@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RMSNorm 与 RoPE · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html" class="active"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">阶段 3 · kernel</div>
+<h1>RMSNorm 与 RoPE</h1>
+<p class="lead">按行宽选线程映射，舍入点对齐 PyTorch。</p>
+<div class="callout goal"><span class="t">本步目标</span>RMSNorm 按行宽用两种线程映射：hidden 行（1024）一个 block 一行，每头的行（128）一个 warp 一行。数值上对齐 PyTorch 的舍入点。顺带回头看第 05 步换上的 RoPE kernel 为什么那样排线程。</div>
+<h2>原理</h2>
+<h3>RMSNorm 的结构</h3>
+<p>一行的计算分两趟：先求平方和（归约），再逐元素乘 <code>rstd × w</code>。归约需要一行里所有线程把各自的部分和汇到一起，这决定了线程怎么排。</p>
+<p>Qwen3 里 RMSNorm 有两种行宽：</p>
+<div class="tablewrap"><table><thead><tr><th></th><th>行宽</th><th>每 token 几行</th><th>每层几次</th></tr></thead><tbody><tr><td>attn_norm / ffn_norm / final_norm</td><td>hidden = 1024</td><td>1</td><td>2</td></tr><tr><td>q_norm</td><td>head_dim = 128</td><td>16（每个 q 头一行）</td><td>1</td></tr><tr><td>k_norm</td><td>head_dim = 128</td><td>8（每个 kv 头一行）</td><td>1</td></tr></tbody></table></div>
+
+<h3>起点：不管多宽，都是一个 warp 一行</h3>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cuda/norm_warp.cu</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">template&lt;typename T, typename W&gt;
+__global__ void rmsnorm_warp_kernel(
+    T* __restrict__ out,
+    const T* __restrict__ x ,         // [1,seq,hidden]
+    const W* __restrict__ weight,     // [hidden]
+    int rows, int hidden_size, float eps
+){
+    // 每个 warp 处理一行
+    int warp_id = threadIdx.x / 32; // 因为一个warp是32个线程，所以每个warp处理一行
+    int lane_id = threadIdx.x % 32; // 算出当前线程在warp中的编号
+    int row = blockIdx.x * (blockDim.x / 32) + warp_id; // 算出当前线程处理的行号，共rows行
+    if (row &gt;= rows) return; // 超出行数，直接返回
+
+    T* out_row = out + (long)row * hidden_size;   // 输出地址
+    const T* x_row = x + (long)row * hidden_size; // 输入地址
+
+    // ===== Step 1: 计算 sum(x^2) =====
+    float sum = 0.f;
+    // 32 个线程交错读取整个 hidden_size 维度
+    for (int i = lane_id; i &lt; hidden_size; i += 32) {
+        float v = float(x_row[i]);
+        sum += v * v;
+    }
+
+    // warp reduce
+    #pragma unroll
+    for (int offset = 16; offset &gt; 0; offset /= 2) {
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+    }
+    float mean_sq = __shfl_sync(0xffffffff, sum, 0) / hidden_size;
+    float inv_rms = rsqrtf(mean_sq + eps);
+    // ===== Step 2: normalize + scale =====
+    for (int i = lane_id; i &lt; hidden_size; i += 32) {
+        float v = float(x_row[i]);
+        float o = v * inv_rms * float(weight[i]);
+        out_row[i] = T(o);
+    }
+}</code></pre></div>
+<p>32 个 lane 交错读一行。行宽 1024 时每个 lane 循环 32 次，每次读一个 2 字节的 bf16，两趟共读 64 次、写 32 次。行宽 128 时每个 lane 循环 4 次，倒是合适。</p>
+
+<h3>lab：按行宽选映射</h3>
+<div class="codeblock"><div class="cap"><span><b>backend/cuda/normalization.cu</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">// lab: module-serving-unfused -- normalization.cu -- RMSNorm
+// 对照 module-style backend/cuda/normalization.cu 与 C++ src/backend/cuda/normalization.cu(RmsNormImpl&lt;CUDA&gt;).
+// 行宽 = 权重长度: attn_norm / ffn_norm / final_norm 按 hidden(一个 block 一行), q_norm / k_norm 按 head_dim=128(一个 warp 一行).
+// 数值同 Qwen3RMSNorm: (x·rstd).to(bf16) · w → bf16.
+#include &quot;cuda_common.cuh&quot;
+
+// ------------------------------------------------------------------
+// rmsnorm: x 看成 [rows, D], out = (x·rstd).to(bf16) · w
+//   D = 128(每头 QK-norm): 一个 warp 一行, 一个 block 4 行
+//   其余(hidden):          一个 block 一行
+// ------------------------------------------------------------------
+__global__ void rmsnorm_row_kernel(bf16x8 *out, const bf16x8 *x, const float *w, int D8, float eps) {
+    const long t = blockIdx.x;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i &lt; D8; i += blockDim.x) {
+        float v[8];
+        unpack8(x[t * D8 + i], v);
+#pragma unroll
+        for (int k = 0; k &lt; 8; ++k) ss += v[k] * v[k];
+    }
+    const float rstd = rsqrtf(block_sum(ss) / (float)(D8 * 8) + eps);
+    for (int i = threadIdx.x; i &lt; D8; i += blockDim.x) {
+        float v[8];
+        unpack8(x[t * D8 + i], v);
+#pragma unroll
+        for (int k = 0; k &lt; 8; ++k) v[k] = round_bf(v[k] * rstd) * w[i * 8 + k];
+        out[t * D8 + i] = pack8(v);
+    }
+}
+__global__ void rmsnorm_head_kernel(bf16 *out, const bf16 *x, const float *w, long rows, float eps) {
+    const int HD = 128;
+    const long r = (long)blockIdx.x * (blockDim.x &gt;&gt; 5) + (threadIdx.x &gt;&gt; 5);
+    const int lane = threadIdx.x &amp; 31;
+    if (r &gt;= rows) return;
+    const bf16 *xr = x + r * HD;
+    float v[4];
+    float ss = 0.f;
+#pragma unroll
+    for (int j = 0; j &lt; 4; ++j) {
+        v[j] = bf2f(xr[lane + 32 * j]);
+        ss += v[j] * v[j];
+    }
+    const float rs = rsqrtf(warp_sum(ss) / (float)HD + eps);
+    bf16 *o = out + r * HD;
+#pragma unroll
+    for (int j = 0; j &lt; 4; ++j) o[lane + 32 * j] = f2bf(round_bf(v[j] * rs) * w[lane + 32 * j]);
+}
+
+extern &quot;C&quot; void cuda_rmsnorm(cuda_bf16_t *out, const cuda_bf16_t *x, const float *w, long rows, int D, float eps) {
+    if (rows &lt;= 0) return;
+    if (D == 128) {
+        const int rows_per_block = 4;
+        rmsnorm_head_kernel&lt;&lt;&lt;(unsigned)((rows + rows_per_block - 1) / rows_per_block), rows_per_block * 32, 0,
+                              g_cuda_stream&gt;&gt;&gt;((bf16 *)out, (const bf16 *)x, w, rows, eps);
+        return;
+    }
+    rmsnorm_row_kernel&lt;&lt;&lt;(unsigned)rows, 128, 0, g_cuda_stream&gt;&gt;&gt;((bf16x8 *)out, (const bf16x8 *)x, w, D / 8, eps);
+}</code></pre></div>
+<ul>
+  <li><b>hidden 行</b>：一个 block（128 线程）一行，每线程一个 <code>bf16x8</code>。128 × 8 = 1024，每个线程<b>只读一次</b>就覆盖整行。平方和用 <code>block_sum</code> 汇总。</li>
+  <li><b>每头的行</b>：一个 warp 一行，每个 lane 管 4 个元素（<code>lane, lane+32, lane+64, lane+96</code>），读一次、存在寄存器里，归约后直接写回，不用读第二遍。一个 block 放 4 个 warp。</li>
+</ul>
+<div class="codeblock"><div class="cap"><span><b>backend/cuda/cuda_common.cuh</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">__device__ __forceinline__ float warp_sum(float v) {
+#pragma unroll
+    for (int o = 16; o &gt; 0; o &gt;&gt;= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+__device__ __forceinline__ float warp_max(float v) {
+#pragma unroll
+    for (int o = 16; o &gt; 0; o &gt;&gt;= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+
+// 块内求和(blockDim.x 为 32 的倍数, ≤ 1024); 结果广播给所有线程
+__device__ __forceinline__ float block_sum(float v) {
+    __shared__ float sh[32];
+    int lane = threadIdx.x &amp; 31, wid = threadIdx.x &gt;&gt; 5;
+    v = warp_sum(v);
+    __syncthreads();
+    if (lane == 0) sh[wid] = v;
+    __syncthreads();
+    int nw = (blockDim.x + 31) &gt;&gt; 5;
+    float r = (lane &lt; nw) ? sh[lane] : 0.f;
+    return warp_sum(r);
+}</code></pre></div>
+<p><code>warp_sum</code> 用 <code>__shfl_xor_sync</code> 做蝶形归约：5 步之后 32 个 lane 手里都是总和，不经过 shared memory。<code>block_sum</code> 是两级：warp 内 shuffle，warp 之间经一小块 shared memory。</p>
+<div class="codeblock"><div class="cap"><span><b>cuda-course/results.txt · 第 02 课</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="nohighlight">[3] 逐行平方和 [4096, 1024] (RMSNorm 的归约部分)
+  block/行, smem 树形(256 线程)    24.574 us    682.7 GB/s  ( 72.9% of peak)
+  [PASS] block/行 smem                 max|err| = 3.05e-05 (tol 0.01)
+  warp/行, shuffle                     21.043 us    797.3 GB/s  ( 85.2% of peak)
+  [PASS] warp/行 shuffle               max|err| = 3.05e-05 (tol 0.01)
+  block/行, block_sum(128 线程)      20.853 us    804.6 GB/s  ( 86.0% of peak)
+  [PASS] block/行 block_sum            max|err| = 6.1e-05 (tol 0.01)</code></pre></div>
+<p>4096 行 × 1024 的平方和：一线程管一行的朴素写法在 module-style 里是 35.8 µs / 次 <span class="src lab">nsys 实测</span>（只处理 1 行！）；上面三种并行归约都在 21–25 µs 处理 4096 行。</p>
+
+<h3>数值：舍入点</h3>
+<p>PyTorch 的 Qwen3RMSNorm 是 <code>(x * rstd).to(bf16) * w</code>：先把归一化结果舍入到 bf16，再乘权重。lab 的 kernel 照这个写：<code>round_bf(v * rstd) * w</code>。</p>
+<p>起点是 <code>v * inv_rms * w</code> 一次算完再舍入，中间少一次舍入。两种写法的结果在部分元素上差 1 ulp。这一步之后 llmgen 的 norm 和 PyTorch / nano-vllm / lab 逐位一致。</p>
+
+<h2>改动</h2>
+<h3><span class="stepno">1</span>换掉 kernel</h3>
+<p>把 lab 的 <code>backend/cuda/normalization.cu</code> 拷过来，删掉 <code>norm_warp.cu</code>（和已经不用的 <code>norm_naive.cu</code>）。</p>
+
+<h3><span class="stepno">2</span>Impl 和声明</h3>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cuda/norm.zig（整个文件换掉）</b> <span class="tag new">新建文件</span></span><button type="button">复制</button></div><pre><code class="language-zig">//! cuda/norm.zig -- RmsNormImpl&lt;CUDA&gt;
+//! 行宽 = 权重长度: attn_norm / ffn_norm / final_norm 按 hidden, q_norm / k_norm 按 head_dim(每头一次)。
+const Tensor = @import(&quot;../../Tensor.zig&quot;);
+const cu = @import(&quot;cuda.zig&quot;);
+
+pub const RmsNormImpl = struct {
+    pub fn execute(device_id: i32, out_tensor: *Tensor) !void {
+        _ = device_id;
+        const x = out_tensor.src[0].?;
+        const w = out_tensor.src[1].?;
+        // kernel 把权重当 float* 读。llama.cpp 转出来的 GGUF 里 1 维张量(norm 权重)本来就是 F32。
+        if (w.data_type != .GGML_TYPE_F32 or x.data_type != .GGML_TYPE_BF16) return error.RmsNormNeedsBf16AndF32Gain;
+        const d = w.numElements();
+        cu.cuda_rmsnorm(out_tensor.data, x.data, w.data, @intCast(x.numElements() / d), @intCast(d), out_tensor.op_params[0]);
+    }
+};</code></pre></div>
+<div class="codeblock diff"><div class="cap"><span><b>声明和构建</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">// ---- cuda_shim.h ----</span><span class="ln del">void cuda_rms_norm(void *out, const void *x, const void *w, int dtype, int wdtype,int rows, int hidden_size, float eps, int dev_id);</span><span class="ln add">void cuda_rmsnorm(cuda_bf16_t *out, const cuda_bf16_t *x, const float *w, long rows, int D, float eps);</span><span class="ln ctx">// ---- cuda.zig ----</span><span class="ln del">pub extern fn cuda_rms_norm(...) void;</span><span class="ln add">pub extern fn cuda_rmsnorm(out: ?*anyopaque, x: ?*const anyopaque, w: ?*const anyopaque, rows: c_long, D: c_int, eps: f32) void;</span><span class="ln ctx">// ---- build.zig · CUDA_SRC ----</span><span class="ln del">    &quot;norm_warp.cu&quot;,</span><span class="ln add">    &quot;normalization.cu&quot;,</span></code></pre></div>
+
+<h2>回头看 RoPE 的线程映射</h2>
+<p>第 05 步换 RoPE kernel 时只说了“token-major”，没讲线程为什么那样排。和 norm 是同一个思路：让线程的编号直接对应数据的结构。</p>
+<div class="codeblock"><div class="cap"><span><b>RoPE：起点（一线程一元素，每线程 4 次除法 / 取模）</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">template &lt;typename T&gt;
+__global__ void apply_rope_kernel(
+    T* __restrict__ out,
+    const T* __restrict__ input,
+    const float* __restrict__ cos_cache,
+    const float* __restrict__ sin_cache,
+    int64_t B, int64_t n_heads, int64_t seq_len,
+    int64_t head_dim, int64_t rope_half, int64_t rope_dim,
+    int64_t head_stride, int64_t batch_stride,
+    int64_t cos_stride, int64_t start_pos
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &gt;= B * n_heads * seq_len * head_dim) return;
+
+    int i = idx % head_dim;
+    int tmp = idx / head_dim;
+    int s = tmp % seq_len;
+    tmp /= seq_len;
+    int h = tmp % n_heads;
+    int b = tmp / n_heads;
+
+    const T* row_in = input + b * batch_stride + h * head_stride + s * head_dim;
+    T* row_out = out + b * batch_stride + h * head_stride + s * head_dim;
+    int64_t pos = start_pos + s;
+
+    if (i &lt; rope_half) {
+        float x0 = float(row_in[i]);
+        float x1 = float(row_in[i + rope_half]);
+        float c = cos_cache[pos * cos_stride + i];
+        float si = sin_cache[pos * cos_stride + i];
+        row_out[i] = T(x0 * c - x1 * si);
+        row_out[i + rope_half] = T(x0 * si + x1 * c);
+    } else if (i &gt;= rope_dim) {
+        row_out[i] = row_in[i];
+    }
+}</code></pre></div>
+<p>起点把所有元素摊平，每个线程用除法和取模反推自己是哪个 batch、哪个头、哪个 token、哪一维，再判断自己在前半还是后半。前半的线程写两个元素，后半的线程什么都不干就退出（一半线程是空转的）。</p>
+<p>第 05 步的 kernel：<code>blockIdx.x</code> 就是 token，<code>threadIdx.x &gt;&gt; 5</code> 就是头，<code>lane</code> 管 <code>i ∈ {lane, lane+32}</code> 及配对的 <code>i+64</code>。没有除法，没有空转的线程，128 维正好被 32 个 lane × 2 对 × 2 个元素覆盖。</p>
+
+<h2>对拍验证</h2>
+<p>因为舍入点变了，greedy 输出<b>允许</b>在近似并列处和上一步不同。验收：前 20 个 token 相同，全文通顺。单算子对拍见第 15 步（对拍的 CPU 参考也要按新舍入点写）。</p>
+<h2>CPU 同步</h2>
+<div class="callout cpu"><span class="t">这一步 CPU 后端要做的事</span><b>必须同步改。</b>这一步把 CUDA 的 RMSNorm 舍入点改成了 <code>round_bf(x·rstd)·w</code>。CPU 不跟着改，两个后端的 norm 输出会差 1 ulp，28 层之后 greedy 输出分叉。 <a href="cpu-4-kernels-math.html#norm">去看 →</a></div>
+<h2>性能收益</h2>
+<h3>依据</h3>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th class="num">改前</th><th class="num">改后</th><th>来源</th></tr></thead><tbody><tr><td>module-style rmsnorm（一线程一行，1 行）</td><td class="num">35.8 µs / 次</td><td class="num">—</td><td><span class="src lab">nsys 实测</span></td></tr><tr><td>[4096, 1024] 平方和：smem 树形 → block_sum</td><td class="num">24.574 µs</td><td class="num">20.853 µs</td><td><span class="src lab">lab 实测</span></td></tr><tr><td>融合版 add_rmsnorm（decode，1 行）</td><td class="num">—</td><td class="num">2.1 µs / 次</td><td><span class="src lab">nsys 实测</span></td></tr></tbody></table></div>
+<h3>对 llmgen 的预期</h3>
+<p>llmgen 起点的 norm 已经是 warp 归约，不是 module-style 那种 35.8 µs 的朴素写法，所以这一步的提升有限：</p>
+<ul>
+  <li><b>decode</b>：每层 4 次 norm，每次只有 1–16 行。kernel 耗时在 2 µs 上下，改前改后差不多。ITL 不变。</li>
+  <li><b>prefill / 大批</b>：hidden 行从“每 lane 读 32 次 × 2 字节”变成“每线程读 1 次 × 16 字节”，带宽利用率从 80% 左右升到 90% 左右 <span class="src est">推算</span>。</li>
+</ul>
+<p>这一步的主要价值是<b>数值对齐</b>：从这里开始，llmgen 的 norm 和 lab 逐位相同，离“直接和 lab 比 token id”又近了一步。</p>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>RMS_NORM 平均耗时 · decode (µs)</td><td class="num fill" contenteditable="true" data-key="11-norm-rope.html|RMS_NORM 平均耗时 · decode (µs)|before"></td><td class="num fill" contenteditable="true" data-key="11-norm-rope.html|RMS_NORM 平均耗时 · decode (µs)|after"></td><td class="num gain"></td></tr><tr><td>RMS_NORM 平均耗时 · prefill (µs)</td><td class="num fill" contenteditable="true" data-key="11-norm-rope.html|RMS_NORM 平均耗时 · prefill (µs)|before"></td><td class="num fill" contenteditable="true" data-key="11-norm-rope.html|RMS_NORM 平均耗时 · prefill (µs)|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td><code>error.RmsNormNeedsBf16AndF32Gain</code></td><td>norm 权重不是 F32。少数 GGUF 把 1 维张量也存成 BF16，那就在 <code>loadWeights</code> 里对 norm 权重做一次 bf16 → f32 转换（lab 的 <code>loadOne</code> 里 <code>.f32</code> 分支）。</td></tr><tr><td>q_norm 之后数值全错</td><td>行宽取错了。<code>D</code> 必须是<b>权重</b>的元素数（128），不是 x 的最后一维以外的东西。</td></tr><tr><td>prefill 正常，但行数很多时崩</td><td>hidden 行的 kernel 一行一个 block，<code>rows</code> 不能超过 grid 上限（2³¹-1），不会碰到。检查是不是 <code>rows</code> 传成了元素数。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li>greedy 输出前 20 个 token 不变，全文通顺</li><li><code>build.zig</code> 的 <code>CUDA_SRC</code> 里是 <code>normalization.cu</code></li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="10-bf16x8.html"><small>← 上一步</small>bf16x8 向量化</a><a class="next" href="12-linear-gemv.html"><small>下一步 →</small>Linear：GEMV + cuBLAS</a></div>
+</main>
+</div>
+</body>
+</html>

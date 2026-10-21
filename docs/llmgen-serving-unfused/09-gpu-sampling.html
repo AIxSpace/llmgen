@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPU 采样 · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html" class="active"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">阶段 2 · 少算、少搬</div>
+<h1>GPU 采样</h1>
+<p class="lead">两段式 Gumbel-max，每步只拷回 4 个字节。</p>
+<div class="callout goal"><span class="t">本步目标</span>采样搬到 GPU 上做。每步从显存拷回 host 的数据从 30 万字节（一行 logits）降到 4 字节（一个 token id）。图里最后一条拷贝边消失，一步前向从头到尾不需要 host 参与计算。</div>
+<h2>原理</h2>
+<h3>起点的采样做了什么</h3>
+<div class="codeblock"><div class="cap"><span><b>src/executor.zig</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-zig">    /// 把 logits 最后一个 token 位读成 f32(logits 是 bf16, 在 host 上的回拷代理里)。调用方 free。
+    fn lastLogits(self: *Self) ![]f32 {
+        const t = self.output_tensor;
+        const vocab: usize = @intCast(t.dims[t.rank() - 1]);
+        const last = (t.numElements() / vocab - 1) * vocab;
+        const row = try self.allocator.alloc(f32, vocab);
+        for (row, 0..) |*v, i| v.* = common.elemF32(t, last + i);
+        return row;
+    }
+
+    /// greedy(对拍 / 调试用)
+    pub fn sampleArgmax(self: *Self) !i32 {
+        const row = try self.lastLogits();
+        defer self.allocator.free(row);
+        return @intCast(sampling.argmax(row));
+    }
+
+    /// 对照 C++ sample():softmax(带温度) → top-p 截断后抽样
+    pub fn sample(self: *Self) !i32 {
+        const cfg = self.graph_scheduler.config;
+        const row = try self.lastLogits();
+        defer self.allocator.free(row);
+        const probs = try sampling.softmax(self.allocator, row, cfg.temperature);
+        defer self.allocator.free(probs);
+        return @intCast(try sampling.sampleFromProbs(self.allocator, probs, cfg.top_p, self.prng.random()));
+    }</code></pre></div>
+<p>每个 token：把 151936 个 bf16 logits 逐个转成 f32（<code>elemF32</code> 每次一个 dtype 分支）、分配两个 15 万元素的数组、算 softmax、为 top-p 排序、抽样。实测每次 4.209 ms <span class="src start">llmgen 起点实测</span>，是目标整步 ITL（2.449 ms）的 1.7 倍。</p>
+
+<h3>GPU 上怎么采样：Gumbel-max</h3>
+<p>按概率 <code>softmax(logit / T)</code> 抽一个 token，有一个不需要算 softmax、不需要排序的等价做法：</p>
+<div class="callout tip"><span class="t">Gumbel-max</span>给每个 logit 加一个独立的 Gumbel 噪声 <code>G = -log(-log U)</code>（U 是 (0,1) 上的均匀随机数），然后取 argmax：<br>
+<code>token = argmax( logit[i] / T + G[i] )</code><br>
+这样取到 token i 的概率正好是 <code>softmax(logit / T)[i]</code>。</div>
+<p>于是带温度的采样和 greedy 变成了同一件事：都是一次 argmax，前者多加一个噪声。argmax 是归约，GPU 最擅长。nano-vllm 的 Sampler 用的是同分布的另一种写法（除以指数分布的随机数）。</p>
+<p>代价是<b>不支持 top-p</b>：top-p 需要排序。nano-vllm 也不做 top-p，目标 lab 的口径是 <code>temperature = 0.6</code>、无 top-p。</p>
+
+<h3>两段式 argmax</h3>
+<p>词表 151936，一个 block 256 个线程扫完要循环 594 次。lab 把每行拆成 32 段，每段一个 block，各出一个候选；再用一个 warp（32 个 lane 正好 32 个候选）合并：</p>
+<div class="codeblock"><div class="cap"><span><b>backend/cuda/sample.cu</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">// lab: module-serving-unfused -- sample.cu: GPU 端采样(每步只把 S 个 int32 拷回 host)
+//
+// 对照 module-style: logits 在 host, CPU 标量 argmax 扫整个 151936 词表.
+// 这里两段式: 每行拆 32 个 block 各扫一段词表出候选, 再由一个 warp 合并; temperature&gt;0 用 Gumbel-max(argmax(logit/T + G), G = -log(-log U))
+// —— 与 nano-vllm Sampler 的 argmax(softmax(logit/T) / Exp(1)) 同分布; temperature&lt;=0 退化为 greedy.
+// 随机数: 无状态计数器哈希(seed, 行, 词 id) → CUDA Graph 回放时只需更新 device 上的 seed.
+#include &quot;cuda_common.cuh&quot;
+
+__device__ __forceinline__ unsigned long long splitmix64(unsigned long long x) {
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x &gt;&gt; 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x &gt;&gt; 27)) * 0x94D049BB133111EBull;
+    return x ^ (x &gt;&gt; 31);
+}
+
+// argmax 归约: 并列取小下标(与 torch.argmax 一致)
+__device__ __forceinline__ void argmax_merge(float &amp;best, int &amp;best_i, float ov, int oi) {
+    if (ov &gt; best || (ov == best &amp;&amp; oi &lt; best_i)) { best = ov; best_i = oi; }
+}
+__device__ __forceinline__ void warp_argmax(float &amp;best, int &amp;best_i) {
+#pragma unroll
+    for (int o = 16; o &gt; 0; o &gt;&gt;= 1) {
+        float ov = __shfl_xor_sync(0xffffffffu, best, o);
+        int oi = __shfl_xor_sync(0xffffffffu, best_i, o);
+        argmax_merge(best, best_i, ov, oi);
+    }
+}
+
+// 第一段: grid = (S, SAMPLE_SPLIT), 每个 block 扫词表的一段, 输出段内 (最大值, 下标)
+#define SAMPLE_SPLIT 32
+#define SAMPLE_THREADS 256
+__global__ void __launch_bounds__(SAMPLE_THREADS) sample_partial_kernel(float *pv, int *pi, const bf16 *logits, const float *temps,
+                                                                        const unsigned long long *seed_ptr, int V) {
+    const int s = blockIdx.x, part = blockIdx.y;
+    const int chunk = (V + SAMPLE_SPLIT - 1) / SAMPLE_SPLIT;
+    const int beg = part * chunk, end = min(V, beg + chunk);
+    const bf16 *row = logits + (long)s * V;
+    const float temp = temps[s];
+    const unsigned long long seed = splitmix64(*seed_ptr ^ ((unsigned long long)s &lt;&lt; 40));
+    float best = -INFINITY;
+    int best_i = 0x7fffffff;
+    if (temp &gt; 0.f) {
+        const float inv_t = 1.f / temp;
+        for (int i = beg + threadIdx.x; i &lt; end; i += SAMPLE_THREADS) {
+            unsigned long long r = splitmix64(seed + (unsigned long long)i);
+            float u = ((float)(r &gt;&gt; 40) + 0.5f) * (1.0f / 16777216.0f); // (0,1)
+            argmax_merge(best, best_i, bf2f(row[i]) * inv_t - __logf(-__logf(u)), i);
+        }
+    } else {
+        for (int i = beg + threadIdx.x; i &lt; end; i += SAMPLE_THREADS) argmax_merge(best, best_i, bf2f(row[i]), i);
+    }
+    warp_argmax(best, best_i);
+    __shared__ float sv[SAMPLE_THREADS / 32];
+    __shared__ int si[SAMPLE_THREADS / 32];
+    const int lane = threadIdx.x &amp; 31, wid = threadIdx.x &gt;&gt; 5;
+    if (lane == 0) { sv[wid] = best; si[wid] = best_i; }
+    __syncthreads();
+    if (wid == 0) {
+        best = lane &lt; SAMPLE_THREADS / 32 ? sv[lane] : -INFINITY;
+        best_i = lane &lt; SAMPLE_THREADS / 32 ? si[lane] : 0x7fffffff;
+        warp_argmax(best, best_i);
+        if (lane == 0) {
+            pv[s * SAMPLE_SPLIT + part] = best;
+            pi[s * SAMPLE_SPLIT + part] = best_i;
+        }
+    }
+}
+
+// 第二段: 一个 warp 合并 SAMPLE_SPLIT 个候选
+__global__ void sample_final_kernel(int *out, const float *pv, const int *pi) {
+    const int s = blockIdx.x, lane = threadIdx.x;
+    float best = pv[s * SAMPLE_SPLIT + lane];
+    int best_i = pi[s * SAMPLE_SPLIT + lane];
+    warp_argmax(best, best_i);
+    if (lane == 0) out[s] = best_i;
+}
+
+extern &quot;C&quot; void cuda_sample(int *out_ids, const cuda_bf16_t *logits, const float *temps, const unsigned long long *seed,
+                          int S, int V, void *scratch) {
+    if (S &lt;= 0) return;
+    float *pv = (float *)scratch;
+    int *pi = (int *)(pv + (long)S * SAMPLE_SPLIT);
+    sample_partial_kernel&lt;&lt;&lt;dim3(S, SAMPLE_SPLIT), SAMPLE_THREADS, 0, g_cuda_stream&gt;&gt;&gt;(pv, pi, (const bf16 *)logits, temps, seed, V);
+    sample_final_kernel&lt;&lt;&lt;S, 32, 0, g_cuda_stream&gt;&gt;&gt;(out_ids, pv, pi);
+}
+
+extern &quot;C&quot; size_t cuda_sample_scratch_bytes(int max_S) { return (size_t)max_S * SAMPLE_SPLIT * 8; }</code></pre></div>
+<p>几个细节：</p>
+<ul>
+  <li><b>随机数无状态。</b>每个 (seed, 行号, token id) 用 splitmix64 哈希出一个数。kernel 不维护随机数状态，只读一个 8 字节的 seed。这是为第 17 步准备的：CUDA Graph 回放时 kernel 参数不能变，每步只要改显存里那 8 个字节。seed 就是第 04 步元数据包的头 8 字节。</li>
+  <li><b>并列取小下标。</b>和 <code>torch.argmax</code>、和起点 CPU 上的 argmax 一致，所以 greedy 的输出不变。</li>
+  <li><b>温度逐序列。</b><code>temps[s]</code> 在元数据里，批处理时每条请求可以用不同的温度。</li>
+</ul>
+
+<h2>改动</h2>
+<h3><span class="stepno">1</span>kernel</h3>
+<p>把 lab 的 <code>backend/cuda/sample.cu</code> 整个拷过来。</p>
+
+<h3><span class="stepno">2</span>图节点：输出从 logits 变成 token id</h3>
+<div class="codeblock"><div class="cap"><span><b>src/module/serving.zig</b> <span class="tag new">新增</span></span><button type="button">复制</button></div><pre><code class="language-zig">/// logits [1, S, V] bf16 → token id [1, S] i32。温度和随机种子在执行期从元数据读。
+pub fn sample(allocator: std.mem.Allocator, logits: *Tensor, name: []const u8, layer_id: i32) !*Tensor {
+    const t = try base.newTensor(allocator, .{
+        .name = name,
+        .layer_id = layer_id,
+        .data_type = .GGML_TYPE_I32,
+        .tensor_type = .TENSOR_TYPE_OUTPUT,
+        .op_type = .OP_TYPE_SAMPLE,
+        .src = base.srcs(&amp;.{logits}),
+        .dims = .{ 1, base.DYN_S, 0, 0 },
+    });
+    base.computeStrides(t);
+    return t;
+}</code></pre></div>
+<div class="codeblock diff"><div class="cap"><span><b>src/models/qwen3.zig · Qwen3Model.forward</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">        const last = try serving.gatherLast(self.trace.node_allocator, fx, &quot;gather_last&quot;, self.final_norm.layer_id);</span><span class="ln ctx">        const logits = try self.lm_head.forward(last);</span><span class="ln del"> </span><span class="ln del">        return logits;</span><span class="ln add">        // 图的输出从 logits 变成采样出的 token id</span><span class="ln add">        return serving.sample(self.trace.node_allocator, logits, &quot;sample&quot;, self.final_norm.layer_id);</span></code></pre></div>
+
+<h3><span class="stepno">3</span>Impl 和接线</h3>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cuda/sample.zig</b> <span class="tag new">新建文件</span></span><button type="button">复制</button></div><pre><code class="language-zig">//! cuda/sample.zig -- SampleImpl&lt;CUDA&gt;: 两段式并行 Gumbel-max(temperature ≤ 0 时是 greedy)
+const Tensor = @import(&quot;../../Tensor.zig&quot;);
+const c = @import(&quot;../cpu/common.zig&quot;);
+const cu = @import(&quot;cuda.zig&quot;);
+
+pub const SampleImpl = struct {
+    pub fn execute(device_id: i32, out_tensor: *Tensor) !void {
+        _ = device_id;
+        const logits = out_tensor.src[0].?; // [1, S, V]
+        cu.cuda_sample(out_tensor.data, logits.data, c.g_step.temps, c.g_step.seed, c.g_step.n_seq, @intCast(logits.dims[2]), c.g_step.sample_scratch);
+    }
+};
+
+// backend/cpu/sample.zig 是同一个算法的 CPU 版, 见&quot;CPU 同步&quot;一节</code></pre></div>
+<div class="codeblock diff"><div class="cap"><span><b>接线</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">// ---- cuda_shim.h ----</span><span class="ln add">void cuda_sample(int *out_ids, const cuda_bf16_t *logits, const float *temps, const unsigned long long *seed,</span><span class="ln add">                 int S, int V, void *scratch);</span><span class="ln add">size_t cuda_sample_scratch_bytes(int max_S);</span><span class="ln add">void cuda_d2h_async(void *dst_host, const void *src_dev, size_t bytes); /* 第 07 步已加 */</span><span class="ln ctx">// ---- cuda.zig ----</span><span class="ln add">pub extern fn cuda_sample(out_ids: ?*anyopaque, logits: ?*const anyopaque, temps: ?*const anyopaque, seed: ?*const anyopaque, S: c_int, V: c_int, scratch: ?*anyopaque) void;</span><span class="ln add">pub extern fn cuda_sample_scratch_bytes(max_S: c_int) usize;</span><span class="ln ctx">// ---- impls.zig(cuda / cpu)、ops.zig、dispatchKernel:和第 08 步的 GatherLastImpl 同样的三处 ----</span><span class="ln add">pub const SampleImpl = @import(&quot;sample.zig&quot;).SampleImpl;</span><span class="ln add">        .OP_TYPE_SAMPLE =&gt; try ops.kernel.sample(tensor, device_id),</span><span class="ln ctx">// ---- build.zig · CUDA_SRC ----</span><span class="ln add">    &quot;sample.cu&quot;,</span></code></pre></div>
+
+<h3><span class="stepno">4</span>去掉输出的拷贝代理</h3>
+<div class="codeblock diff"><div class="cap"><span><b>src/graph/scheduler.zig · insertCopyEdges</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln del">        // (原有的 src 去重插代理循环之后)</span><span class="ln del">        // 外部输出也可能需要回拷:不在 CPU 的输出插一个 → CPU 的 memcpy 代理, 并 replaceOutput,</span><span class="ln del">        // 采样从代理读 host 内存(对照 C++ insert_copy_edges)。</span><span class="ln del">        for (self.compute_graph.getExecutionOutputs()) |out| {</span><span class="ln del">            ...</span><span class="ln del">            self.compute_graph.replaceOutput(out, found.?);</span><span class="ln del">        }</span><span class="ln add">        // 图的输出是 S 个 token id, 留在显存里;Executor 自己用一次异步 D2H 取回(fetchOut)</span><span class="ln ctx"> </span><span class="ln ctx">        try self.compute_graph.rebuildOrder();</span></code></pre></div>
+
+<h3><span class="stepno">5</span>Executor：forward 直接返回 token</h3>
+<div class="codeblock"><div class="cap"><span><b>src/executor.zig</b> <span class="tag new">新增</span></span><button type="button">复制</button></div><pre><code class="language-zig">// ---- 新字段 ----
+    out_host: [*]i32 = undefined, //      采样结果的 pinned host 缓冲, MAX_SEQS 个 i32
+    sample_scratch: ?*anyopaque = null, // 两段式 argmax 的中间候选
+
+// ---- allocMeta() 里, 和 part_o / part_ml 一起切 ----
+            self.sample_scratch = (try pool.allocate(cuda.cuda_sample_scratch_bytes(@intCast(MAX_SEQS)), pools.POOL_ALIGN)).ptr;
+            self.out_host = @ptrCast(@alignCast(cuda.cuda_host_alloc(MAX_SEQS * @sizeOf(i32)) orelse return error.PinnedAllocFailed));
+
+// ---- bindStep() 的 setStep 里 ----
+            .sample_scratch = self.sample_scratch,
+
+// ---- forward() 结尾:取回本步 S 个 token。这是一步里唯一等 GPU 的地方 ----
+    fn fetchOut(self: *Self, n_seq: usize) []const i32 {
+        if (opts.have_cuda and self.output_tensor.device_type == .CUDA) {
+            cuda.cuda_d2h_async(self.out_host, self.output_tensor.data, n_seq * @sizeOf(i32));
+            cuda.CudaContext.instance().sync();
+            return self.out_host[0..n_seq];
+        }
+        return @as([*]const i32, @ptrCast(@alignCast(self.output_tensor.data.?)))[0..n_seq];
+    }</code></pre></div>
+<div class="codeblock diff"><div class="cap"><span><b>src/executor.zig（sampleLast / lastLogits / sampleArgmax / sample 四个函数和 prng 字段可以删掉）</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln del">    fn forward(self: *Self, entries: []const Entry) !void {</span><span class="ln add">    /// 返回 entries 里每一条的采样 token(按 entries 顺序)</span><span class="ln add">    fn forward(self: *Self, entries: []const Entry) ![]const i32 {</span><span class="ln ctx">        ...</span><span class="ln add">        return self.fetchOut(n_seq);</span><span class="ln ctx">    }</span><span class="ln ctx"> </span><span class="ln ctx">// ---- generate() ----</span><span class="ln del">        try self.forward(&amp;.{.{ .seq = &amp;seq, .q_start = 0, .q_len = prompt.len }});</span><span class="ln add">        var next = (try self.forward(&amp;.{.{ .seq = &amp;seq, .q_start = 0, .q_len = prompt.len }}))[0];</span><span class="ln ctx">        ...</span><span class="ln ctx">        while (idx &lt; max_tokens) : (idx += 1) {</span><span class="ln del">            step_timer.reset();</span><span class="ln del"> </span><span class="ln del">            // sample 是带温度的 softmax 加上 top-p 截断后按概率抽样，结果会随 seed 变化</span><span class="ln del">            const next = try self.sample();</span><span class="ln del">            self.metrics.sample_ns += step_timer.lap();</span><span class="ln add">            step_timer.reset(); // 采样已经在 forward 里做完了, sample_ns 从此恒为 0</span><span class="ln ctx"> </span><span class="ln ctx">            try self.metrics.onGenToken(self.allocator, total_timer.read());</span><span class="ln ctx">            if (next == eos) break;</span><span class="ln ctx">            try seq.token_ids.append(self.allocator, next);</span><span class="ln ctx">            ...</span><span class="ln del">                try self.forward(&amp;.{.{ .seq = &amp;seq, .q_start = seq.len() - 1, .q_len = 1 }});</span><span class="ln add">                next = (try self.forward(&amp;.{.{ .seq = &amp;seq, .q_start = seq.len() - 1, .q_len = 1 }}))[0];</span></code></pre></div>
+<div class="codeblock diff"><div class="cap"><span><b>src/llmgen.zig</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">    var graph_scheduler = GraphScheduler.init(allocator, compute_graph, .{</span><span class="ln ctx">        ...</span><span class="ln del">        .temperature = 0.5,</span><span class="ln del">        .top_p = 0.9,</span><span class="ln add">        .temperature = 0, // ≤ 0 是 greedy;压测时由 workload 的每条请求给(0.6)</span></code></pre></div>
+
+<h2>对拍验证</h2>
+<ul>
+  <li><b>greedy</b>（<code>temperature = 0</code>）：输出应该和第 08 步逐 token 相同。argmax 的并列规则一致，logits 本身没变。</li>
+  <li><b>带温度</b>：输出会变，这是预期的（随机数生成方式换了，top-p 没了）。检查文本通顺、同一个 seed 两次运行结果相同即可。</li>
+</ul>
+<p>nsys 里每步的拷贝应该是：1 次 <code>cudaMemcpyAsync</code> H2D（元数据）+ 1 次 <code>cudaMemcpyAsync</code> D2H（4 字节）。</p>
+<h2>CPU 同步</h2>
+<div class="callout cpu"><span class="t">这一步 CPU 后端要做的事</span><b>必须同步改。</b>CPU 上用同一个算法（splitmix64 + Gumbel-max，并列取小下标）实现 <code>SampleImpl</code>，这样同一个 seed 下 CPU 和 CUDA 抽到的 token 一致。<code>fetchOut</code> 在 CPU 上直接读输出节点。 <a href="cpu-3-kernels-layout.html#sample">去看 →</a></div>
+<h2>性能收益</h2>
+<h3>依据</h3>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th class="num">改前</th><th class="num">改后</th><th>来源</th></tr></thead><tbody><tr><td>llmgen 起点：CPU 采样</td><td class="num">4.209 ms / 次</td><td class="num">—</td><td><span class="src start">llmgen 起点实测</span></td></tr><tr><td>融合版 S1：sample_partial_kernel</td><td class="num">—</td><td class="num">4.9 µs / 次</td><td><span class="src lab">nsys 实测</span></td></tr><tr><td>融合版 S1：每步拷贝次数</td><td class="num">—</td><td class="num">2 次 cudaMemcpyAsync</td><td><span class="src lab">nsys 实测</span></td></tr></tbody></table></div>
+<h3>对 llmgen 的预期</h3>
+<p>每个 token 直接省掉 4.209 ms 的 CPU 采样，再加一次 30 万字节的 D2H。GPU 上两个 kernel 合计不到 10 µs。</p>
+<p>预期 ITL 降 4.2–4.5 ms <span class="src est">推算</span>。如果此时 ITL 在 15 ms 左右，就是 30% 的提升。</p>
+<p>到这里阶段 2 结束，里程碑 M1 的验收点：<b>单请求 decode 超过 150 tok/s</b>（ITL &lt; 6.7 ms）。没到的话先别往下走，回第 02 步的方法重新抓一次 nsys，看 API 表里还剩什么。</p>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>S1 ITL mean (ms)</td><td class="num fill" contenteditable="true" data-key="09-gpu-sampling.html|S1 ITL mean (ms)|before"></td><td class="num fill" contenteditable="true" data-key="09-gpu-sampling.html|S1 ITL mean (ms)|after"></td><td class="num gain"></td></tr><tr><td>S1 输出吞吐 (tok/s)</td><td class="num fill" contenteditable="true" data-key="09-gpu-sampling.html|S1 输出吞吐 (tok/s)|before"></td><td class="num fill" contenteditable="true" data-key="09-gpu-sampling.html|S1 输出吞吐 (tok/s)|after"></td><td class="num gain"></td></tr><tr><td>sample 平均 (ms/次)</td><td class="num fill" contenteditable="true" data-key="09-gpu-sampling.html|sample 平均 (ms/次)|before"></td><td class="num fill" contenteditable="true" data-key="09-gpu-sampling.html|sample 平均 (ms/次)|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td>取回的 token 全是 0 或很大的数</td><td><code>fetchOut</code> 在 kernel 跑完之前就读了：<code>cuda_d2h_async</code> 之后必须 <code>sync</code>。或者 <code>out_host</code> 不是 pinned 内存。</td></tr><tr><td>greedy 输出和上一步不同</td><td>检查 <code>temps[s]</code>：<code>seq.params.temperature</code> 要是 0。<code>SamplingParams</code> 的默认值是 1.0。</td></tr><tr><td>段错误，栈在 CPU 的 MemcpyImpl</td><td>输出的拷贝代理还在。第 4 步的循环没删干净，Executor 的 <code>output_tensor</code> 指向了代理。</td></tr><tr><td>带温度时每次运行结果都一样</td><td>这是对的：seed 从固定初值开始每步递增。想要不同结果，改 <code>step_seed</code> 的初值。</td></tr><tr><td>编译报 <code>SampleImpl&lt;CPU&gt; 未实现</code></td><td><code>backend/cpu/impls.zig</code> 里没导出 CPU 版的 <code>SampleImpl</code>。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li>greedy 输出和第 08 步逐 token 相同</li><li>nsys 里每步只有 2 次 <code>cudaMemcpyAsync</code>，没有同步的 <code>cudaMemcpy</code></li><li>指标里 sample 时间为 0</li><li>M1：S1 的 decode 吞吐超过 150 tok/s</li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="08-gather-last.html"><small>← 上一步</small>gather_last：只算最后一行</a><a class="next" href="10-bf16x8.html"><small>下一步 →</small>bf16x8 向量化</a></div>
+</main>
+</div>
+</body>
+</html>

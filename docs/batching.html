@@ -1,0 +1,855 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>连续批处理详解</title>
+<style>
+:root {
+  --bg: #fbfaf8;
+  --surface: #ffffff;
+  --surface-2: #f3f1ec;
+  --text: #1f1d1a;
+  --muted: #6b665e;
+  --border: #e3dfd6;
+  --accent: #b4532a;
+  --accent-soft: #f6e6dc;
+  --code-bg: #f5f3ee;
+  --seq-a: #dbe8f7;
+  --seq-b: #e3f1dc;
+  --seq-c: #f7e5cf;
+  --seq-pad: #ececec;
+  --warn: #8a5a00;
+  --warn-bg: #fff6e0;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #171614;
+    --surface: #1f1e1b;
+    --surface-2: #272522;
+    --text: #ece9e3;
+    --muted: #a39d93;
+    --border: #36332e;
+    --accent: #e08a5f;
+    --accent-soft: #3a2a21;
+    --code-bg: #24221f;
+    --seq-a: #22344a;
+    --seq-b: #26391f;
+    --seq-c: #44331d;
+    --seq-pad: #333;
+    --warn: #f0c060;
+    --warn-bg: #3a3020;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #171614;
+  --surface: #1f1e1b;
+  --surface-2: #272522;
+  --text: #ece9e3;
+  --muted: #a39d93;
+  --border: #36332e;
+  --accent: #e08a5f;
+  --accent-soft: #3a2a21;
+  --code-bg: #24221f;
+  --seq-a: #22344a;
+  --seq-b: #26391f;
+  --seq-c: #44331d;
+  --seq-pad: #333;
+  --warn: #f0c060;
+  --warn-bg: #3a3020;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.75 -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", sans-serif;
+}
+.layout {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr);
+  max-width: 1180px;
+  margin: 0 auto;
+  gap: 40px;
+  padding: 32px 24px 80px;
+}
+nav.toc {
+  position: sticky;
+  top: 24px;
+  align-self: start;
+  font-size: 13.5px;
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+}
+nav.toc .toc-title { font-weight: 600; color: var(--muted); margin-bottom: 8px; letter-spacing: .04em; }
+nav.toc ol { list-style: none; margin: 0; padding: 0; counter-reset: toc; }
+nav.toc li { counter-increment: toc; }
+nav.toc a {
+  display: block;
+  padding: 4px 10px;
+  border-left: 2px solid var(--border);
+  color: var(--muted);
+  text-decoration: none;
+}
+nav.toc a::before { content: counter(toc) ". "; }
+nav.toc a:hover { color: var(--accent); border-left-color: var(--accent); }
+main { min-width: 0; }
+header.hero { border-bottom: 1px solid var(--border); padding-bottom: 20px; margin-bottom: 8px; }
+header.hero h1 { font-size: 30px; line-height: 1.3; margin: 0 0 8px; }
+header.hero p { color: var(--muted); margin: 0; }
+h2 {
+  font-size: 22px;
+  margin: 56px 0 14px;
+  padding-top: 8px;
+  scroll-margin-top: 16px;
+}
+h2 .num { color: var(--accent); margin-right: 8px; font-variant-numeric: tabular-nums; }
+h3 { font-size: 17px; margin: 30px 0 10px; }
+h4 { font-size: 15px; margin: 22px 0 8px; color: var(--muted); }
+p { margin: 10px 0; }
+a { color: var(--accent); }
+code {
+  font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  font-size: 0.88em;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+  overflow-x: auto;
+  font-size: 13px;
+  line-height: 1.6;
+}
+pre code { background: none; border: 0; padding: 0; font-size: inherit; }
+.cm { color: var(--muted); }
+.hl { color: var(--accent); font-weight: 600; }
+.table-wrap { overflow-x: auto; margin: 12px 0; border: 1px solid var(--border); border-radius: 8px; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; background: var(--surface); }
+th, td { padding: 8px 12px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+th { background: var(--surface-2); font-weight: 600; white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+.callout {
+  background: var(--accent-soft);
+  border-left: 3px solid var(--accent);
+  border-radius: 0 8px 8px 0;
+  padding: 12px 16px;
+  margin: 16px 0;
+}
+.callout.warn { background: var(--warn-bg); border-left-color: var(--warn); }
+.callout p:first-child { margin-top: 0; }
+.callout p:last-child { margin-bottom: 0; }
+.summary {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 18px;
+  margin: 18px 0;
+}
+.summary strong { color: var(--accent); }
+.flow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 16px 0;
+}
+.flow .node {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 13.5px;
+}
+.flow .node b { display: block; font-size: 14px; }
+.flow .node span { color: var(--muted); font-size: 12.5px; }
+.flow .arrow { color: var(--muted); }
+
+/* 拼接示意 */
+.rows {
+  display: grid;
+  grid-template-columns: 72px repeat(6, minmax(48px, 1fr));
+  gap: 3px;
+  font-family: "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  margin: 14px 0;
+  min-width: 460px;
+}
+.rows .lbl { color: var(--muted); padding: 5px 4px; text-align: right; }
+.rows .c { padding: 5px 4px; text-align: center; border-radius: 4px; }
+.rows .a { background: var(--seq-a); }
+.rows .b { background: var(--seq-b); }
+.rows .cc { background: var(--seq-c); }
+.rows .h { background: transparent; color: var(--muted); font-size: 11.5px; }
+.scroll-x { overflow-x: auto; }
+
+/* 缓冲区示意 */
+.buf {
+  display: flex;
+  min-width: 720px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  font-size: 12px;
+  margin: 14px 0;
+}
+.buf div {
+  padding: 8px 4px;
+  text-align: center;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+  line-height: 1.4;
+}
+.buf div:last-child { border-right: 0; }
+.buf div small { display: block; color: var(--muted); font-size: 11px; }
+.buf .tok { background: var(--seq-a); }
+.buf .seq { background: var(--seq-b); }
+.buf .til { background: var(--seq-c); }
+.buf .bt { background: var(--surface-2); }
+.legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12.5px; color: var(--muted); }
+.legend i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -1px; margin-right: 4px; }
+
+.theme-toggle {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 13px;
+  cursor: pointer;
+}
+footer { margin-top: 64px; color: var(--muted); font-size: 13px; border-top: 1px solid var(--border); padding-top: 16px; }
+
+@media (max-width: 900px) {
+  .layout { grid-template-columns: 1fr; padding: 20px 16px 72px; gap: 0; }
+  nav.toc { position: static; max-height: none; margin-bottom: 8px; border: 1px solid var(--border); border-radius: 8px; padding: 12px; background: var(--surface); }
+  header.hero h1 { font-size: 24px; }
+  h2 { font-size: 20px; margin-top: 44px; }
+}
+</style>
+</head>
+<body>
+<div class="layout">
+
+<nav class="toc">
+  <div class="toc-title">目录</div>
+  <ol>
+    <li><a href="#overview">整体流程</a></li>
+    <li><a href="#cb">Continuous Batching</a></li>
+    <li><a href="#preempt">抢占逻辑</a></li>
+    <li><a href="#pass">execute 拆趟</a></li>
+    <li><a href="#pass-why">拆趟的好处与代价</a></li>
+    <li><a href="#max-tokens">max_tokens 怎么定</a></li>
+    <li><a href="#varlen">变长 token 维度</a></li>
+    <li><a href="#fillmeta">fillMeta 详解</a></li>
+    <li><a href="#example">完整例子</a></li>
+    <li><a href="#index">代码位置索引</a></li>
+  </ol>
+</nav>
+
+<main>
+<header class="hero">
+  <h1>连续批处理（Continuous Batching）详解</h1>
+  <p>从调度、抢占、拆趟执行，到变长 token 拼接和元数据布局。代码路径都相对于项目根目录。</p>
+</header>
+
+<!-- ============================== 1 ============================== -->
+<h2 id="overview"><span class="num">01</span>整体流程</h2>
+
+<p>每一步（每生成一个 token）都会完整走一遍下面这条链路，<code>src/runner/engine.zig</code> 的 step 负责串起来：</p>
+
+<div class="flow">
+  <div class="node"><b>schedule()</b><span>batching.zig · 选出本步的 Entry 列表</span></div>
+  <div class="arrow">→</div>
+  <div class="node"><b>execute()</b><span>executor.zig · 超出容量就拆趟</span></div>
+  <div class="arrow">→</div>
+  <div class="node"><b>forward()</b><span>fillMeta → 拷到显存 → 跑计算图</span></div>
+  <div class="arrow">→</div>
+  <div class="node"><b>emits() 过滤</b><span>engine.zig · 只保留产出 token 的条目</span></div>
+  <div class="arrow">→</div>
+  <div class="node"><b>postprocess()</b><span>追加 token，结束的移出并释放 block</span></div>
+</div>
+
+<p>核心数据结构 <code>Entry</code>（<code>batching.zig:93</code>）描述"这一步要对哪条序列的哪一段 token 做前向"：</p>
+
+<pre><code>pub const Entry = struct {
+    seq: *Sequence,
+    q_start: usize,   <span class="cm">// 本步从序列的第几个 token 开始算</span>
+    q_len: usize,     <span class="cm">// 本步算多少个 token</span>
+
+    <span class="cm">// 算到了序列当前最后一个 token → 本步会产出一个新 token</span>
+    <span class="cm">// decode 永远为真；prefill 最后一块为真；chunked prefill 的中间块为 false</span>
+    pub fn emits(self: Entry) bool {
+        return (self.q_start + self.q_len) == self.seq.len();
+    }
+};</code></pre>
+
+<!-- ============================== 2 ============================== -->
+<h2 id="cb"><span class="num">02</span>Continuous Batching</h2>
+
+<p><code>src/runner/batching.zig</code> 实现的就是 continuous batching（迭代级调度），带两种调度策略、基于 block 的 KV 分配和抢占，结构上和 nano-vllm / vLLM 的调度器基本一致。</p>
+
+<h3>和 static batching 的区别</h3>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Static batching</th><th>Continuous batching</th></tr>
+  <tr><td>组批时机</td><td>凑齐一批再开跑</td><td><b>每一步都重新组批</b></td></tr>
+  <tr><td>序列结束</td><td>等全批最长的那条跑完，先结束的位置空转</td><td><b>结束马上移出，资源立刻释放</b></td></tr>
+  <tr><td>新请求加入</td><td>等下一批</td><td><b>下一步就能插进来</b></td></tr>
+</table></div>
+
+<h3>代码里的对应位置</h3>
+<ul>
+  <li><b>每步重新调度</b>：<code>schedule()</code>（<code>batching.zig:145</code>）每次先 <code>clearRetainingCapacity()</code>，再按 waiting / running 的当前状态重新组批。</li>
+  <li><b>结束就离场</b>：<code>postprocess()</code>（<code>batching.zig:316-325</code>）碰到 EOS 或到达 <code>max_tokens</code>，立刻 <code>deallocate</code> 释放 block，并从 running 移除。</li>
+  <li><b>新请求随时进场</b>：<code>add()</code> 只是追加到 waiting；下一次 <code>schedule()</code> 只要预算和 block 够，就拉进 running。</li>
+</ul>
+
+<h3>时间线示例（prefill_first）</h3>
+<div class="table-wrap"><table>
+  <tr><th>step</th><th>waiting</th><th>本步调度</th><th>说明</th></tr>
+  <tr><td>1</td><td>[A, B]</td><td>prefill A, B</td><td>两条一起 prefill</td></tr>
+  <tr><td>2</td><td>[]</td><td>decode A, B</td><td></td></tr>
+  <tr><td>3</td><td>[C]</td><td><b>prefill C</b></td><td>C 到了，prefill 优先，A、B 这步暂停</td></tr>
+  <tr><td>4</td><td>[]</td><td>decode A, B, C</td><td>C 直接并入正在跑的批</td></tr>
+  <tr><td>5</td><td>[]</td><td>decode A, B, C</td><td>A 碰到 EOS，移出并释放 block</td></tr>
+  <tr><td>6</td><td>[]</td><td>decode B, C</td><td>A 的位置马上让出来</td></tr>
+</table></div>
+
+<h3>两种调度策略</h3>
+<div class="table-wrap"><table>
+  <tr><th></th><th><code>prefill_first</code>（<code>:155</code>）</th><th><code>chunked</code>（<code>:220</code>）</th></tr>
+  <tr><td>对应实现</td><td>nano-vllm、vLLM V0 默认</td><td>Sarathi-Serve、vLLM V1</td></tr>
+  <tr><td>一步里的内容</td><td>要么全是 prefill，要么全是 decode</td><td>prefill 分块和 decode 混在同一步</td></tr>
+  <tr><td>prefill 长度</td><td>整段 prompt 一次算完</td><td>每步最多 <code>chunk_tokens</code></td></tr>
+  <tr><td>优点</td><td>实现简单；纯 decode 步能用 CUDA Graph</td><td>decode 不会被长 prefill 卡住，ITL 更平稳</td></tr>
+  <tr><td>缺点</td><td>新请求一来 decode 就停一步（decode 饥饿）</td><td>混合步一般用不上 CUDA Graph</td></tr>
+</table></div>
+<p><code>chunked</code> 里先处理 running（decode 和没算完的 prefill），剩下的预算再从 waiting 接新请求：老序列优先。</p>
+
+<h3>配套机制</h3>
+<ul>
+  <li><b>Paged KV</b>（<code>block_table</code> + <code>BlockManager</code>）：KV 按块按需分配，不用给每条序列预留 <code>max_model_len</code>。</li>
+  <li><b>抢占</b>（<code>preempt</code>）：block 不够时把后来的序列踢回 waiting 队首，之后重新 prefill（recompute 方式）。</li>
+  <li><b><code>num_computed_tokens</code> + <code>emits()</code></b>：记录每条序列算到哪里，chunk 中间块不产出 token。</li>
+</ul>
+
+<h3>和完整版 vLLM 相比还缺</h3>
+<ul>
+  <li>Prefix caching（相同前缀共享 KV block）</li>
+  <li>Swap 方式抢占（把 KV 换到 CPU，而不是丢掉重算）</li>
+  <li>优先级 / 公平调度（现在是纯 FIFO）</li>
+</ul>
+<p>另外，<code>chunked</code> 从 waiting 接新请求时 <code>ensure</code> 失败就直接 <code>break</code>，不会为新请求抢占老请求。这是合理的选择，否则容易来回抖动。</p>
+
+<!-- ============================== 3 ============================== -->
+<h2 id="preempt"><span class="num">03</span>抢占逻辑</h2>
+
+<h3>为什么 decode 会缺块</h3>
+<p>decode 时 <code>seq.len()</code> 已经包含上一步刚采样出的 token，但它的 KV 还没写进 cache。这步 forward 要把它写进去，所以要能装下 <code>seq.len()</code> 个 token。长度一旦跨过块边界（比如 block_size=16，长度从 16 变成 17），就要再申请一块。</p>
+<p><code>canEnsure(seq, n)</code>（<code>block.zig:64</code>）只检查不分配：已有块够用，或者缺的块数 ≤ 空闲块数，返回 true。</p>
+
+<h3>循环逻辑（<code>batching.zig:195</code>）</h3>
+<pre><code>while (!canEnsure(seq, seq.len())) {          <span class="cm">// 序列 i 缺块</span>
+    if (running.len - 1 > i) {                <span class="cm">// i 后面还有别的序列</span>
+        preempt(running.pop().?);             <span class="cm">// 踢掉队尾，释放它的块，再检查一次</span>
+    } else {                                  <span class="cm">// i 自己就是队尾</span>
+        _ = running.orderedRemove(i);
+        preempt(seq);                         <span class="cm">// 把自己也踢掉</span>
+        ok = false;
+        break;                                <span class="cm">// 本轮 decode 调度结束</span>
+    }
+}</code></pre>
+
+<div class="callout"><p>规则：<b>先来的优先保住，后来的先被牺牲</b>。<code>running</code> 按进入顺序排列，下标越小越早。<code>ok</code> 标志用于跳出外层 while：内层 <code>break</code> 只能跳出抢占循环。</p></div>
+
+<h3>例子：running = [A, B, C, D]，空闲块为 0</h3>
+<div class="table-wrap"><table>
+  <tr><th>步骤</th><th>i</th><th>情况</th><th>动作</th><th>running</th><th>waiting</th></tr>
+  <tr><td>1</td><td>0</td><td>A 不用新块</td><td>调度 A</td><td>[A,B,C,D]</td><td>[]</td></tr>
+  <tr><td>2</td><td>1</td><td>B 缺 1 块</td><td>pop D，释放 D 的块</td><td>[A,B,C]</td><td>[D]</td></tr>
+  <tr><td>3</td><td>1</td><td>块够了</td><td><code>ensure</code> 分配，调度 B</td><td>[A,B,C]</td><td>[D]</td></tr>
+  <tr><td>4</td><td>2</td><td>C 缺块，自己是队尾</td><td>踢掉 C，break</td><td>[A,B]</td><td>[C,D]</td></tr>
+</table></div>
+
+<h3>细节</h3>
+<ul>
+  <li><b>waiting 顺序不乱</b>：<code>preempt</code> 用 <code>insert(0, seq)</code> 插到队首。从队尾往前踢，D 先进、C 后插到它前面，结果是 <code>[C, D]</code>。</li>
+  <li><b>被抢占就要重算</b>：<code>deallocate</code> 把 <code>num_computed_tokens</code> 清 0，KV 全丢，下轮整段重新 prefill（prompt + 已生成的 token）。</li>
+  <li><b>先 canEnsure 再 ensure</b>：确认够了才真正拿块，不会出现分了一半又失败的状态。</li>
+  <li><code>scheduleChunked</code> 里有一段相同的抢占逻辑，区别只是检查 <code>upto</code>（本轮 chunk 算到的位置）而不是 <code>seq.len()</code>。</li>
+</ul>
+
+<!-- ============================== 4 ============================== -->
+<h2 id="pass"><span class="num">04</span>execute 拆趟</h2>
+
+<p>调度出来的一批 token 总数可能超过执行器单趟能放下的上限 <code>limit.max_tokens</code>（激活区、元数据区都按这个上限预分配）。超出时，<code>execute</code>（<code>executor.zig:948</code>）把这一批拆成几趟依次跑，结果按原 entries 顺序拼回去。</p>
+
+<pre><code>execute(entries)
+ ├─ 序列条数 > max_seqs        → 报错（序列区放不下，拆趟也没用）
+ ├─ 总 token 数 ≤ max_tokens   → 一趟 forward 直接返回（常见情况）
+ └─ 总 token 数 > max_tokens   → 拆成多趟</code></pre>
+
+<h3>三个辅助数组</h3>
+<div class="table-wrap"><table>
+  <tr><th>变量</th><th>含义</th></tr>
+  <tr><td><code>pass_out</code></td><td>最终结果，长度 = entries.len，第 i 个是 entries[i] 的采样 token</td></tr>
+  <tr><td><code>pass_group</code></td><td>当前这一趟要跑的"片段"，每个片段也是 Entry，只覆盖原条目的一部分</td></tr>
+  <tr><td><code>pass_owner</code></td><td>和 pass_group 一一对应，记录每个片段来自 entries 的第几条</td></tr>
+</table></div>
+
+<h3>切分循环</h3>
+<pre><code>var room = max_tokens;                         <span class="cm">// 当前这趟还能装多少 token</span>
+for (entries, 0..) |e, idx| {
+    var qs = e.q_start;
+    var left = e.q_len;
+    while (left > 0) {
+        const take = @min(left, room);         <span class="cm">// 能装多少装多少</span>
+        pass_group.append({ e.seq, qs, take });
+        pass_owner.append(idx);
+        qs += take; left -= take; room -= take;
+        if (room == 0) {                       <span class="cm">// 装满了，立刻跑一趟</span>
+            flushPass(entries);
+            room = max_tokens;
+        }
+    }
+}
+flushPass(entries);                            <span class="cm">// 最后一趟没装满也要跑</span></code></pre>
+
+<h3>flushPass：跑一趟并回收结果（<code>executor.zig:989</code>）</h3>
+<pre><code>const toks = forward(pass_group.items);        <span class="cm">// 每个片段返回一个采样 token</span>
+for (pass_group, pass_owner, toks) |piece, owner, tk| {
+    const e = entries[owner];
+    if (piece.q_start + piece.q_len == e.q_start + e.q_len)  <span class="cm">// 是该条目的最后一段</span>
+        pass_out[owner] = tk;
+}</code></pre>
+<p>只有<b>原条目最后一段</b>的采样结果有意义；中间片段的末尾不是条目末尾，采出来的 token 直接丢掉。</p>
+
+<h3>例子：max_tokens = 8</h3>
+<div class="table-wrap"><table>
+  <tr><th>idx</th><th>条目</th><th>q_start</th><th>q_len</th></tr>
+  <tr><td>0</td><td>A：prefill，prompt 长 10</td><td>0</td><td>10</td></tr>
+  <tr><td>1</td><td>B：decode</td><td>30</td><td>1</td></tr>
+  <tr><td>2</td><td>C：decode</td><td>15</td><td>1</td></tr>
+</table></div>
+<ul>
+  <li><b>第 1 趟</b>：<code>A[0..8)</code>，满了就 flush。片段末尾 8 ≠ 10，结果丢弃。这一趟的作用是把 A 前 8 个 token 的 KV 写进 cache。</li>
+  <li><b>第 2 趟</b>：<code>A[8..10)</code>、<code>B</code>、<code>C</code>。A 末尾 10 = 10，写入 <code>pass_out[0]</code>；B、C 分别写入 <code>pass_out[1]</code>、<code>pass_out[2]</code>。</li>
+</ul>
+
+<h3>为什么拆开跑结果还是对的</h3>
+<ul>
+  <li><b>KV Cache 起衔接作用</b>：第 2 趟算 <code>A[8..10)</code> 时，attention 从 cache 读前 8 个位置，等同于一次算完。原理和 chunked prefill 相同。</li>
+  <li><b>同一序列的片段不会在同一趟</b>：只有 <code>room == 0</code> 才切断序列，而 room 归零会立刻 flush，保证先写 KV 后读 KV。</li>
+  <li><b>非 emit 条目会被过滤</b>：<code>pass_out</code> 里也有值，但 <code>engine.zig:135</code> 只取 <code>e.emits()</code> 为真的条目。</li>
+</ul>
+
+<!-- ============================== 5 ============================== -->
+<h2 id="pass-why"><span class="num">05</span>拆趟的好处与代价</h2>
+
+<p>核心好处：<b>把"一步调度多少 token"（调度器的决定）和"一趟 forward 能装多少 token"（执行器的显存限制）解耦</b>。</p>
+
+<h3>好处</h3>
+<ol>
+  <li><b>显存上限可预测</b>：激活区（<code>tok_arena</code>）、元数据区（<code>meta</code>）启动时按 <code>max_tokens</code> 一次性切好，运行时不扩。拆趟保证一趟永远不超，不会越界也不会 OOM。</li>
+  <li><b>调度器不用关心执行器的内存细节</b>：调度器按自己的 <code>max_batched_tokens_num</code>（默认 16384）和 KV block 决定跑谁，执行器保证都能跑完，返回格式不变。</li>
+  <li><b>长 prompt 也能跑</b>：<code>prefill_first</code> 下 prompt 是整段 prefill，比 <code>max_tokens</code> 长时，拆趟相当于在执行层自动做了 chunked prefill。</li>
+  <li><b>激活显存可以设小一点</b>：激活区 ≈ <code>max_tokens × 每 token 字节数</code>，设小之后省下的显存留给 KV Cache，能同时跑的序列更多、抢占更少。</li>
+</ol>
+
+<h3>代价</h3>
+<div class="table-wrap"><table>
+  <tr><th>代价</th><th>原因</th></tr>
+  <tr><td>权重要多读几遍</td><td>每趟都要把全部层的权重读一遍，拆成 N 趟就读 N 次</td></tr>
+  <tr><td>中间片段的采样白算</td><td>非最后一段的结果被丢弃（lm_head 只算最后一行，开销不大）</td></tr>
+  <tr><td>这一步的延迟变长</td><td>N 趟串行，同一步里的 decode 序列要等所有趟跑完，ITL 出现尖峰</td></tr>
+  <tr><td>用不上 CUDA Graph</td><td>拆出来的批一般含 prefill 片段，走 eager 路径</td></tr>
+</table></div>
+
+<div class="callout"><p>拆趟是<b>兜底的安全网</b>，不是常规路径。最理想的配置是让调度器的 token 预算（<code>max_batched_tokens_num</code> 或 <code>chunk_tokens</code>）不超过执行器的 <code>max_tokens</code>，大多数步都走一趟的快路径。</p></div>
+
+<!-- ============================== 6 ============================== -->
+<h2 id="max-tokens"><span class="num">06</span>max_tokens 怎么定</h2>
+
+<p><code>src/graph/scheduler.zig:32</code> 的 <code>max_tokens: usize = 1024</code> 只是结构体默认值。实际生效的值来自 <code>llmgen.zig:74</code> 传进来的 <code>cli_opts.maxTokens()</code>（<code>src/cli.zig:58</code>）：</p>
+
+<pre><code>pub fn maxTokens(self: Options) usize {
+    const pass = self.pass_tokens orelse (if (opts.have_cuda) @as(usize, 8192) else 2048);
+    return @max(pass, self.max_num_seqs);
+}</code></pre>
+
+<ul>
+  <li>命令行 <code>--pass-tokens &lt;n&gt;</code> 指定了就用 n</li>
+  <li>否则 CUDA 构建默认 <b>8192</b>，CPU 构建默认 <b>2048</b></li>
+  <li>最后和 <code>max_num_seqs</code>（默认 256）取较大值</li>
+</ul>
+
+<h3>决定因素</h3>
+<div class="table-wrap"><table>
+  <tr><th>因素</th><th>说明</th></tr>
+  <tr><td>下限：一步 decode 必须一趟装下</td><td>S 条序列 decode 就是 S 个 token。<code>max_tokens &lt; max_num_seqs</code> 会导致 decode 也拆趟、CUDA Graph 失效，所以有 <code>@max</code></td></tr>
+  <tr><td>上限：和 KV Cache 抢显存</td><td>KV 预算 = 总显存 × 利用率 − 已用 − 权重 − 激活 − 预留（<code>scheduler.zig:380</code> 之后）。激活随 <code>max_tokens</code> 线性增长，挤掉的是 KV block</td></tr>
+  <tr><td>收益：把 GPU 喂饱</td><td>T 太小时 prefill 访存受限；增大到几百到几千后进入计算受限，再大吞吐基本不涨</td></tr>
+  <tr><td>CPU 为什么更小</td><td>CPU 几百个 token 就算满了，设大只会拉长单步延迟；CPU 的 KV 固定 <code>HOST_KV_BLOCKS = 512</code> 块，不和激活抢</td></tr>
+</table></div>
+
+<h3>业界参考</h3>
+<div class="table-wrap"><table>
+  <tr><th>框架</th><th>参数</th><th>常见默认值</th></tr>
+  <tr><td>nano-vllm</td><td><code>max_num_batched_tokens</code></td><td>16384</td></tr>
+  <tr><td>vLLM</td><td><code>max_num_batched_tokens</code></td><td>随版本和场景变化，chunked prefill 下常见 2048～8192，离线吞吐场景更大</td></tr>
+  <tr><td>本项目</td><td><code>--pass-tokens</code></td><td>CUDA 8192 / CPU 2048</td></tr>
+</table></div>
+<p>偏小有利于降低 decode 延迟抖动（ITL），偏大有利于提高 prefill 吞吐、降低首 token 延迟（TTFT）。</p>
+
+<h3>怎么调</h3>
+<ol>
+  <li>跑一次，看启动日志 <code>[executor] 激活 token 区 xx MB (yyy B/token)</code>（<code>executor.zig:739</code>）和 KV block 数</li>
+  <li>用 bench workload 分别试 <code>--pass-tokens 2048 / 4096 / 8192 / 16384</code>，对比吞吐、TTFT、<code>num_preemptions</code></li>
+  <li>选吞吐不再明显上升、KV 仍够用（抢占不多）的那个点</li>
+</ol>
+
+<!-- ============================== 7 ============================== -->
+<h2 id="varlen"><span class="num">07</span>变长 token 维度</h2>
+
+<p>不同序列本步的 token 数不一样（prefill 几千个，decode 1 个）。这里<b>不用 padding 对齐</b>，而是把所有 token <b>首尾相接拼成一维</b>（packed / varlen batch），再附带一份元数据说明边界和位置。</p>
+
+<pre><code>传统:    [batch, max_len, hidden]，短的补 0  → 浪费大量计算
+这里:    [A0 A1 A2 | B5 | C4 C5]  → [T, hidden]，T = 6，S = 3，没有 batch 维</code></pre>
+
+<h3>动态维度 DYN / DYN_S</h3>
+<p>计算图启动时只建一次，但每步 T、S 都在变。<code>src/module/base.zig:11-12</code> 定义了两个占位符：</p>
+<pre><code>pub const DYN: i64 = -1;   <span class="cm">// 本步 token 总数 T</span>
+pub const DYN_S: i64 = -2; <span class="cm">// 本步序列数 S</span></code></pre>
+<p>每步 forward 前 <code>resolveDims</code>（<code>executor.zig:930</code>，调用在 <code>:571</code>）把它们替换成真实值并重算 stride。</p>
+
+<h3>各算子如何处理</h3>
+<div class="table-wrap"><table>
+  <tr><th>算子</th><th>读的元数据</th><th>做法</th></tr>
+  <tr><td>embedding / Linear / RMSNorm / MLP</td><td>无</td><td>逐 token 独立，<code>[T, hidden] @ W</code> 就是普通矩阵乘，不关心序列边界</td></tr>
+  <tr><td>RoPE</td><td><code>pos</code></td><td>第 t 行用 <code>pos[t]</code> 查 cos/sin，而不是行号 t</td></tr>
+  <tr><td>store_kv</td><td><code>slots</code></td><td>第 t 行的 K/V 写到 <code>slots[t]</code>，<code>-1</code> 跳过</td></tr>
+  <tr><td>attention</td><td><code>cu_q</code> <code>ctx</code> <code>block_tables</code></td><td>按序列循环，只读本序列的行和本序列的 KV 块，天然隔离</td></tr>
+  <tr><td>gather_last</td><td><code>last</code></td><td>从 <code>[T, hidden]</code> 挑出每条序列最后一行 → <code>[S, hidden]</code></td></tr>
+  <tr><td>sample</td><td><code>temps</code> <code>seed</code></td><td><code>[S, vocab]</code> 每行按各自温度采样</td></tr>
+</table></div>
+
+<h3>attention 的因果公式</h3>
+<p>CPU <code>attend</code>（<code>backend/cpu/attention.zig:64</code>）对序列 s 的段内第 j 个 query：</p>
+<pre><code>n_keys = ctx - q_len + j + 1;   <span class="cm">// attention.zig:84，只看位置 0..自己</span></code></pre>
+<p>一个公式覆盖三种情况：</p>
+<div class="table-wrap"><table>
+  <tr><th>序列</th><th>ctx</th><th>q_len</th><th>每个 query 看到的 key 数</th></tr>
+  <tr><td>A（完整 prefill）</td><td>3</td><td>3</td><td>1, 2, 3（标准因果三角）</td></tr>
+  <tr><td>B（decode）</td><td>6</td><td>1</td><td>6（看全部历史）</td></tr>
+  <tr><td>C（chunk 后半段）</td><td>6</td><td>2</td><td>5, 6（4 个历史 + 段内因果）</td></tr>
+</table></div>
+<p>store_kv 在 attend <b>之前</b>执行（<code>attention.zig:133</code>），所以本步新 token 的 KV 已经在 cache 里。因为 cu_q 只给本序列的行、block_table 只指向本序列的块，不需要构造 <code>[T, T]</code> 的 mask。</p>
+
+<h3>gather_last：T → S</h3>
+<p>位于 final_norm 之后、lm_head 之前（<code>models/qwen3.zig:324, 330</code>）。lm_head 输出 151936 维，只让每条序列的最后一行过 lm_head，能省掉绝大部分计算。</p>
+
+<h3>CUDA Graph 下的 padding</h3>
+<p>纯 decode 步会把 S 向上取到桶大小（1、2、4、8、16、32、48…）。多出来的行填成无害值：<code>slots = -1</code>（不写 KV）、<code>ctx = 0</code>（attention 输出 0），采样结果由 <code>fetchOutAt(..., n_seq)</code> 截掉。这是整个流程里<b>唯一用到 padding 的地方</b>。</p>
+
+<div class="summary"><p>一句话：<strong>token 维靠"拼接 + 前缀和"解决，序列维靠 gather_last 收缩，边界全部写在元数据里，只有 RoPE、attention 等和位置相关的算子去读它</strong>。这和 vLLM 的 <code>cu_seqlens</code> / <code>slot_mapping</code> / <code>block_tables</code>、FlashAttention 的 varlen 接口是同一套思路。</p></div>
+
+<!-- ============================== 8 ============================== -->
+<h2 id="fillmeta"><span class="num">08</span>fillMeta 详解</h2>
+
+<p><code>fillMeta</code>（<code>executor.zig:764</code>）做了两层"拼成一维"：</p>
+<ol>
+  <li><b>token 层</b>：所有 entry 的 token 首尾相接排成 T 行，靠游标 <code>t</code> 实现</li>
+  <li><b>内存层</b>：十来个元数据数组按 <code>Layout</code> 的偏移塞进同一块连续缓冲 <code>meta_host</code>，一次拷到显存</li>
+</ol>
+
+<h3>内存层：Layout</h3>
+<p><code>Layout.init</code>（<code>executor.zig:153</code>）不分配内存，只用一个从 8 开始累加的 <code>offset</code> 算出每个数组的起始字节：</p>
+
+<div class="scroll-x">
+<div class="buf">
+  <div style="flex:0.6">seed<small>8B</small></div>
+  <div class="tok" style="flex:1">ids<small>4·T</small></div>
+  <div class="tok" style="flex:1">pos<small>4·T</small></div>
+  <div class="tok" style="flex:1">slots<small>4·T</small></div>
+  <div class="seq" style="flex:0.9">cu_q<small>4·(S+1)</small></div>
+  <div class="seq" style="flex:0.7">ctx<small>4·S</small></div>
+  <div class="seq" style="flex:0.7">last<small>4·S</small></div>
+  <div class="seq" style="flex:0.7">temps<small>4·S</small></div>
+  <div class="til" style="flex:0.9">tile_seq<small>4·tiles</small></div>
+  <div class="til" style="flex:0.9">tile_q0<small>4·tiles</small></div>
+  <div class="bt" style="flex:1.6">bt<small>4·S·max_blocks</small></div>
+</div>
+</div>
+<div class="legend">
+  <span><i style="background:var(--seq-a)"></i>逐 token</span>
+  <span><i style="background:var(--seq-b)"></i>逐序列</span>
+  <span><i style="background:var(--seq-c)"></i>prefill tile</span>
+  <span><i style="background:var(--surface-2)"></i>块表</span>
+</div>
+
+<p><code>fillMeta</code> 开头用 <code>i32At(layout.xxx)</code> / <code>f32At</code>（<code>executor.zig:747-752</code>）拿各段指针，只是把 <code>meta_host + 偏移</code> 强转成对应类型，不拷贝也不分配。</p>
+
+<div class="callout">
+<p><b>为什么挤进同一块缓冲</b></p>
+<ul>
+  <li><code>uploadMeta</code>（<code>:757</code>）只需<b>一次</b> <code>cuda_h2d_async</code>，而不是十次</li>
+  <li>kernel 端地址是 <code>devAt(偏移) = meta_dev + 偏移</code>（<code>:753</code>），和 host 端一一对应</li>
+  <li>(T, S, tiles) 相同时偏移完全相同、地址固定，CUDA Graph 回放时往同样位置写新值即可</li>
+</ul>
+</div>
+
+<h3>① 写 seed</h3>
+<pre><code>self.step_seed +%= 0x9E3779B97F4A7C15;   <span class="cm">// 每步加一个黄金比例常数，+%= 允许回绕</span>
+std.mem.writeInt(u64, self.meta_host[0..8], self.step_seed, .little);</code></pre>
+<p>采样 kernel 从显存读种子，所以 CUDA Graph 回放时每步的随机数也不同。</p>
+
+<h3>② 主循环：拼接 token（核心）</h3>
+<pre><code>var t: usize = 0;        <span class="hl">// ★ 全局游标：下一个 token 写到第几行</span>
+var tile: usize = 0;
+cu_q[0] = 0;
+
+for (entries, 0..) |e, s| {
+    const seq = e.seq;
+
+    <span class="cm">// 把这条序列本步的 q_len 个 token 依次追加到第 t 行</span>
+    for (0..e.q_len) |j| {
+        const p = e.q_start + j;                         <span class="cm">// 在自己序列里的位置</span>
+        ids[t]   = seq.all_token_ids.items[p];
+        pos[t]   = @intCast(p);
+        slots[t] = seq.slotOf(p, self.limit.block_size);
+        t += 1;                                          <span class="hl">// ★ 游标前进，从不清零</span>
+    }
+
+    <span class="cm">// 记录这条序列的边界和属性</span>
+    cu_q[s + 1] = @intCast(t);                    <span class="cm">// 序列 s 占 [cu_q[s], cu_q[s+1]) 行</span>
+    ctx[s]      = @intCast(e.q_start + e.q_len);  <span class="cm">// 算完本步 KV 里共有多少 token</span>
+    last[s]     = @intCast(t - 1);                <span class="cm">// 最后一行的行号</span>
+    temps[s]    = seq.params.temperature;
+
+    <span class="cm">// 块表拷进第 s 行，不足 max_blocks 补 0</span>
+    const row = bt + s * mb;
+    @memcpy(row[0..nb], seq.block_table.items);
+    @memset(row[nb..mb], 0);
+
+    <span class="cm">// prefill：query 按 pf_tile(64) 切块</span>
+    if (n_tiles > 0) {
+        var q0: usize = 0;
+        while (q0 &lt; e.q_len) : (q0 += self.pf_tile) {
+            tseq[tile] = @intCast(s);
+            tq0[tile]  = @intCast(q0);
+            tile += 1;
+        }
+    }
+}</code></pre>
+
+<p><b>拼成一维的关键就是游标 <code>t</code></b>：它在整个外层循环中一直累加。序列 0 写在第 0 ~ q_len₀−1 行，序列 1 紧接着写，以此类推。每条序列写完时 <code>t</code> 的值就是下一条的起点，存进 <code>cu_q[s+1]</code>。所以 <code>cu_q</code> 就是 q_len 的<b>前缀和</b>，任何 kernel 都能据此把一维数组拆回各条序列。</p>
+
+<div class="table-wrap"><table>
+  <tr><th>字段</th><th>下标</th><th>存的是</th><th>说明</th></tr>
+  <tr><td><code>t</code></td><td>—</td><td>一维数组里的行号</td><td>所有序列共享，0 到 T−1</td></tr>
+  <tr><td><code>p</code></td><td>—</td><td>在自己序列内的位置</td><td>每条序列各自从 q_start 开始</td></tr>
+  <tr><td><code>pos[t]</code></td><td>行号</td><td><code>p</code></td><td>行号和位置脱钩，RoPE 必须用它</td></tr>
+  <tr><td><code>ids[t]</code></td><td>行号</td><td><code>all_token_ids[p]</code></td><td>decode 时 p = len−1，即上步采样、本步作为输入的 token</td></tr>
+  <tr><td><code>ctx[s]</code></td><td>序列号</td><td><code>q_start + q_len</code></td><td>chunk 中间块的 ctx 小于 <code>seq.len()</code></td></tr>
+  <tr><td><code>last[s]</code></td><td>序列号</td><td><code>t − 1</code></td><td>每条都填，是否有效由 engine 用 <code>emits()</code> 判断</td></tr>
+</table></div>
+
+<h3>③ padding 行（只有 CUDA Graph decode 才走到）</h3>
+<pre><code>var s = entries.len;
+while (s &lt; Sn) : (s += 1) {     <span class="cm">// Sn 是桶大小</span>
+    ids[t]   = 0;
+    pos[t]   = 0;
+    slots[t] = -1;              <span class="cm">// store_kv 跳过</span>
+    t += 1;                     <span class="cm">// 游标继续往后走</span>
+    cu_q[s + 1] = @intCast(t);
+    ctx[s]   = 0;               <span class="cm">// attend 里 ctx &lt; q_len → 输出 0</span>
+    last[s]  = @intCast(t - 1);
+    temps[s] = 0;
+    @memset((bt + s * mb)[0..mb], 0);
+}</code></pre>
+<p>padding 按同样格式拼在末尾，让一维数组长度刚好等于桶大小、和录图时形状一致。非 decode 步 <code>Sn == entries.len</code>，这段不执行。</p>
+
+<h3>④ 之后</h3>
+<p><code>forward</code> 调用 <code>uploadMeta(layout.total)</code> 一次性拷到显存，再由 <code>bindStep</code>（<code>:826</code>）把 <code>devAt(layout.xxx)</code> 地址写进全局 <code>g_step</code>，各 kernel 从那里读。<code>bindStep</code> 还把 <code>input_tensor.data</code> 直接指向 ids 段，embedding 就从这里读 token id。</p>
+
+<!-- ============================== 9 ============================== -->
+<h2 id="example"><span class="num">09</span>完整例子</h2>
+
+<p>为了好算，设 <code>block_size = 4</code>（实际默认 16）、<code>max_blocks = 4</code>、<code>pf_tile = 64</code>：</p>
+
+<div class="table-wrap"><table>
+  <tr><th>s</th><th>序列</th><th>状态</th><th>seq.len()</th><th>q_start</th><th>q_len</th><th>block_table</th></tr>
+  <tr><td>0</td><td>A</td><td>新 prompt <code>[a0 a1 a2]</code></td><td>3</td><td>0</td><td>3</td><td><code>[7]</code></td></tr>
+  <tr><td>1</td><td>B</td><td>decode，前 5 个已算，第 6 个是上步采样的</td><td>6</td><td>5</td><td>1</td><td><code>[2, 5]</code></td></tr>
+  <tr><td>2</td><td>C</td><td>chunked prefill，prompt 长 10，已算 4，本步算 2</td><td>10</td><td>4</td><td>2</td><td><code>[0, 3]</code></td></tr>
+</table></div>
+
+<h3>slots 计算</h3>
+<p><code>slotOf</code>（<code>batching.zig:74</code>）：<code>block_table[p / bs] * bs + p % bs</code></p>
+<pre><code>A p=0: block_table[0]=7 → 7*4+0 = 28
+A p=1:                  → 7*4+1 = 29
+A p=2:                  → 7*4+2 = 30
+B p=5: block_table[1]=5 → 5*4+1 = 21
+C p=4: block_table[1]=3 → 3*4+0 = 12
+C p=5:                  → 3*4+1 = 13</code></pre>
+
+<h3>拼接结果</h3>
+<div class="scroll-x">
+<div class="rows">
+  <div class="lbl">行号 t</div>
+  <div class="c h">0</div><div class="c h">1</div><div class="c h">2</div><div class="c h">3</div><div class="c h">4</div><div class="c h">5</div>
+  <div class="lbl">序列</div>
+  <div class="c a">A</div><div class="c a">A</div><div class="c a">A</div><div class="c b">B</div><div class="c cc">C</div><div class="c cc">C</div>
+  <div class="lbl">ids</div>
+  <div class="c a">a0</div><div class="c a">a1</div><div class="c a">a2</div><div class="c b">b5</div><div class="c cc">c4</div><div class="c cc">c5</div>
+  <div class="lbl">pos</div>
+  <div class="c a">0</div><div class="c a">1</div><div class="c a">2</div><div class="c b">5</div><div class="c cc">4</div><div class="c cc">5</div>
+  <div class="lbl">slots</div>
+  <div class="c a">28</div><div class="c a">29</div><div class="c a">30</div><div class="c b">21</div><div class="c cc">12</div><div class="c cc">13</div>
+</div>
+</div>
+<p>注意 <code>pos</code> 不是 0..5：每条序列各算各的位置。</p>
+
+<pre><code>cu_q  = [0, 3, 4, 6]      <span class="cm">// A:[0,3)  B:[3,4)  C:[4,6)</span>
+ctx   = [3, 6, 6]
+last  = [2, 3, 5]
+temps = [tA, tB, tC]
+
+bt    = [7, 0, 0, 0,      <span class="cm">// A 的块表，后面补 0</span>
+         2, 5, 0, 0,      <span class="cm">// B</span>
+         0, 3, 0, 0]      <span class="cm">// C</span>
+
+tile_seq = [0, 1, 2]      <span class="cm">// 非纯 decode 步，每条序列至少一个 tile</span>
+tile_q0  = [0, 0, 0]</code></pre>
+<p>如果 A 的 prompt 有 150 个 token，会切成 3 个 tile：<code>tile_seq</code> 多出 <code>0, 0, 0</code>，<code>tile_q0</code> 为 <code>0, 64, 128</code>。</p>
+
+<h3>主循环逐步执行</h3>
+<pre><code>s=0 (A):  p=0 → t=0    p=1 → t=1    p=2 → t=2
+          cu_q[1]=3  ctx[0]=3  last[0]=2
+s=1 (B):  p=5 → t=3
+          cu_q[2]=4  ctx[1]=6  last[1]=3
+s=2 (C):  p=4 → t=4    p=5 → t=5
+          cu_q[3]=6  ctx[2]=6  last[2]=5</code></pre>
+
+<h3>缓冲区偏移（T=6，S=3，n_tiles=3，mb=4）</h3>
+<div class="table-wrap"><table>
+  <tr><th>段</th><th>字节范围</th><th>大小</th></tr>
+  <tr><td>seed</td><td>[0, 8)</td><td>8</td></tr>
+  <tr><td>ids</td><td>[8, 32)</td><td>6 × 4</td></tr>
+  <tr><td>pos</td><td>[32, 56)</td><td>6 × 4</td></tr>
+  <tr><td>slots</td><td>[56, 80)</td><td>6 × 4</td></tr>
+  <tr><td>cu_q</td><td>[80, 96)</td><td>4 × 4</td></tr>
+  <tr><td>ctx</td><td>[96, 108)</td><td>3 × 4</td></tr>
+  <tr><td>last</td><td>[108, 120)</td><td>3 × 4</td></tr>
+  <tr><td>temps</td><td>[120, 132)</td><td>3 × 4</td></tr>
+  <tr><td>tile_seq</td><td>[132, 144)</td><td>3 × 4</td></tr>
+  <tr><td>tile_q0</td><td>[144, 156)</td><td>3 × 4</td></tr>
+  <tr><td>bt</td><td>[156, 204)</td><td>3 × 4 × 4</td></tr>
+  <tr><td colspan="3"><b>total = 204 字节 → 一次 H2D 拷贝</b></td></tr>
+</table></div>
+
+<h3>用例子验证 attention 的隔离</h3>
+<p>C 的段是 <code>cu_q[2]..cu_q[3]</code> = 第 4、5 行，<code>ctx = 6</code>，<code>q_len = 2</code>：第 4 行看 <code>6−2+0+1 = 5</code> 个 key（位置 0~4），第 5 行看 6 个（位置 0~5）。这些 key 通过 <code>bt</code> 第 2 行的 <code>[0, 3]</code> 去块 0 和块 3 读取，A、B 的 KV 完全不会碰到。</p>
+
+<div class="summary">
+<ul>
+  <li><strong>拼接</strong>：游标 <code>t</code> 在所有序列间连续递增，token 依次追加</li>
+  <li><strong>能拆回去</strong>：<code>cu_q</code> 是前缀和记录每段边界，<code>last</code> 记录每段末行</li>
+  <li><strong>位置和行号分离</strong>：<code>pos</code>、<code>slots</code> 用序列内位置 <code>p</code>，不是行号 <code>t</code></li>
+  <li><strong>一块缓冲</strong>：<code>Layout</code> 把所有数组按偏移排进 <code>meta_host</code>，一次拷到显存，地址固定，CUDA Graph 可复用</li>
+</ul>
+</div>
+
+<!-- ============================== 10 ============================== -->
+<h2 id="index"><span class="num">10</span>代码位置索引</h2>
+
+<h3>调度</h3>
+<div class="table-wrap"><table>
+  <tr><th>作用</th><th>位置</th></tr>
+  <tr><td><code>Entry</code> / <code>emits()</code></td><td><code>src/runner/batching.zig:93, 100</code></td></tr>
+  <tr><td><code>Sequence.slotOf()</code></td><td><code>src/runner/batching.zig:74</code></td></tr>
+  <tr><td><code>schedule()</code> 入口</td><td><code>src/runner/batching.zig:145</code></td></tr>
+  <tr><td><code>schedulePrefillFirst</code>（含 decode 抢占循环 <code>:195</code>）</td><td><code>src/runner/batching.zig:155</code></td></tr>
+  <tr><td><code>scheduleChunked</code>（含抢占循环 <code>:242</code>）</td><td><code>src/runner/batching.zig:220</code></td></tr>
+  <tr><td><code>preempt</code></td><td><code>src/runner/batching.zig:290</code></td></tr>
+  <tr><td><code>postprocess</code></td><td><code>src/runner/batching.zig:298</code></td></tr>
+  <tr><td><code>BlockManager.ensure / canEnsure / deallocate</code></td><td><code>src/runner/block.zig:42, 64, 71</code></td></tr>
+  <tr><td>engine 调用 execute、用 emits 过滤结果</td><td><code>src/runner/engine.zig:126, 135-142</code></td></tr>
+</table></div>
+
+<h3>执行器</h3>
+<div class="table-wrap"><table>
+  <tr><th>作用</th><th>位置</th></tr>
+  <tr><td><code>execute</code>（拆趟入口）</td><td><code>src/executor.zig:948</code></td></tr>
+  <tr><td><code>flushPass</code></td><td><code>src/executor.zig:989</code></td></tr>
+  <tr><td><code>forward</code>（单趟前向）</td><td><code>src/executor.zig:530</code></td></tr>
+  <tr><td>纯 decode 选 CUDA Graph 桶</td><td><code>src/executor.zig:542</code></td></tr>
+  <tr><td><code>Layout</code></td><td><code>src/executor.zig:139</code></td></tr>
+  <tr><td><code>i32At / f32At / devAt</code></td><td><code>src/executor.zig:747-755</code></td></tr>
+  <tr><td><code>uploadMeta</code></td><td><code>src/executor.zig:757</code></td></tr>
+  <tr><td><code>fillMeta</code></td><td><code>src/executor.zig:764</code></td></tr>
+  <tr><td>├ 填 ids / pos / slots</td><td><code>src/executor.zig:787-789</code></td></tr>
+  <tr><td>├ 填 cu_q / ctx / last</td><td><code>src/executor.zig:792-794</code></td></tr>
+  <tr><td>└ padding 行</td><td><code>src/executor.zig:810-819</code></td></tr>
+  <tr><td><code>bindStep</code></td><td><code>src/executor.zig:826</code></td></tr>
+  <tr><td><code>resolveDims</code></td><td><code>src/executor.zig:930</code></td></tr>
+  <tr><td><code>fetchOutAt</code></td><td><code>src/executor.zig:661</code></td></tr>
+  <tr><td><code>StepState</code> / <code>g_step</code></td><td><code>src/backend/cpu/common.zig:10, 43</code></td></tr>
+  <tr><td><code>setStep</code></td><td><code>src/ops.zig:18</code></td></tr>
+  <tr><td><code>DYN / DYN_S</code></td><td><code>src/module/base.zig:11-12</code></td></tr>
+</table></div>
+
+<h3>算子</h3>
+<div class="table-wrap"><table>
+  <tr><th>作用</th><th>CPU</th><th>CUDA</th></tr>
+  <tr><td>RoPE（读 pos）</td><td><code>src/backend/cpu/rope.zig:18, 27</code></td><td><code>src/backend/cuda/rope/rope.zig:36</code></td></tr>
+  <tr><td>store_kv（读 slots）</td><td><code>src/backend/cpu/attention.zig:31</code></td><td><code>src/backend/cuda/attention/attention.cu:18</code></td></tr>
+  <tr><td>attention（读 cu_q / ctx / bt）</td><td><code>src/backend/cpu/attention.zig:64, 84</code></td><td>decode <code>attention.cu:52, 186</code>；prefill <code>attention.cu:301</code></td></tr>
+  <tr><td>gather_last（读 last）</td><td><code>src/backend/cpu/memcpy.zig:18</code></td><td><code>src/backend/cuda/memory/memcpy.zig:42</code></td></tr>
+  <tr><td>sample（读 temps）</td><td><code>src/backend/cpu/sample.zig:18</code></td><td><code>src/backend/cuda/sample/sample.zig</code></td></tr>
+  <tr><td>图里的 gather_last → lm_head → sample</td><td colspan="2"><code>src/models/qwen3.zig:324, 330, 333</code></td></tr>
+</table></div>
+
+<h3>配置</h3>
+<div class="table-wrap"><table>
+  <tr><th>作用</th><th>位置</th></tr>
+  <tr><td><code>BatchConfig</code>（调度器预算）</td><td><code>src/runner/batching.zig:85</code></td></tr>
+  <tr><td><code>GraphScheduler.Config.max_tokens</code> 默认值</td><td><code>src/graph/scheduler.zig:32</code></td></tr>
+  <tr><td><code>Options.maxTokens()</code>（实际生效值）</td><td><code>src/cli.zig:58</code></td></tr>
+  <tr><td>激活 / KV 显存预算</td><td><code>src/graph/scheduler.zig:380</code> 之后</td></tr>
+</table></div>
+
+<p>建议阅读顺序：先看 <code>fillMeta</code>，理解一维拼接和元数据；再看 CPU 的 <code>attend</code>，它最短，最能说明序列为什么不互相干扰；最后看 <code>qwen3.zig</code> 里的 <code>gatherLast</code>，理解维度在哪里从 T 变成 S。</p>
+
+<footer>行号以编写时的代码为准，代码改动后可能有偏移。</footer>
+</main>
+</div>
+
+<button class="theme-toggle" type="button" id="themeToggle">切换主题</button>
+<script>
+(function () {
+  var root = document.documentElement;
+  var btn = document.getElementById('themeToggle');
+  try {
+    var saved = localStorage.getItem('batching-doc-theme');
+    if (saved) root.setAttribute('data-theme', saved);
+  } catch (e) {}
+  btn.addEventListener('click', function () {
+    var cur = root.getAttribute('data-theme');
+    if (!cur) cur = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    var next = cur === 'dark' ? 'light' : 'dark';
+    root.setAttribute('data-theme', next);
+    try { localStorage.setItem('batching-doc-theme', next); } catch (e) {}
+  });
+})();
+</script>
+</body>
+</html>

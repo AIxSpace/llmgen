@@ -1,0 +1,25 @@
+
+/* serving-unfused 教程追加的样式 */
+.stepno { display: inline-block; min-width: 1.9em; padding: 0 6px; margin-right: 8px; border-radius: 6px;
+  background: var(--accent); color: var(--bg); font-size: 13px; text-align: center; font-family: var(--mono); vertical-align: 1px; }
+.codeblock.diff pre code { padding: 10px 0; }
+.codeblock.diff .ln { display: block; padding: 0 16px 0 30px; white-space: pre; position: relative; min-height: 1.6em; }
+.codeblock.diff .ln.add { background: #1d3320; }
+.codeblock.diff .ln.del { background: #3a1f1c; color: #c9a09b; }
+.codeblock.diff .ln.add::before { content: "+"; position: absolute; left: 12px; color: #9fd892; font-weight: 700; }
+.codeblock.diff .ln.del::before { content: "-"; position: absolute; left: 12px; color: #f0a197; font-weight: 700; }
+.src { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 999px; white-space: nowrap; }
+.src.lab { background: var(--gpu-soft); color: var(--gpu); }
+.src.start { background: var(--cpu-soft); color: var(--cpu); }
+.src.est { background: var(--warn-soft); color: var(--warn); }
+table.mine td.fill { background: var(--surface); min-width: 90px; outline: none; cursor: text; }
+table.mine td.fill:focus { box-shadow: inset 0 0 0 1px var(--accent); }
+table.mine td.gain { color: var(--accent); }
+.bars { display: grid; grid-template-columns: max-content minmax(0, 1fr) max-content; gap: 6px 12px; align-items: center; font-size: 13.5px; }
+.bars .bar { height: 14px; border-radius: 4px; background: var(--accent); min-width: 2px; }
+.bars .bar.base { background: var(--cpu); }
+.bars .v { font-family: var(--mono); font-size: 13px; text-align: right; }
+.roadmap td:first-child { white-space: nowrap; }
+.roadmap a { text-decoration: none; }
+.callout.cpu { background: var(--cpu-soft); border-color: var(--cpu); }
+.callout.cpu .t { color: var(--cpu); }

@@ -1,0 +1,429 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>写 KV 改成一个 kernel · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html" class="active"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">阶段 1 · 去掉主机开销</div>
+<h1>写 KV 改成一个 kernel</h1>
+<p class="lead">序列级块表、slot 寻址、store_kv kernel。</p>
+<div class="callout goal"><span class="t">本步目标</span>写 KV 从“每层 16 次小拷贝”变成“每层一个 kernel”；块表从“每层一份、每步上传”变成“每条序列一份、跟元数据一起上传”。注意力 kernel 换成 lab 的两个（decode 和 prefill），它们的原理放到第 13、14 步讲。做完这步，热路径上只剩 kernel 和一次元数据上传。</div>
+<h2>原理</h2>
+<h3>起点怎么写 KV</h3>
+<div class="codeblock"><div class="cap"><span><b>src/memory/page_atten.zig</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-zig">    pub fn appendKVFromTensor(
+        self: *Self,
+        layer_id: i32,
+        k_data: []const u8,
+        v_data: []const u8,
+        n_kv_heads: i32,
+        seq_len: i32,
+        head_dim: i32,
+        data_tpye: GGMLDataType,
+    ) !void {
+        const layer_state = self.layers.get(layer_id) orelse return error.LayerNotActive;
+        if (!layer_state.active or seq_len &lt;= 0) {
+            return;
+        }
+
+        const elem_size = data_tpye.size();
+        const head_dim_bytes = @as(usize, @intCast(head_dim)) * elem_size;
+        const head_stride_bytes = @as(usize, @intCast(seq_len)) * @as(usize, @intCast(head_dim)) * elem_size;
+
+        const prev_cached = layer_state.num_cached;
+        try self.appendKVPages(layer_id, seq_len);
+
+        var seq_idx: i32 = 0;
+        while (seq_idx &lt; seq_len) : (seq_idx += 1) {
+            const global_pos = prev_cached + seq_idx;
+
+            const logical_block: usize = @intCast(@divFloor(global_pos, PAGE_BLOCK_SIZE));
+            const offset_in_block: usize = @intCast(@mod(global_pos, PAGE_BLOCK_SIZE));
+
+            const entry = layer_state.page_table.items[logical_block];
+            const nk: usize = @intCast(n_kv_heads);
+            const kv_base = offset_in_block * nk * @as(usize, @intCast(head_dim)) * elem_size;
+            const k_blk = layer_state.k_pool.blockData(entry.k_block_id);
+            const v_blk = layer_state.v_pool.blockData(entry.v_block_id);
+
+            var h: usize = 0;
+            while (h &lt; nk) : (h += 1) {
+                const src_offset = h * head_stride_bytes + @as(usize, @intCast(seq_idx)) * head_dim_bytes; // 输入 head-major
+                const dst_offset = kv_base + h * head_dim_bytes; // 块内 token-major:[token][kv_head][hd]
+
+                const device_type = self.pool.getDeviceType(); // pools.zig 里把 getDeviceType 改成 pub
+                deviceMemcpy(k_blk[dst_offset .. dst_offset + head_dim_bytes], k_data[src_offset .. src_offset + head_dim_bytes], device_type);
+                deviceMemcpy(v_blk[dst_offset .. dst_offset + head_dim_bytes], v_data[src_offset .. src_offset + head_dim_bytes], device_type);
+            }
+        }
+    }</code></pre></div>
+<p>三层循环：token × KV 头 × (K, V)。每次 <code>deviceMemcpy</code> 是一次 <code>cudaMemcpy</code>（D2D），搬 256 字节。decode 一步 28 层共 448 次；512 token 的 prefill 是 512 × 8 × 2 × 28 = 22.9 万次。</p>
+<p>然后注意力还要一份块表：</p>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cuda/attention.zig</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-zig">fn attentionExecute(comptime kind: Kind, out: *Tensor, dev_id: i32) !void {
+    const mgr = (MemoryManager.global_mem_manager orelse return).getAttentionManager(out.device_type, @intCast(dev_id)) orelse return;
+    const layer_id = out.layer_id;
+    if (!mgr.isActive(layer_id)) return;
+
+    const Q = out.src[0].?; // [B, num_q_heads, seq_len, head_dim]
+    const K = out.src[1].?; // [B, num_kv_heads, seq_len, head_dim]
+    const V = out.src[2].?;
+
+    const num_q_heads: i32 = @intCast(Q.dims[1]);
+    const seq_len: i32 = @intCast(Q.dims[2]);
+    const head_dim: i32 = @intCast(Q.dims[3]);
+
+    const num_kv_heads: i32 = @intCast(K.dims[1]);
+    const num_kv_groups: i32 = @intFromFloat(out.op_params[3]);
+
+    const scale = out.op_params[1];
+    const causal: c_int = if (out.op_params[2] != 0) 1 else 0;
+
+    try mgr.appendKVFromTensor(layer_id, K.data.?[0..K.bytes()], V.data.?[0..V.bytes()], num_kv_heads, seq_len, head_dim, K.data_type);
+
+    const layer = mgr.getLayerState(layer_id).?;
+    const total_cached: i32 = layer.num_cached;
+    const num_blocks: i32 = @intCast(layer.page_table.items.len);
+    if (total_cached &lt;= 0 or num_blocks &lt;= 0) return;
+
+    const block_stride_elems: i32 = page_atten.PAGE_BLOCK_SIZE * num_kv_heads * head_dim;
+
+    const n: usize = @intCast(num_blocks);
+    const h_page_k_ids = try mgr.allocator.alloc(i32, n);
+    defer mgr.allocator.free(h_page_k_ids);
+    const h_page_v_ids = try mgr.allocator.alloc(i32, n);
+    defer mgr.allocator.free(h_page_v_ids);
+    for (layer.page_table.items, 0..) |e, i| {
+        h_page_k_ids[i] = e.k_block_id;
+        h_page_v_ids[i] = e.v_block_id;
+    }
+
+    const k_pool_base = layer.k_pool.blockData(0).ptr;
+    const v_pool_base = layer.v_pool.blockData(0).ptr;
+    const q_start = total_cached - seq_len;
+
+    const launch = switch (kind) {
+        .paged =&gt; cu.cuda_paged_attention,
+        .flash =&gt; cu.cuda_flash_attention,
+    };
+    launch(out.data, Q.data, cu.dtypeCode(out.data_type), head_dim, num_q_heads, seq_len, num_kv_heads, total_cached, scale, causal, num_kv_groups, h_page_k_ids.ptr, h_page_v_ids.ptr, num_blocks, k_pool_base, v_pool_base, block_stride_elems, q_start, dev_id);
+}</code></pre></div>
+<p>每层在 host 上重新收集一遍 <code>page_table</code>，交给 <code>.cu</code> 去 cudaMalloc、H2D、用完 cudaFree。</p>
+
+<h3>两个观察</h3>
+<p><b>一、写 KV 是纯拷贝，天然可以并行。</b>每个 token 的每个头是独立的 128 个数。一个 kernel、每个 token 一个 block、每个头一个 warp，一次全搬完。</p>
+<p><b>二、所有层的块表是同一张。</b>第 5 个 token 在第 0 层写进块 0 的第 5 个槽，在第 27 层也是。起点给每层各配了一个 <code>BlockPool</code> 和一张 <code>page_table</code>，28 张表内容完全相同。所以块表应该属于<b>序列</b>，不属于层：</p>
+<div class="diagram">
+<div class="flow">
+  <div class="box cpu"><b>Sequence.block_table</b><small>逻辑块 → 物理块，host 上，每条序列一份</small></div><div class="arrow">→</div>
+  <div class="box cpu"><b>fillMeta</b><small>算出每个 token 的 slot；块表抄进元数据包</small></div><div class="arrow">→</div>
+  <div class="box gpu"><b>store_kv × 28 层</b><small>读同一份 slots</small></div><div class="arrow">+</div>
+  <div class="box gpu"><b>注意力 × 28 层</b><small>读同一份块表</small></div>
+</div></div>
+<p><code>runner/block.zig</code> 的 <code>BlockManager</code> 和 <code>Sequence.block_table</code> 就是为这个准备的，一直没接上。这一步接上。</p>
+
+<h3>slot 和块内布局</h3>
+<p><code>slot = 物理块号 × block_size + 块内偏移</code>，一个整数就定位了一个 token 在 KV cache 里的位置。host 上算好放进元数据的 <code>slots[T]</code>，kernel 直接用。</p>
+<p>KV cache 每层一大块，布局是 <code>[块][kv_head][块内 slot][head_dim]</code>：</p>
+<div class="codeblock"><div class="cap"><span><b>backend/cuda/attention.cu · store_kv</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">// ------------------------------------------------------------------
+// store_kv: k/v [T, nkv, 128] → 分页 cache 的 slot(块内布局 [kv_head][slot][head_dim]); 一个 warp 一个 KV 头
+// ------------------------------------------------------------------
+__global__ void store_kv_kernel(const bf16 *k, const bf16 *v, const int *slots, bf16 *kc, bf16 *vc, int nkv,
+                                int block_size) {
+    const int HD = 128;
+    const int t = blockIdx.x, h = threadIdx.x &gt;&gt; 5, lane = threadIdx.x &amp; 31;
+    if (h &gt;= nkv) return;
+    const int slot = slots[t];
+    if (slot &lt; 0) return;
+    const long blk = slot / block_size, off = slot % block_size;
+    const long dst = ((blk * nkv + h) * block_size + off) * HD;
+    const long src = ((long)t * nkv + h) * HD;
+#pragma unroll
+    for (int j = 0; j &lt; 4; ++j) {
+        kc[dst + lane + 32 * j] = k[src + lane + 32 * j];
+        vc[dst + lane + 32 * j] = v[src + lane + 32 * j];
+    }
+}
+
+extern &quot;C&quot; void cuda_store_kv(const cuda_bf16_t *k, const cuda_bf16_t *v, const int *slot_mapping, cuda_bf16_t *k_cache,
+                            cuda_bf16_t *v_cache, int T, int nkv, int hd, int block_size) {
+    if (T &lt;= 0) return;
+    if (hd != 128 || nkv &gt; 32) {
+        fprintf(stderr, &quot;[serve] store_kv: 仅支持 head_dim=128 且 nkv&lt;=32\n&quot;);
+        return;
+    }
+    store_kv_kernel&lt;&lt;&lt;T, nkv * 32, 0, g_cuda_stream&gt;&gt;&gt;((const bf16 *)k, (const bf16 *)v, slot_mapping, (bf16 *)k_cache,
+                                                   (bf16 *)v_cache, nkv, block_size);
+}</code></pre></div>
+<p>注意块内是 <b>kv_head 在外、slot 在内</b>，和起点的 <code>[token][kv_head][hd]</code> 相反。原因在读的那一侧：注意力 kernel 一个 block 处理一个 KV 头，它要顺序扫这个头的所有 token。同一个头的 16 个 token 在内存里连续（16 × 256 B = 4 KB），顺序读带宽才上得去。</p>
+<p><code>slot &lt; 0</code> 表示不写，是给第 17 步 CUDA Graph 的 padding 行留的。</p>
+
+<h2>改动</h2>
+<h3><span class="stepno">1</span>换掉 attention.cu</h3>
+<p>把 lab 的 <code>backend/cuda/attention.cu</code> <b>整个文件</b>拷过来，覆盖 llmgen 的同名文件。它包含 <code>store_kv</code>、decode（split-K）、prefill（FA2）三组 kernel，约 500 行，在 3090 上实测过，不要改。唯一要动的是文件头的 <code>#include</code>，llmgen 的公共头文件同名，不用改。</p>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cuda/cuda_shim.h</b> <span class="tag new">新增</span></span><button type="button">复制</button></div><pre><code class="language-cpp">// ---- cuda_shim.h: 删掉 cuda_paged_attention / cuda_flash_attention, 换成 ----
+void cuda_store_kv(const cuda_bf16_t *k, const cuda_bf16_t *v, const int *slot_mapping, cuda_bf16_t *k_cache, cuda_bf16_t *v_cache,
+                   int T, int nkv, int hd, int block_size);
+void cuda_attn_decode(cuda_bf16_t *out, const cuda_bf16_t *q, const cuda_bf16_t *k_cache, const cuda_bf16_t *v_cache,
+                      const int *block_tables, const int *ctx_lens,
+                      int S, int nq, int nkv, int hd, int max_blocks, int block_size, float scale,
+                      float *part_o, float *part_ml, int part_size, int max_parts);
+void cuda_attn_prefill(cuda_bf16_t *out, const cuda_bf16_t *q, const cuda_bf16_t *k_cache, const cuda_bf16_t *v_cache,
+                       const int *block_tables, const int *ctx_lens, const int *cu_q,
+                       const int *tile_seq, const int *tile_q0, int n_tiles,
+                       int nq, int nkv, int hd, int max_blocks, int block_size, float scale);
+int  cuda_attn_prefill_tile(void);</code></pre></div>
+<div class="codeblock"><div class="cap"><span><b>backend/cuda/cuda.zig（这几条 extern 加进 llmgen 的 cuda.zig，删掉旧的两条）</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">pub extern fn cuda_store_kv(k: ?*const anyopaque, v: ?*const anyopaque, slot_mapping: ?*const anyopaque, k_cache: ?*anyopaque, v_cache: ?*anyopaque, T: c_int, nkv: c_int, hd: c_int, block_size: c_int) void;
+pub extern fn cuda_attn_decode(
+    out: ?*anyopaque,
+    q: ?*const anyopaque,
+    k_cache: ?*const anyopaque,
+    v_cache: ?*const anyopaque,
+    block_tables: ?*const anyopaque,
+    ctx_lens: ?*const anyopaque,
+    S: c_int,
+    nq: c_int,
+    nkv: c_int,
+    hd: c_int,
+    max_blocks: c_int,
+    block_size: c_int,
+    scale: f32,
+    part_o: ?*anyopaque,
+    part_ml: ?*anyopaque,
+    part_size: c_int,
+    max_parts: c_int,
+) void;
+pub extern fn cuda_attn_prefill(
+    out: ?*anyopaque,
+    q: ?*const anyopaque,
+    k_cache: ?*const anyopaque,
+    v_cache: ?*const anyopaque,
+    block_tables: ?*const anyopaque,
+    ctx_lens: ?*const anyopaque,
+    cu_q: ?*const anyopaque,
+    tile_seq: ?*const anyopaque,
+    tile_q0: ?*const anyopaque,
+    n_tiles: c_int,
+    nq: c_int,
+    nkv: c_int,
+    hd: c_int,
+    max_blocks: c_int,
+    block_size: c_int,
+    scale: f32,
+) void;
+pub extern fn cuda_attn_prefill_tile() c_int;
+
+// ---- sample.cu ----</code></pre></div>
+
+<h3><span class="stepno">2</span>PagedAttentionManager 瘦身</h3>
+<p>它不再管块的分配，只记每层 K / V 的显存地址：</p>
+<div class="codeblock"><div class="cap"><span><b>src/memory/page_atten.zig（整个文件换掉）</b> <span class="tag new">新建文件</span></span><button type="button">复制</button></div><pre><code class="language-zig">//! memory/page_atten.zig -- 每层 K/V 的分页缓存(由 module-serving-unfused 的 paged.zig 改名而来)
+//! 块内布局 [kv_head][slot][head_dim]。块的分配 / 回收是序列级的, 由 runner/block.zig 的 BlockManager 管,
+//! 所有层共用同一张块表;这里只持有每层 K / V 的显存地址。
+
+const std = @import(&quot;std&quot;);
+const types = @import(&quot;../types.zig&quot;);
+const P = @import(&quot;pools.zig&quot;);
+
+pub const DataType = types.GGMLDataType;
+
+/// 每块 token 数的缺省值(调度器算池容量时用)
+pub const PAGE_BLOCK_SIZE: i32 = 16;
+
+/// 每层的 KV 分页状态(对照 PagedAttentionManager::LayerState).k / v 是设备指针.
+pub const LayerState = struct {
+    active: bool = false,
+    n_kv_heads: i32 = 0,
+    head_dim: i32 = 0,
+    dtype: DataType = .GGML_TYPE_BF16,
+    num_blocks: usize = 0,
+    k: ?*anyopaque = null,
+    v: ?*anyopaque = null,
+
+    /// 一个 token 的 K(或 V)字节数 = n_kv_heads × head_dim × elem.
+    pub fn tokenBytes(self: *const LayerState) usize {
+        return @as(usize, @intCast(self.n_kv_heads)) * @as(usize, @intCast(self.head_dim)) * self.dtype.size();
+    }
+};
+
+/// 对照 class PagedAttentionManager:pool_ + layers_(layer_id → LayerState).
+pub const PagedAttentionManager = struct {
+    alloc: std.mem.Allocator,
+    pool: *P.MemoryPool, // KV 块的 backing(kv_cache 池)
+    block_size: usize, // 每块 token 数(module-style 固定 PAGE_BLOCK_SIZE=16, 这里可配)
+    layers: std.AutoHashMapUnmanaged(i32, *LayerState) = .empty,
+
+    pub fn init(alloc: std.mem.Allocator, pool: *P.MemoryPool, block_size: usize) PagedAttentionManager {
+        return .{ .alloc = alloc, .pool = pool, .block_size = block_size };
+    }
+    pub fn deinit(self: *PagedAttentionManager) void {
+        var it = self.layers.valueIterator();
+        while (it.next()) |ls| self.alloc.destroy(ls.*);
+        self.layers.deinit(self.alloc);
+    }
+
+    pub fn getLayer(self: *PagedAttentionManager, layer_id: i32) ?*LayerState {
+        return self.layers.get(layer_id);
+    }
+    pub fn isActive(self: *PagedAttentionManager, layer_id: i32) bool {
+        if (self.layers.get(layer_id)) |ls| return ls.active;
+        return false;
+    }
+
+    /// 对照 init_layer:只设该层元数据(n_kv/head_dim/dtype),active=true;显存由 reserveLayer 切.
+    pub fn initLayer(self: *PagedAttentionManager, layer_id: i32, n_kv_heads: i32, head_dim: i32, dtype: DataType) !void {
+        const gop = try self.layers.getOrPut(self.alloc, layer_id);
+        if (!gop.found_existing) gop.value_ptr.* = try self.alloc.create(LayerState);
+        gop.value_ptr.*.* = .{ .active = true, .n_kv_heads = n_kv_heads, .head_dim = head_dim, .dtype = dtype };
+    }
+
+    /// 一层 K(或 V)一块的字节数.
+    pub fn blockBytes(self: *const PagedAttentionManager, ls: *const LayerState) usize {
+        return self.block_size * ls.tokenBytes();
+    }
+
+    /// 对照 reserve_layer:为该层从 KV 池切出 K/V 各 num_blocks 个块.
+    pub fn reserveLayer(self: *PagedAttentionManager, layer_id: i32, num_blocks: usize) !void {
+        const ls = self.layers.get(layer_id) orelse return error.LayerNotActive;
+        if (!ls.active) return;
+        const per_pool = self.blockBytes(ls) * num_blocks;
+        const kblk = try self.pool.allocate(per_pool, P.POOL_ALIGN);
+        const vblk = try self.pool.allocate(per_pool, P.POOL_ALIGN);
+        ls.num_blocks = num_blocks;
+        ls.k = @ptrCast(kblk.ptr);
+        ls.v = @ptrCast(vblk.ptr);
+    }
+};</code></pre></div>
+<div class="codeblock diff"><div class="cap"><span><b>manager.zig / scheduler.zig</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">// ---- src/memory/manager.zig ----</span><span class="ln del">    pub fn resetKVCache(self: *Self) void {</span><span class="ln del">        var it = self.paged_atten_managers_map.valueIterator();</span><span class="ln del">        while (it.next()) |mgr| {</span><span class="ln del">            mgr.*.reset();</span><span class="ln del">        }</span><span class="ln del">    }</span><span class="ln add">    /// KV 里的内容不用清:块归还给 BlockManager 之后, 下一条序列写进去时会覆盖</span><span class="ln add">    pub fn resetKVCache(self: *Self) void {</span><span class="ln add">        _ = self;</span><span class="ln add">    }</span><span class="ln ctx">...</span><span class="ln del">        paged_atten_mananger.* = PagedAttentionManager.init(self.allocator, &amp;(device_pools.kv_cache.?));</span><span class="ln add">        paged_atten_mananger.* = PagedAttentionManager.init(self.allocator, &amp;(device_pools.kv_cache.?), @intCast(paged_atten.PAGE_BLOCK_SIZE));</span><span class="ln ctx"> </span><span class="ln ctx">// ---- src/graph/scheduler.zig: estimateLayerCosts / createMemoryPools / initializeKVCache 三处 ----</span><span class="ln del">                    const n_kv: usize = @intCast(t.src[1].?.dims[1]); // k: [B, n_kv, seq, hd]</span><span class="ln add">                    const n_kv: usize = @intCast(t.src[1].?.dims[2]); // k: [1, T, n_kv, hd]</span><span class="ln ctx">...</span><span class="ln del">                    try page_atten_manager.reserveLayer(t.layer_id, max_blocks);</span><span class="ln add">                    try page_atten_manager.reserveLayer(t.layer_id, @intCast(max_blocks));</span></code></pre></div>
+
+<h3><span class="stepno">3</span>Impl</h3>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cpu/common.zig</b> <span class="tag new">新增</span></span><button type="button">复制</button></div><pre><code class="language-zig">// ---- 加在 src/backend/cpu/common.zig ----
+const page_atten = @import(&quot;../../memory/page_atten.zig&quot;);
+
+/// 本设备的分页 KV 管理器。单设备, Executor.init 里设一次。
+pub var g_attn_mgr: ?*page_atten.PagedAttentionManager = null;
+
+/// 本层的 K / V 显存地址
+pub fn kvOf(layer_id: i32) !*page_atten.LayerState {
+    const mgr = g_attn_mgr orelse return error.NoAttentionManager;
+    return mgr.getLayer(layer_id) orelse return error.LayerNotActive;
+}</code></pre></div>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cuda/attention.zig（整个文件换掉）</b> <span class="tag new">新建文件</span></span><button type="button">复制</button></div><pre><code class="language-zig">//! cuda/attention.zig -- PagedAttentionImpl&lt;CUDA&gt;
+//! 先 cuda_store_kv 把本步 k / v 写进本层分页 cache, 再做注意力。
+//! decode: split-K flash-decoding(第 13 步讲);prefill: tensor core FlashAttention-2(第 14 步讲)。
+const std = @import(&quot;std&quot;);
+const Tensor = @import(&quot;../../Tensor.zig&quot;);
+const c = @import(&quot;../cpu/common.zig&quot;);
+const cu = @import(&quot;cuda.zig&quot;);
+
+/// decode split-K 的分段长度: 批越小分段越细, 保证 grid = nkv × S × parts 足够铺满 82 个 SM。
+pub fn partSize(s: usize) usize {
+    return if (s &gt;= 64) 512 else if (s &gt;= 16) 256 else if (s &gt;= 4) 128 else 64;
+}
+pub fn maxParts(s: usize, max_model_len: usize) usize {
+    const ps = partSize(s);
+    return (max_model_len + ps - 1) / ps;
+}
+
+/// src[0] = q [1, T, nq, hd], src[1] = k [1, T, nkv, hd], src[2] = v [1, T, nkv, hd] → out [1, T, nq, hd]
+pub const PagedAttentionImpl = struct {
+    pub fn execute(device_id: i32, out: *Tensor) !void {
+        _ = device_id;
+        const s = &amp;c.g_step;
+        const kv = try c.kvOf(out.layer_id);
+        cu.cuda_store_kv(out.src[1].?.data, out.src[2].?.data, s.slots, kv.k, kv.v, s.n_tok, s.n_kv_head, s.head_dim, s.block_size);
+        if (s.decode) {
+            const n_seq: usize = @intCast(s.n_seq);
+            cu.cuda_attn_decode(out.data, out.src[0].?.data, kv.k, kv.v, s.block_tables, s.ctx, s.n_seq, s.n_head, s.n_kv_head, s.head_dim, s.max_blocks, s.block_size, s.attn_scale, s.part_o, s.part_ml, @intCast(partSize(n_seq)), @intCast(maxParts(n_seq, s.max_model_len)));
+        } else {
+            cu.cuda_attn_prefill(out.data, out.src[0].?.data, kv.k, kv.v, s.block_tables, s.ctx, s.cu_q, s.tile_seq, s.tile_q0, s.n_tiles, s.n_head, s.n_kv_head, s.head_dim, s.max_blocks, s.block_size, s.attn_scale);
+        }
+    }
+};
+
+/// 旧的 FLASH_ATTN 图节点(LLMGEN_FLASH=1)走同一个实现
+pub const FlashAttentionImpl = PagedAttentionImpl;</code></pre></div>
+
+<h3><span class="stepno">4</span>Executor 接上 BlockManager</h3>
+<div class="codeblock"><div class="cap"><span><b>src/executor.zig</b> <span class="tag new">新增</span></span><button type="button">复制</button></div><pre><code class="language-zig">const BlockManager = @import(&quot;runner/block.zig&quot;).BlockManager;
+const cuda_attn = @import(&quot;backend/cuda/attention.zig&quot;); // 只用 partSize / maxParts 两个纯函数
+
+// ---- Executor 的新字段 ----
+    block_manager: BlockManager,
+    part_o: ?*anyopaque = null, //  decode split-K 的 scratch:各段未归一化的输出
+    part_ml: ?*anyopaque = null, // 各段的 (max, sum)
+
+// ---- init() ----
+        // 块数 = 每层 K(或 V)切了多少块;现在还是 ceil(max_seq / 16), 第 18 步改成按显存算
+        .block_manager = try BlockManager.init(allocator, max_blocks, BLOCK_SIZE),
+        ...
+        common.g_attn_mgr = memory_manager.getAttentionManager(input_tensor.?.device_type, 0);
+
+// ---- allocMeta() 里, pool.markPersistent() 之前 ----
+        if (opts.have_cuda and dev_type == .CUDA) {
+            // split-K scratch: [S, nq, max_parts, hd] f32 和 [S, nq, max_parts, 2] f32
+            const c = self.model_cfg;
+            const nq: usize = @intCast(c.head_count);
+            const hd: usize = @intCast(c.key_length);
+            var cap: usize = 0;
+            var s: usize = 1;
+            while (s &lt;= MAX_SEQS) : (s += 1) cap = @max(cap, s * cuda_attn.maxParts(s, self.max_seq));
+            self.part_o = (try pool.allocate(cap * nq * hd * 4, pools.POOL_ALIGN)).ptr;
+            self.part_ml = (try pool.allocate(cap * nq * 2 * 4, pools.POOL_ALIGN)).ptr;
+        }
+
+// ---- bindStep() 的 ops.setStep(.{ ... }) 里加两行 ----
+            .part_o = self.part_o,
+            .part_ml = self.part_ml,
+
+// ---- deinit() ----
+        self.block_manager.deinit();</code></pre></div>
+<div class="codeblock diff"><div class="cap"><span><b>src/executor.zig · generate() / fillMeta()</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">        var seq = try Sequence.init(self.allocator, 0, prompt, .{ ... });</span><span class="ln del">        defer seq.deinit();</span><span class="ln add">        defer {</span><span class="ln add">            self.block_manager.deallocate(&amp;seq); // 块还给空闲栈</span><span class="ln add">            seq.deinit();</span><span class="ln add">        }</span><span class="ln ctx"> </span><span class="ln add">        if (!try self.block_manager.ensure(&amp;seq, prompt.len)) return error.OutOfBlocks;</span><span class="ln ctx">        try self.forward(&amp;.{.{ .seq = &amp;seq, .q_start = 0, .q_len = prompt.len }});</span><span class="ln ctx">...</span><span class="ln ctx">            try seq.token_ids.append(self.allocator, next);</span><span class="ln ctx">...</span><span class="ln add">            // 新 token 要写进 KV:块表不够就再要一块(每 16 个 token 发生一次)</span><span class="ln add">            if (!try self.block_manager.ensure(&amp;seq, seq.len())) return error.OutOfBlocks;</span><span class="ln ctx">            if (self.use_kv_cache) {</span><span class="ln ctx"> </span><span class="ln ctx">// ---- fillMeta() ----</span><span class="ln del">            const has_blocks = seq.block_table.items.len &gt; 0;</span><span class="ln ctx">...</span><span class="ln del">                slots[t] = if (has_blocks) seq.slotOf(p, BLOCK_SIZE) else -1;</span><span class="ln add">                slots[t] = seq.slotOf(p, BLOCK_SIZE);</span></code></pre></div>
+<div class="codeblock diff"><div class="cap"><span><b>src/runner/block.zig · ensure（删掉这行调试打印，否则每步刷一行）</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln del">        std.debug.print(&quot;need blocks num = {}, have blocks num = {}\n&quot;, .{ need_blocks_num, have_blocks_num });</span></code></pre></div>
+
+<h3><span class="stepno">5</span>把还在用旧接口的地方处理掉</h3>
+<div class="codeblock diff"><div class="cap"><span><b>CPU 注意力和内存报告</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">// ---- src/backend/cpu/attention.zig ----</span><span class="ln ctx">// 原来的实现(取 mgr、appendKVFromTensor、按 page_table 读 KV)整个换成 slot 寻址的版本, 见&quot;CPU 同步&quot;一节</span><span class="ln ctx"> </span><span class="ln ctx">// ---- src/profiler/metrics.zig · printMemory ----</span><span class="ln del">    var pit = mm.paged_atten_managers_map.valueIterator();</span><span class="ln del">    while (pit.next()) |pam| {</span><span class="ln del">        ...(读 k_pool / page_table 算&quot;KV 块利用率&quot;的那一段)</span><span class="ln del">    }</span><span class="ln add">    // KV 块的占用现在看 Executor 的 block_manager:已用 = num_blocks - freeBlocksNum()</span></code></pre></div>
+
+<h2>对拍验证</h2>
+<p>第 05、06 步合起来验证。</p>
+<div class="callout warn"><span class="t">这一步 greedy 输出可能和基线不完全相同</span>注意力 kernel 换了，点积和 softmax 的累加顺序变了，f32 的舍入会有最后一位的差别；写回 bf16 时这个差别偶尔会跨过舍入边界。绝大多数 token 相同，但遇到两个候选 logit 几乎并列的位置，可能选到另一个。lab 自己的 Metal 后端就是在第 40 个 token 处分叉的。<br>
+验收标准改成：<b>前 20 个 token 相同，后面的文本通顺</b>。如果前几个 token 就不同，或者输出是乱码，那是真的错了。等第 10–12 步把其余 kernel 也换成 lab 的之后，llmgen 的数值会和 lab 完全一致，到时候直接和 lab 的 <code>chat</code> 输出比 token id。</div>
+<p>再抓一次 nsys，对比第 02 步存的账本：</p>
+<div class="tablewrap"><table><thead><tr><th>调用</th><th>第 02 步</th><th>现在应该是</th></tr></thead><tbody><tr><td><code>cudaMemcpy</code> / 步</td><td>约 505</td><td>2（元数据 H2D、logits D2H）</td></tr><tr><td><code>cudaMalloc</code> / 步</td><td>56</td><td>0</td></tr><tr><td><code>cudaFree</code> / 步</td><td>56</td><td>0</td></tr><tr><td><code>store_kv_kernel</code> / 步</td><td>0</td><td>28</td></tr></tbody></table></div>
+<h2>CPU 同步</h2>
+<div class="callout cpu"><span class="t">这一步 CPU 后端要做的事</span><b>必须同步改。</b><code>PagedAttentionManager</code> 瘦身后，CPU 的注意力（还在调 <code>appendKVFromTensor</code>）编译不过。换成 slot 寻址的版本：先 <code>storeKv</code> 再在分页 cache 上算，prefill / decode / 混批是同一条路径。不要留“返回错误”的占位。 <a href="cpu-3-kernels-layout.html#attention">去看 →</a></div>
+<h2>性能收益</h2>
+<h3>依据</h3>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th class="num">改前</th><th class="num">改后</th><th>来源</th></tr></thead><tbody><tr><td>module-style：cudaMemcpy 单次</td><td class="num">108.3 µs</td><td class="num">—</td><td><span class="src lab">nsys 实测</span></td></tr><tr><td>module-style：cudaMalloc / cudaFree 单次</td><td class="num">34.2 / 46.1 µs</td><td class="num">0 次</td><td><span class="src lab">nsys 实测</span></td></tr><tr><td>融合版 S1 decode 注意力 kernel</td><td class="num">—</td><td class="num">8 µs / 次</td><td><span class="src lab">nsys 实测</span></td></tr><tr><td>融合版 S1 prefill 注意力 kernel</td><td class="num">—</td><td class="num">45.3 µs / 次</td><td><span class="src lab">nsys 实测</span></td></tr></tbody></table></div>
+<h3>对 llmgen 的预期</h3>
+<p>这是阶段 1 里收益最大的一步。每步去掉的调用：</p>
+<ul>
+  <li>448 次 D2D <code>cudaMemcpy</code>（写 KV）+ 56 次 H2D（块表）；</li>
+  <li>56 次 <code>cudaMalloc</code> + 56 次 <code>cudaFree</code>，按 lab 实测的单次耗时约 4.5 ms <span class="src est">推算</span>；</li>
+  <li>加上第 05 步去掉的 112 个 permute kernel。</li>
+</ul>
+<p>同步的小 <code>cudaMemcpy</code> 单次多贵，lab 没有直接可比的数字（它那张表里的 108.3 µs 搬的是整块权重）。保守按每次 10 µs 算，448 + 56 次是 5 ms。合起来预期 ITL 降 10–20 ms <span class="src est">推算</span>，以你的 nsys 为准。</p>
+<p>prefill 的变化更大：512 token 时原来有 22.9 万次小拷贝，现在是 28 个 kernel。S1 的 TTFT 预期从秒级降到百毫秒级 <span class="src est">推算</span>（剩下的大头是 lm_head 对 512 行全算，第 08 步解决）。</p>
+<p>注意力 kernel 本身也换成了更快的版本，这部分收益在第 13、14 步用回退开关单独量。</p>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>S1 ITL mean (ms)</td><td class="num fill" contenteditable="true" data-key="06-store-kv.html|S1 ITL mean (ms)|before"></td><td class="num fill" contenteditable="true" data-key="06-store-kv.html|S1 ITL mean (ms)|after"></td><td class="num gain"></td></tr><tr><td>S1 TTFT mean (ms)</td><td class="num fill" contenteditable="true" data-key="06-store-kv.html|S1 TTFT mean (ms)|before"></td><td class="num fill" contenteditable="true" data-key="06-store-kv.html|S1 TTFT mean (ms)|after"></td><td class="num gain"></td></tr><tr><td>S1 输出吞吐 (tok/s)</td><td class="num fill" contenteditable="true" data-key="06-store-kv.html|S1 输出吞吐 (tok/s)|before"></td><td class="num fill" contenteditable="true" data-key="06-store-kv.html|S1 输出吞吐 (tok/s)|after"></td><td class="num gain"></td></tr><tr><td>cudaMemcpy 次数 / 步</td><td class="num fill" contenteditable="true" data-key="06-store-kv.html|cudaMemcpy 次数 / 步|before"></td><td class="num fill" contenteditable="true" data-key="06-store-kv.html|cudaMemcpy 次数 / 步|after"></td><td class="num gain"></td></tr><tr><td>PAGED_ATTN 平均耗时 (µs)</td><td class="num fill" contenteditable="true" data-key="06-store-kv.html|PAGED_ATTN 平均耗时 (µs)|before"></td><td class="num fill" contenteditable="true" data-key="06-store-kv.html|PAGED_ATTN 平均耗时 (µs)|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td><code>error.NoAttentionManager</code></td><td><code>common.g_attn_mgr</code> 没设。它要在 <code>graph_scheduler.schedule()</code> 之后（KV 池建好了）才取得到。</td></tr><tr><td><code>error.OutOfBlocks</code></td><td>BlockManager 的块数（<code>max_blocks</code>）不够放 prompt + 生成。现在容量还是 <code>ceil(max_seq / 16)</code>，等于单条序列的上限。</td></tr><tr><td>输出从第 17 个 token 开始乱</td><td>块表问题：第 17 个 token 进第二块。检查 decode 循环里 <code>ensure</code> 是否在 <code>forward</code> 之前、<code>fillMeta</code> 是否把块表抄进了 <code>bt</code>。</td></tr><tr><td>输出第一个 token 就错</td><td>多半是 KV 池大小和布局对不上。<code>reserveLayer</code> 切的字节数 = 块数 × 16 × n_kv × hd × 2；调度器里 <code>n_kv</code> 要读 <code>dims[2]</code>。</td></tr><tr><td><code>[serve] attn_decode: 仅支持 head_dim=128</code></td><td>lab 的 kernel 把 head_dim 写死成 128。Qwen3-0.6B 正好是 128。</td></tr><tr><td>第二次调 <code>generate</code> 报 OutOfBlocks</td><td>上一条序列的块没还。<code>deallocate</code> 要在 <code>seq.deinit()</code> 之前。</td></tr><tr><td>编译报 <code>no member named appendKVFromTensor</code></td><td><code>backend/cpu/attention.zig</code> 还在用旧接口，按“CPU 同步”一节换成新版本。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li>greedy 输出前 20 个 token 和基线相同，全文通顺</li><li>nsys 里每步没有 <code>cudaMalloc</code> / <code>cudaFree</code></li><li><code>memory/page_atten.zig</code> 里没有 <code>BlockPool</code> 和 <code>page_table</code></li><li>记下了新的 S1 ITL 和 TTFT</li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="05-token-major-view.html"><small>← 上一步</small>token-major 零拷贝拆头</a><a class="next" href="07-stream-sync.html"><small>下一步 →</small>一条 stream，一步一同步</a></div>
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>批量前向 execute(entries) · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html" class="active"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">阶段 5 · 连续批处理</div>
+<h1>批量前向 execute(entries)</h1>
+<p class="lead">变长打包，一步里跑多条序列。</p>
+<div class="callout goal"><span class="t">本步目标</span>多条序列在同一步里一起前向。<code>forward</code> 从第 04 步起就按 Entry 列表写的，kernel 从第 06 步起就是变长批的，这一步只是把上层接起来：<code>Engine</code> 负责排队和回填，<code>Executor.execute</code> 负责把超大的一步切成多趟。</div>
+<h2>原理</h2>
+<h3>为什么批处理能提高吞吐</h3>
+<p>decode 是带宽受限的：一步的时间主要花在把 1.2 GB 权重读一遍。批大小从 1 变成 32，<b>权重还是只读一遍</b>：GEMM 的 M 从 1 变成 32，每读到一个权重，和 32 行输入各乘一次。计算量是 32 倍，但 GPU 的算力在 M = 1 时几乎是闲着的。</p>
+<p>所以一步的时间只涨一点，产出的 token 数是 32 倍：</p>
+<div class="tablewrap"><table><thead><tr><th>场景</th><th>每步序列数</th><th class="num">ITL mean (ms)</th><th class="num">输出吞吐 (tok/s)</th></tr></thead><tbody><tr><td>S1</td><td>1</td><td class="num">2.449</td><td class="num">401.3</td></tr><tr><td>S4</td><td>8</td><td class="num">3.489</td><td class="num">1670.1</td></tr><tr><td>S2</td><td>32</td><td class="num">5.245</td><td class="num">3786.1</td></tr><tr><td>S3</td><td>最多 256</td><td class="num">27.293</td><td class="num">5580</td></tr></tbody></table></div>
+<p>批到 256 时一步要 27 ms，这时候瓶颈换了：每条序列有自己的 KV 要读，256 条序列 × 平均 1000 token 上下文 × 112 KiB ≈ 29 GB 的 KV 流量，大头成了注意力。nsys 里 S3 的 kernel 时间 68% 是 <code>attn_decode_kernel</code> <span class="src lab">nsys 实测</span>。</p>
+
+<h3>变长打包：不要 padding</h3>
+<p>PyTorch 风格的批是 <code>[B, max_len, hidden]</code>，短序列补 padding。这里不这么做。一步里所有序列的 token 首尾相接排成一行：</p>
+<div class="diagram">
+<div class="lanes">
+  <div class="lab">序列 A（prefill 5）</div><div class="lane"><span class="d">a0</span><span class="d">a1</span><span class="d">a2</span><span class="d">a3</span><span class="d">a4</span></div>
+  <div class="lab">序列 B（decode）</div><div class="lane"><span class="h">b7</span></div>
+  <div class="lab">序列 C（prefill 3）</div><div class="lane"><span class="x">c0</span><span class="x">c1</span><span class="x">c2</span></div>
+  <div class="lab">这一步的 T = 9</div><div class="lane"><span class="d">a0</span><span class="d">a1</span><span class="d">a2</span><span class="d">a3</span><span class="d">a4</span><span class="h">b7</span><span class="x">c0</span><span class="x">c1</span><span class="x">c2</span></div>
+  <div class="lab">cu_q</div><div class="lane"><span>0</span><span>5</span><span>6</span><span>9</span></div>
+</div>
+<div class="cap2">张量形状是 [1, T, …]。哪几行属于哪条序列，记在元数据的 cu_q 里。</div>
+</div>
+<p>大多数 kernel 根本不关心序列边界：Linear、RMSNorm、add、mul、silu、RoPE、embedding 都是逐行算的，T 行来自一条序列还是 256 条，对它们没有区别。只有三处需要知道边界，各自从元数据里读：</p>
+<div class="tablewrap"><table><thead><tr><th>kernel</th><th>需要知道什么</th><th>读哪个字段</th></tr></thead><tbody><tr><td>store_kv</td><td>每个 token 写到哪</td><td><code>slots[T]</code></td></tr><tr><td>注意力</td><td>每条序列的块表、上下文长度、query 范围</td><td><code>block_tables[S]</code>、<code>ctx[S]</code>、<code>cu_q[S+1]</code>、tile 表</td></tr><tr><td>gather_last</td><td>每条序列最后一行在哪</td><td><code>last[S]</code></td></tr><tr><td>sample</td><td>每条序列的温度</td><td><code>temps[S]</code></td></tr></tbody></table></div>
+<p>这就是第 04 步那个元数据包、第 05 步 token-major、第 08 步 <code>DYN_S</code> 的全部意义。现在 <code>forward</code> 的代码一行都不用改，传进来的 Entry 多于一条就是批处理。</p>
+
+<h3>一步太大：切成多趟</h3>
+<p>激活 token 区按 <code>max_tokens</code>（8192）分配。但调度器一步可以排进 16384 个 prefill token（<code>max_num_batched_tokens</code>）。超过时 <code>execute</code> 把 Entry 列表切成多趟，每趟不超过上限：</p>
+<div class="codeblock"><div class="cap"><span><b>executor.zig · execute / flushPass</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">    /// 跑一步. 返回 entries 里每一条的采样 token(按 entries 顺序; 不 emits 的条目其值无意义).
+    /// token 数超过单趟上限时切成多趟(条目的 query 段可被切开, 只有末段的采样结果有意义).
+    pub fn execute(self: *Executor, entries: []const sch.Entry) ![]const i32 {
+        var total: usize = 0;
+        for (entries) |e| total += e.q_len;
+        if (total &lt;= self.lim.max_tok) return self.forward(entries);
+
+        try self.pass_out.resize(self.alloc, entries.len);
+        self.pass_group.clearRetainingCapacity();
+        self.pass_owner.clearRetainingCapacity();
+        var room = self.lim.max_tok;
+        for (entries, 0..) |e, idx| {
+            var qs = e.q_start;
+            var left = e.q_len;
+            while (left &gt; 0) {
+                const take = @min(left, room);
+                try self.pass_group.append(self.alloc, .{ .seq = e.seq, .q_start = qs, .q_len = take });
+                try self.pass_owner.append(self.alloc, idx);
+                qs += take;
+                left -= take;
+                room -= take;
+                if (room == 0) {
+                    try self.flushPass(entries);
+                    room = self.lim.max_tok;
+                }
+            }
+        }
+        try self.flushPass(entries);
+        return self.pass_out.items;
+    }
+
+    fn flushPass(self: *Executor, entries: []const sch.Entry) !void {
+        if (self.pass_group.items.len == 0) return;
+        const toks = try self.forward(self.pass_group.items);
+        for (self.pass_group.items, self.pass_owner.items, toks) |piece, owner, tk| {
+            const e = entries[owner];
+            if (piece.q_start + piece.q_len == e.q_start + e.q_len) self.pass_out.items[owner] = tk;
+        }
+        self.pass_group.clearRetainingCapacity();
+        self.pass_owner.clearRetainingCapacity();
+    }</code></pre></div>
+<p>一条 Entry 可以被切开：前半段在第一趟，后半段在第二趟。这之所以正确，是因为 prefill 注意力读的是 KV cache（第 14 步）：第二趟的 query 能看到第一趟已经写进去的 K/V。只有末段的采样结果有意义（<code>flushPass</code> 里那个判断）。</p>
+
+<h3>Engine：一步的三个动作</h3>
+<div class="codeblock"><div class="cap"><span><b>engine.zig</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">pub const Engine = struct {
+    alloc: Alloc,
+    executor: *exe.Executor,
+    cfg: EngineConfig,
+    bm: bmm.BlockManager,
+    sched: sch.BatchScheduler,
+    seqs: std.ArrayListUnmanaged(*sq.Sequence) = .empty,
+    next_id: u64 = 0,
+    last: []const sch.Entry = &amp;.{},
+    emitted: std.ArrayListUnmanaged(Emitted) = .empty,
+    eos: i32,
+
+    /// 本步产出: 序列 + 新 token(postprocess 之后 Entry.emits() 已不再成立, 故在此单独记录).
+    pub const Emitted = struct { seq: *sq.Sequence, token: i32 };
+
+    /// 堆分配: BatchScheduler 持有指向 self.bm 的指针, Engine 地址必须稳定.
+    pub fn init(alloc: Alloc, executor: *exe.Executor, cfg: EngineConfig) !*Engine {
+        const self = try alloc.create(Engine);
+        errdefer alloc.destroy(self);
+        self.* = .{
+            .alloc = alloc,
+            .executor = executor,
+            .cfg = cfg,
+            .bm = try bmm.BlockManager.init(alloc, cfg.num_kv_blocks, cfg.block_size),
+            .sched = undefined,
+            .eos = cfg.eos,
+        };
+        self.sched = sch.BatchScheduler.init(alloc, .{
+            .max_num_seqs = cfg.max_num_seqs,
+            .max_num_batched_tokens = cfg.max_num_batched_tokens,
+            .policy = cfg.policy,
+            .chunk_tokens = cfg.chunk_tokens,
+            .eos = cfg.eos,
+        }, &amp;self.bm);
+        return self;
+    }
+
+    pub fn deinit(self: *Engine) void {
+        for (self.seqs.items) |s| {
+            s.deinit(self.alloc);
+            self.alloc.destroy(s);
+        }
+        self.seqs.deinit(self.alloc);
+        self.emitted.deinit(self.alloc);
+        self.sched.deinit();
+        self.bm.deinit();
+        self.alloc.destroy(self);
+    }
+
+    pub fn addRequest(self: *Engine, prompt: []const i32, params: sq.SamplingParams) !*sq.Sequence {
+        if (prompt.len + params.max_tokens &gt; self.cfg.max_model_len) return error.SequenceTooLong;
+        const s = try self.alloc.create(sq.Sequence);
+        errdefer self.alloc.destroy(s);
+        s.* = try sq.Sequence.init(self.alloc, self.next_id, prompt, params);
+        self.next_id += 1;
+        try self.seqs.append(self.alloc, s);
+        try self.sched.add(s);
+        return s;
+    }
+
+    pub fn isFinished(self: *const Engine) bool {
+        return self.sched.isFinished();
+    }
+
+    /// 跑一步; 返回本步结束的序列数. 本步条目见 lastEntries().
+    pub fn step(self: *Engine) !usize {
+        const entries = try self.sched.schedule();
+        self.last = entries;
+        if (entries.len == 0) return error.SchedulerStuck;
+        const toks = try self.executor.execute(entries);
+        // executor 按 entries 顺序给出每条的采样值; postprocess 只要 emits() 的那些(按顺序)
+        self.emitted.clearRetainingCapacity();
+        var buf: std.ArrayListUnmanaged(i32) = .empty;
+        defer buf.deinit(self.alloc);
+        for (entries, 0..) |e, i| {
+            if (e.emits()) {
+                try buf.append(self.alloc, toks[i]);
+                try self.emitted.append(self.alloc, .{ .seq = e.seq, .token = toks[i] });
+            }
+        }
+        return self.sched.postprocess(entries, buf.items);
+    }</code></pre></div>
+<p><code>schedule()</code> 排出这一步的 Entry 列表 → <code>execute()</code> 前向并采样 → <code>postprocess()</code> 把新 token 追加到各序列、判断结束、归还块。调用方在每步之后看 <code>lastEmitted()</code> 就知道哪条序列刚出了哪个 token。</p>
+
+<h2>改动</h2>
+<h3><span class="stepno">1</span>BatchScheduler：修四处编译错误和一处逻辑</h3>
+<p>llmgen 的 <code>runner/batching.zig</code> 和 lab 的 <code>batch.zig</code> 逻辑基本相同，但从没被编译过（没人引用 <code>BatchScheduler</code>），有几处错：</p>
+<div class="codeblock diff"><div class="cap"><span><b>src/runner/batching.zig（四处）</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">    waiting: std.ArrayList(*Sequence) = .empty, // FIFO</span><span class="ln ctx">    running: std.ArrayList(*Sequence) = .empty,</span><span class="ln del">    scheduled: std.ArrayList(*Entry) = .empty,</span><span class="ln add">    scheduled: std.ArrayList(Entry) = .empty, // 存值:schedule() 返回 []const Entry</span><span class="ln ctx">...</span><span class="ln del">    pub fn add(self: *const Self, s: *Sequence) !void {</span><span class="ln add">    pub fn add(self: *Self, s: *Sequence) !void {</span><span class="ln ctx">...</span><span class="ln ctx">// ---- schedulePrefillFirst() ----</span><span class="ln del">            self.scheduled.append(self.allocator, .{ .seq = seq, .q_start = 0, .q_len = seq_len });</span><span class="ln add">            try self.scheduled.append(self.allocator, .{ .seq = seq, .q_start = 0, .q_len = seq_len });</span><span class="ln ctx">            n_tok += seq_len;</span><span class="ln ctx">        }</span><span class="ln add">        // prefill_first:这一步有 prefill 就只做 prefill, decode 等下一步</span><span class="ln add">        if (self.scheduled.items.len &gt; 0) return;</span><span class="ln ctx"> </span><span class="ln ctx">        // decode</span></code></pre></div>
+<p>最后那个 <code>return</code> 是逻辑问题：没有它，一步里会同时排进“整条 prompt 的 prefill”和“decode”，那就不是 prefill_first 了（混批是 chunked 策略的事，第 20 步讲）。</p>
+
+<h3><span class="stepno">2</span>Engine：构造参数</h3>
+<div class="codeblock"><div class="cap"><span><b>src/runner/engine.zig</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-zig">    pub fn init(allocator: std.mem.Allocator, executor: *Executor, cfg: EngineConfig) !*Self {
+        const self = try allocator.create(Engine);
+        errdefer allocator.destroy(self);
+
+        self.* = .{
+            .allocator = allocator,
+            .cfg = cfg,
+            .batch_scheduler = BatchScheduler.init(allocator),
+            .block_manager = try BlockManager.init(allocator),
+            .executor = executor,
+            .eos = cfg.eos,
+            .clock = try std.time.Timer.start(),
+        };
+
+        return self;
+    }</code></pre></div>
+<div class="codeblock diff"><div class="cap"><span><b>src/runner/engine.zig · init（再补一个 deinit：释放 seqs、emitted、batch_scheduler 的三个列表、block_manager、self）</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">        self.* = .{</span><span class="ln ctx">            .allocator = allocator,</span><span class="ln ctx">            .cfg = cfg,</span><span class="ln del">            .batch_scheduler = BatchScheduler.init(allocator),</span><span class="ln del">            .block_manager = try BlockManager.init(allocator),</span><span class="ln add">            .batch_scheduler = undefined, // 它要拿 &amp;self.block_manager, 得等 self 的地址定下来</span><span class="ln add">            .block_manager = try BlockManager.init(allocator, cfg.num_kv_blocks, cfg.block_size),</span><span class="ln ctx">            .executor = executor,</span><span class="ln ctx">            .eos = cfg.eos,</span><span class="ln ctx">            .clock = try std.time.Timer.start(),</span><span class="ln ctx">        };</span><span class="ln add">        self.batch_scheduler = BatchScheduler.init(allocator, &amp;self.block_manager, .{</span><span class="ln add">            .max_num_seqs = cfg.max_num_seqs,</span><span class="ln add">            .max_num_batched_tokens = cfg.max_num_batched_tokens,</span><span class="ln add">            .policy = cfg.policy,</span><span class="ln add">            .chunk_tokens = cfg.chunk_tokens,</span><span class="ln add">            .eos = cfg.eos,</span><span class="ln add">        });</span><span class="ln ctx"> </span><span class="ln ctx">        return self;</span></code></pre></div>
+<p><code>EngineConfig.num_kv_blocks</code> 传 <code>graph_scheduler.num_kv_blocks</code>（第 18 步算出来的）。<code>runStep</code> 里已经在调 <code>self.executor.execute(entries)</code>，不用改。</p>
+
+<h3><span class="stepno">3</span>Executor：execute，删掉 generate</h3>
+<div class="codeblock diff"><div class="cap"><span><b>src/executor.zig</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln del">    block_manager: BlockManager, // 第 06 步加的:块的分配归 Engine 了</span><span class="ln ctx">...</span><span class="ln add">    pass_out: std.ArrayList(i32) = .empty, //   多趟时各条目的采样结果</span><span class="ln add">    pass_group: std.ArrayList(Entry) = .empty,</span><span class="ln add">    pass_owner: std.ArrayList(usize) = .empty,</span><span class="ln ctx">...</span><span class="ln del">    pub fn generate(self: *Self, prompt: []const i32, max_tokens: usize, eos: i32, tokenizer: ?*Tokenizer) ![]i32 {</span><span class="ln del">        ...(单序列的整个生成循环)</span><span class="ln del">    }</span><span class="ln add">    // (把 lab 的 execute / flushPass 贴到这里, self.lim.max_tok 换成 self.max_tokens, self.alloc 换成 self.allocator)</span></code></pre></div>
+<p>单序列的 <code>generate</code> 完成了它的使命。它里面的指标打点（<code>GenMetrics</code>）是按单请求设计的；批处理的指标由 <code>runner/stats.zig</code> 的 <code>EngineStats</code> 和 <code>Sequence</code> 上的时间戳负责。</p>
+
+<h3><span class="stepno">4</span>入口</h3>
+<div class="codeblock"><div class="cap"><span><b>src/llmgen.zig</b> <span class="tag new">新增</span></span><button type="button">复制</button></div><pre><code class="language-zig">/// 一轮请求同时提交, 跑到全部结束。返回墙钟纳秒。
+fn runRound(engine: *Engine, reqs: []const workload.Request) !u64 {
+    var timer = try std.time.Timer.start();
+    for (reqs) |r| {
+        _ = try engine.addRequest(r.prompt_ids, .{
+            .temperature = r.temperature,
+            .max_tokens = r.max_tokens,
+            .ignore_eos = r.ignore_eos,
+        });
+    }
+    while (!engine.isFinished()) _ = try engine.runStep();
+    return timer.read();
+}
+
+/// 取代第 01 步的 benchSingle
+fn bench(allocator: std.mem.Allocator, engine: *Engine, path: []const u8) !void {
+    const parsed = try workload.load(allocator, path);
+    defer parsed.deinit();
+    const wl = parsed.value;
+
+    for (wl.rounds, 0..) |reqs, i| {
+        var out_tokens: usize = 0;
+        for (reqs) |r| out_tokens += r.max_tokens;
+        const ns = try runRound(engine, reqs);
+        std.debug.print(&quot;[bench] {s} 第 {d} 轮: {d} 请求, {d:.3} s, {d:.1} tok/s\n&quot;, .{
+            wl.name, i + 1, reqs.len, @as(f64, @floatFromInt(ns)) / 1e9, pcommon.perSec(out_tokens, ns),
+        });
+        // TTFT / ITL / 抢占次数:Sequence 上有 arrival_ns / first_token_ns / finish_ns, EngineStats 负责汇总
+        try engine.stats.print(allocator, engine.seqs.items, engine.block_manager.num_blocks, engine.batch_scheduler.num_preemtions, engine.clock.read());
+        engine.releaseFinishedSeqs();
+    }
+}</code></pre></div>
+<p><code>llmgen.zig</code> 里已经有一个用 Engine 的 <code>chat()</code> 函数，把 <code>run()</code> 的结尾改成：建 Engine → 有 <code>LLMGEN_WORKLOAD</code> 就 <code>bench</code>，否则 <code>chat</code>。第 21 步把它整理成正式的命令行。</p>
+
+<h2>对拍验证</h2>
+<ul>
+  <li><b>单请求</b>：<code>chat</code> 的 greedy 输出和上一步逐 token 相同。走的是同一个 <code>forward</code>，只是多了 Engine 这一层。</li>
+  <li><b>批内一致性</b>：同一个 prompt 提交 8 份（temperature = 0），8 条序列的输出应该<b>完全相同</b>，且和单独跑一条相同。这能抓出序列之间串数据的错误（块表、cu_q、last 填错）。</li>
+  <li><b>S1</b>：数字应该和第 17 步一样。</li>
+</ul>
+<div class="codeblock"><div class="cap"><span><b>终端</b> <span class="tag out">命令</span></span><button type="button">复制</button></div><pre><code class="language-bash">for s in s1 s2 s3 s4; do
+  LLMGEN_WORKLOAD=src/bench/workloads/$s.json make llmgen-cuda
+done</code></pre></div>
+<h2>CPU 同步</h2>
+<div class="callout cpu"><span class="t">这一步 CPU 后端要做的事</span><b>不用动。</b>变长打包、多趟切分、Engine 都是 host 逻辑。CPU 的注意力按 <code>cu_q</code> 找序列边界，天然支持多条序列。用一个小 workload 在 CPU 上做“8 份相同 prompt”的检查。 <a href="cpu-5-exec-cli.html#final">去看 →</a></div>
+<h2>性能收益</h2>
+<h3>依据</h3>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th class="num">改前</th><th class="num">改后</th><th>来源</th></tr></thead><tbody><tr><td>目标 lab：S1（1 条）→ S4（8 并发）→ S2（32 并发）→ S3（256 条）</td><td class="num">401.3 tok/s</td><td class="num">1670.1 → 3786.1 → 5580</td><td><span class="src lab">lab 实测</span></td></tr><tr><td>融合版 S3：单趟上限 2048 → 8192 → 16384 token（tok/s）</td><td class="num">5697.2</td><td class="num">5770.1 → 5766.4</td><td><span class="src lab">消融实测</span></td></tr><tr><td>S3 的 kernel 时间里 attn_decode 占比</td><td class="num">—</td><td class="num">68.0%，平均 513.2 µs / 次</td><td><span class="src lab">nsys 实测</span></td></tr></tbody></table></div>
+<h3>对 llmgen 的预期</h3>
+<p>这是整份教程里吞吐提升最大的一步：S3 是 S1 的 13.9 倍。前面 17 步把单步做到了 2.4 ms，这一步让每一步多干活。</p>
+<p>对 llmgen：kernel 和执行层都和 lab 相同了，预期四个场景的吞吐都落在目标的 ±10% 以内 <span class="src est">推算</span>。差得多的话，按这个顺序查：</p>
+<ol>
+  <li>S1 对不对（不对就是前面的问题，不是批处理的问题）；</li>
+  <li>S4 对不对（批 4–8，走 cuBLAS 路和 CUDA Graph 桶 4 / 8）；</li>
+  <li>S3 对不对（大批，看有没有抢占、有没有切多趟）。</li>
+</ol>
+<p>单趟上限对吞吐不敏感：2048 和 16384 只差 1%。它影响的是激活区占多少显存（44 MB 对 352 MB），省下来的给 KV。</p>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>S1 输出吞吐 (tok/s)</td><td class="num fill" contenteditable="true" data-key="19-batched-forward.html|S1 输出吞吐 (tok/s)|before"></td><td class="num fill" contenteditable="true" data-key="19-batched-forward.html|S1 输出吞吐 (tok/s)|after"></td><td class="num gain"></td></tr><tr><td>S4 输出吞吐 (tok/s)</td><td class="num fill" contenteditable="true" data-key="19-batched-forward.html|S4 输出吞吐 (tok/s)|before"></td><td class="num fill" contenteditable="true" data-key="19-batched-forward.html|S4 输出吞吐 (tok/s)|after"></td><td class="num gain"></td></tr><tr><td>S2 输出吞吐 (tok/s)</td><td class="num fill" contenteditable="true" data-key="19-batched-forward.html|S2 输出吞吐 (tok/s)|before"></td><td class="num fill" contenteditable="true" data-key="19-batched-forward.html|S2 输出吞吐 (tok/s)|after"></td><td class="num gain"></td></tr><tr><td>S3 输出吞吐 (tok/s)</td><td class="num fill" contenteditable="true" data-key="19-batched-forward.html|S3 输出吞吐 (tok/s)|before"></td><td class="num fill" contenteditable="true" data-key="19-batched-forward.html|S3 输出吞吐 (tok/s)|after"></td><td class="num gain"></td></tr><tr><td>S2 ITL mean (ms)</td><td class="num fill" contenteditable="true" data-key="19-batched-forward.html|S2 ITL mean (ms)|before"></td><td class="num fill" contenteditable="true" data-key="19-batched-forward.html|S2 ITL mean (ms)|after"></td><td class="num gain"></td></tr><tr><td>S3 ITL mean (ms)</td><td class="num fill" contenteditable="true" data-key="19-batched-forward.html|S3 ITL mean (ms)|before"></td><td class="num fill" contenteditable="true" data-key="19-batched-forward.html|S3 ITL mean (ms)|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td><code>error.SchedulerStuck</code></td><td><code>schedule()</code> 返回了空列表但还有序列没结束。多半是一条序列需要的块比总块数还多，或者 <code>max_num_batched_tokens</code> 小于一条 prompt 的长度（prefill_first 要求一条 prompt 能一步放下）。</td></tr><tr><td>8 份相同 prompt 的输出互不相同</td><td>序列之间串了。先查 <code>last[s]</code>（gather 取错行），再查块表（<code>bt + s * max_blocks</code> 的行偏移）。</td></tr><tr><td>批大小 5–7 时结果错，1 / 2 / 4 / 8 对</td><td>CUDA Graph 桶的 padding 行有问题。用 <code>LLMGEN_EAGER=1</code> 确认：eager 对而 graph 错，就是 <code>fillMeta</code> 的 padding 循环。</td></tr><tr><td>prompt 超过 8192 token 的总量时结果错</td><td>多趟切分的问题。<code>flushPass</code> 里只有“走到 Entry 末尾的那一段”才回填采样结果。</td></tr><tr><td>S3 比目标慢很多，日志里抢占次数很大</td><td>KV 容量不够（第 18 步），或者有别的进程占着显存。</td></tr><tr><td><code>error.SequenceTooLang</code></td><td><code>addRequest</code> 检查 <code>prompt.len + max_tokens ≤ max_model_len</code>。S3 最长 1024 + 1024，<code>max_model_len</code> 至少 2048。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li>8 份相同 prompt 的 greedy 输出完全相同</li><li>S1–S4 都能跑完</li><li>S1 的数字和第 17 步一致</li><li>记下了四个场景的吞吐</li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="18-block-manager.html"><small>← 上一步</small>序列级块表与 KV 预算</a><a class="next" href="20-scheduling.html"><small>下一步 →</small>调度策略与抢占</a></div>
+</main>
+</div>
+</body>
+</html>

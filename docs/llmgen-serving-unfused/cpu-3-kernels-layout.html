@@ -1,0 +1,561 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CPU：布局相关的算子 · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html" class="active"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">CPU 支线</div>
+<h1>CPU：布局相关的算子</h1>
+<p class="lead">embedding、rope、attention、gather_last、sample。</p>
+<div class="callout goal"><span class="t">本步目标</span>把 CPU 上五个和“数据怎么排”有关的算子换成新布局的版本：embedding、rope、attention、gather_last、sample。它们分别对应主线第 03、05、06、08、09 步；主线做到哪一步，就来这里做对应的一节。</div>
+<h2>原理</h2>
+<p>这五个算子本身都不复杂，在 CPU 上就是几十行循环。要点只有一个：<b>读写的布局和元数据必须和 CUDA 版完全相同</b>，因为它们共用同一个执行层、同一个 KV cache 布局、同一份元数据包。</p>
+<div class="tablewrap"><table><thead><tr><th>算子</th><th>读什么元数据</th><th>布局约定</th></tr></thead><tbody><tr><td>embedding</td><td>—（ids 是输入张量，在元数据包里）</td><td><code>out[t] = W[ids[t]]</code>，行宽 hidden</td></tr><tr><td>rope</td><td><code>pos[T]</code></td><td>x 是 token-major <code>[T, n_head, hd]</code></td></tr><tr><td>attention</td><td><code>slots[T]</code>、<code>block_tables[S]</code>、<code>ctx[S]</code>、<code>cu_q[S+1]</code></td><td>KV cache <code>[块][kv_head][slot][hd]</code></td></tr><tr><td>gather_last</td><td><code>last[S]</code></td><td><code>out[s] = x[last[s]]</code></td></tr><tr><td>sample</td><td><code>temps[S]</code>、<code>seed</code></td><td><code>out[s]</code> 是 i32 token id</td></tr></tbody></table></div>
+<p>CUDA 版在元数据里拿到的是显存指针，当参数传给 kernel。CPU 版拿到的是同一个结构里的 host 指针，<code>c.ptrAs(i32, s.pos)</code> 直接当数组用。</p>
+
+<h2 id="embedding">embedding（主线第 03 步）</h2>
+<p>原来的实现逐元素 <code>elemF32</code> → <code>storeF32</code>，每个元素两次 dtype 分支和一次 bf16 ↔ f32 往返。查表是按位拷贝，一行一个 <code>@memcpy</code> 就够了。</p>
+<div class="codeblock"><div class="cap"><span><b>backend/cpu/embedding.zig</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">const T = @import(&quot;../../tensor.zig&quot;);
+const c = @import(&quot;common.zig&quot;);
+const Tensor = T.Tensor;
+
+pub const EmbError = error{TokenOutOfRange};
+
+/// src[0]=input_ids[T] int32, src[1]=token_embd[H, V] BF16 → out[T, H] BF16.
+pub const EmbeddingImpl = struct {
+    pub fn execute(out: *Tensor, dev_id: i32) !void {
+        _ = dev_id;
+        const w = out.src[1].?;
+        const H: usize = @intCast(c.dimAt(w, 0));
+        const vocab: usize = @intCast(c.dimAt(w, 1));
+        const ids = c.ptrAs(i32, out.src[0].?.data);
+        const src = c.bf16Of(w);
+        const dst = c.bf16Of(out);
+        for (0..@intCast(c.g_step.n_tok)) |t| {
+            const id: usize = @intCast(ids[t]);
+            if (ids[t] &lt; 0 or id &gt;= vocab) return EmbError.TokenOutOfRange;
+            @memcpy(dst[t * H ..][0..H], src[id * H ..][0..H]);
+        }
+    }
+};</code></pre></div>
+<p>llmgen 的版本（权重维度是 <code>[vocab, hidden]</code>，和 lab 的顺序相反；张量多一维 batch）：</p>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cpu/embedding.zig（整个文件换掉）</b> <span class="tag new">新建文件</span></span><button type="button">复制</button></div><pre><code class="language-zig">//! cpu/embedding.zig -- EmbeddingImpl&lt;CPU&gt;: bf16 查表, 按行拷贝
+const Tensor = @import(&quot;../../Tensor.zig&quot;);
+const c = @import(&quot;common.zig&quot;);
+
+pub const EmbError = error{ TokenOutOfRange, EmbeddingNeedsBf16 };
+
+/// src[0] = input_ids [1, T] i32, src[1] = W [vocab, hidden] bf16 → out [1, T, hidden] bf16
+pub const EmbeddingImpl = struct {
+    pub fn execute(_: i32, out_tensor: *Tensor) !void {
+        const w = out_tensor.src[1].?;
+        if (w.data_type != .GGML_TYPE_BF16 or out_tensor.data_type != .GGML_TYPE_BF16) return EmbError.EmbeddingNeedsBf16;
+        const vocab = c.dimAt(w, 0);
+        const H = c.dimAt(w, 1);
+        const ids = c.ptrAs(i32, out_tensor.src[0].?.data);
+        const table = c.bf16Of(w);
+        const dst = c.bf16Of(out_tensor);
+        for (0..c.dimAt(out_tensor, 1)) |t| {
+            if (ids[t] &lt; 0 or @as(usize, @intCast(ids[t])) &gt;= vocab) return EmbError.TokenOutOfRange;
+            const id: usize = @intCast(ids[t]);
+            @memcpy(dst[t * H ..][0..H], table[id * H ..][0..H]);
+        }
+    }
+};</code></pre></div>
+<p>这一节是可选的：旧实现在新执行层下也能跑，只是慢。</p>
+
+<h2 id="rope">rope（主线第 05 步，必须）</h2>
+<p>主线第 05 步把 q / k 改成 token-major <code>[1, T, n, hd]</code>，位置从元数据读。原来的 CPU 实现按 head-major 寻址、位置是 <code>start_pos + s</code>：</p>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cpu/rope.zig · ApplyRopeImpl</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-zig">pub const ApplyRopeImpl = struct {
+    pub fn execute(_: i32, out_tensor: *Tensor) !void {
+        const x = out_tensor.src[0].?; // [n_heads, seq_len, head_dim], bf16/f16/f32
+        const cos = out_tensor.src[1].?; // [max_seq_len, rope_dim] F32
+        const sin = out_tensor.src[2].?; // [max_seq_len, rope_dim] F32
+
+        const head_dim: usize = @intFromFloat(out_tensor.op_params[0]); // 完整 head_dim
+        const rope_dim: usize = @intFromFloat(out_tensor.op_params[1]); // RoPE 维度
+        const rope_half = rope_dim / 2;
+        const start_pos: usize = @intFromFloat(out_tensor.op_params[2]);
+        const B = c.dimAt(x, 0);
+        const n_heads = c.dimAt(x, 1);
+        const seq_len = c.dimAt(x, 2);
+
+        const cos_data: [*]const f32 = @ptrCast(@alignCast(cos.data.?));
+        const sin_data: [*]const f32 = @ptrCast(@alignCast(sin.data.?));
+        const cos_stride = rope_dim; // cos/sin 的表步长
+        const head_stride = seq_len * head_dim;
+        const batch_stride = n_heads * seq_len * head_dim;
+        for (0..B) |b| {
+            for (0..n_heads) |h| {
+                for (0..seq_len) |s| {
+                    const pos = start_pos + s;
+                    const cos_row = cos_data + pos * cos_stride;
+                    const sin_row = sin_data + pos * cos_stride;
+                    const row = b * batch_stride + h * head_stride + s * head_dim;
+                    for (0..rope_half) |i| {
+                        const x0 = c.elemF32(x, row + i);
+                        const x1 = c.elemF32(x, row + i + rope_half);
+                        const ci = cos_row[i];
+                        const si = sin_row[i];
+                        c.storeF32(out_tensor, row + i, x0 * ci - x1 * si);
+                        c.storeF32(out_tensor, row + i + rope_half, x0 * si + x1 * ci);
+                    }
+                    for (rope_dim..head_dim) |i| c.storeF32(out_tensor, row + i, c.elemF32(x, row + i));
+                }
+            }
+        }
+    }
+};</code></pre></div>
+<p>不改的话它会把“第 t 个 token 的第 h 个头”读成别的位置，输出是乱的（不会崩）。lab 的版本：</p>
+<div class="codeblock"><div class="cap"><span><b>backend/cpu/rope.zig</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">const T = @import(&quot;../../tensor.zig&quot;);
+const c = @import(&quot;common.zig&quot;);
+const Tensor = T.Tensor;
+
+const Ctx = struct { out: [*]c.bf16, x: [*]const c.bf16, cs: [*]const f32, pos: [*]const i32, n_head: usize, hd: usize };
+
+fn tokens(ctx: Ctx, t0: usize, t1: usize) void {
+    const hd = ctx.hd;
+    const half = hd / 2;
+    for (t0..t1) |t| {
+        const cs = ctx.cs + @as(usize, @intCast(ctx.pos[t])) * hd;
+        for (0..ctx.n_head) |h| {
+            const base = (t * ctx.n_head + h) * hd;
+            for (0..half) |i| {
+                const a = c.bf2f(ctx.x[base + i]);
+                const b = c.bf2f(ctx.x[base + i + half]);
+                ctx.out[base + i] = c.f2bf(a * cs[i] - b * cs[half + i]);
+                ctx.out[base + i + half] = c.f2bf(b * cs[i] + a * cs[half + i]);
+            }
+        }
+    }
+}
+
+/// src[0]=x[DYN, n_head, hd]; op_params[0]=base(cos/sin 表已按 base 预算, 这里不再读).
+pub const ApplyRopeImpl = struct {
+    pub fn execute(out: *Tensor, dev_id: i32) !void {
+        _ = dev_id;
+        const s = &amp;c.g_step;
+        c.parallelFor(@intCast(s.n_tok), 8, Ctx{
+            .out = c.bf16Of(out),
+            .x = c.bf16Of(out.src[0].?),
+            .cs = c.ptrAs(f32, s.cos_sin),
+            .pos = c.ptrAs(i32, s.pos),
+            .n_head = @intCast(c.dimAt(out, 1)),
+            .hd = @intCast(c.dimAt(out, 2)),
+        }, tokens);
+    }
+};</code></pre></div>
+<p>llmgen 的 cos / sin 是两张表（lab 是合并的一张），其余相同：</p>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cpu/rope.zig</b> <span class="tag edit">修改</span></span><button type="button">复制</button></div><pre><code class="language-zig">// ---- src/backend/cpu/rope.zig: 只换 ApplyRopeImpl, 同文件里的 RopeCacheImpl 不动 ----
+const RopeCtx = struct {
+    out: [*]c.bf16,
+    x: [*]const c.bf16,
+    cos: [*]const f32, // [max_seq, hd], 每行前后两半存同一个角度, 只读前半
+    sin: [*]const f32,
+    pos: [*]const i32, // 本步元数据:每个 token 的位置
+    n_head: usize,
+    hd: usize,
+};
+
+fn ropeTokens(ctx: RopeCtx, t0: usize, t1: usize) void {
+    const hd = ctx.hd;
+    const half = hd / 2;
+    for (t0..t1) |t| {
+        const row = @as(usize, @intCast(ctx.pos[t])) * hd;
+        for (0..ctx.n_head) |h| {
+            const base = (t * ctx.n_head + h) * hd;
+            for (0..half) |i| {
+                const a = c.bf2f(ctx.x[base + i]);
+                const b = c.bf2f(ctx.x[base + i + half]);
+                const cs = ctx.cos[row + i];
+                const sn = ctx.sin[row + i];
+                ctx.out[base + i] = c.f2bf(a * cs - b * sn);
+                ctx.out[base + i + half] = c.f2bf(b * cs + a * sn);
+            }
+        }
+    }
+}
+
+/// src[0] = x [1, T, n_head, hd] bf16, src[1] = cos / src[2] = sin [max_seq, hd] f32 → out 同形(非原地)
+pub const ApplyRopeImpl = struct {
+    pub fn execute(_: i32, out_tensor: *Tensor) !void {
+        const x = out_tensor.src[0].?;
+        const s = &amp;c.g_step;
+        c.parallelFor(@intCast(s.n_tok), 8, RopeCtx{
+            .out = c.bf16Of(out_tensor),
+            .x = c.bf16Of(x),
+            .cos = c.ptrAs(f32, out_tensor.src[1].?.data),
+            .sin = c.ptrAs(f32, out_tensor.src[2].?.data),
+            .pos = c.ptrAs(i32, s.pos),
+            .n_head = c.dimAt(x, 2),
+            .hd = c.dimAt(x, 3),
+        }, ropeTokens);
+    }
+};</code></pre></div>
+<p>公式和主线第 05 步的 <code>rope_kernel</code> 逐项相同：<code>out[i] = a·cos − b·sin</code>，<code>out[i + half] = b·cos + a·sin</code>，每个输出在 f32 里算完舍入一次。</p>
+
+<h2 id="attention">attention（主线第 06 步，必须）</h2>
+<p>主线第 06 步把 <code>PagedAttentionManager</code> 瘦身了（没有 <code>appendKVFromTensor</code> 和 <code>page_table</code> 了），原来的 CPU 实现直接编译不过：</p>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cpu/attention.zig（起点）</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-zig">        // ① 写入本步 K/V(head-major 输入 → 块内 token-major),推进 num_cached.
+        const kbytes = k.data.?[0..k.bytes()];
+        const vbytes = v.data.?[0..v.bytes()];
+        try mgr.appendKVFromTensor(layer_id, kbytes, vbytes, @intCast(n_kv), @intCast(seq), @intCast(hd), k.data_type);
+
+        const layer = mgr.getLayerState(layer_id).?;
+        if (!layer.active or layer.page_table.items.len == 0) return;
+        const total_cached: usize = @intCast(layer.num_cached);
+        const num_blocks = layer.page_table.items.len;
+        const block_size: usize = @intCast(page_atten.PAGE_BLOCK_SIZE);</code></pre></div>
+<p>新版分两步，和 CUDA 版一样：先 <code>storeKv</code> 把本步 k / v 按 slot 写进 cache，再在 cache 上算注意力。</p>
+<div class="codeblock"><div class="cap"><span><b>backend/cpu/attention.zig（测试之前的全部）</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">const MAX_HD = 256;
+
+/// store_kv: k/v[T, nkv, hd] → cache 的 slot 位置.
+pub fn storeKv(k: [*]const c.bf16, v: [*]const c.bf16, slots: [*]const i32, kc: [*]c.bf16, vc: [*]c.bf16, n_tok: usize, nkv: usize, hd: usize, bs: usize) void {
+    for (0..n_tok) |t| {
+        if (slots[t] &lt; 0) continue;
+        const slot: usize = @intCast(slots[t]);
+        const blk = slot / bs;
+        const off = slot % bs;
+        for (0..nkv) |h| {
+            const dst = ((blk * nkv + h) * bs + off) * hd;
+            const src = (t * nkv + h) * hd;
+            @memcpy(kc[dst..][0..hd], k[src..][0..hd]);
+            @memcpy(vc[dst..][0..hd], v[src..][0..hd]);
+        }
+    }
+}
+
+pub const Args = struct {
+    out: [*]c.bf16,
+    q: [*]const c.bf16,
+    kc: [*]const c.bf16,
+    vc: [*]const c.bf16,
+    block_tables: [*]const i32,
+    ctx_lens: [*]const i32,
+    cu_q: [*]const i32,
+    n_seq: usize,
+    nq: usize,
+    nkv: usize,
+    hd: usize,
+    max_blocks: usize,
+    bs: usize,
+    scale: f32,
+};
+
+/// token t 属于哪条序列: cu_q 上二分(cu_q[s] ≤ t &lt; cu_q[s+1]).
+fn seqOf(a: Args, t: usize) usize {
+    var lo: usize = 0;
+    var hi: usize = a.n_seq;
+    while (hi - lo &gt; 1) {
+        const mid = (lo + hi) / 2;
+        if (@as(usize, @intCast(a.cu_q[mid])) &lt;= t) lo = mid else hi = mid;
+    }
+    return lo;
+}
+
+fn heads(a: Args, w0: usize, w1: usize) void {
+    const hd = a.hd;
+    const group = a.nq / a.nkv;
+    var acc: [MAX_HD]f32 = undefined;
+    for (w0..w1) |w| {
+        const t = w / a.nq;
+        const h = w % a.nq;
+        const s = seqOf(a, t);
+        const q_beg: usize = @intCast(a.cu_q[s]);
+        const q_len: usize = @as(usize, @intCast(a.cu_q[s + 1])) - q_beg;
+        const ctx: usize = @intCast(a.ctx_lens[s]);
+        const o = a.out + (t * a.nq + h) * hd;
+        if (ctx + (t - q_beg) + 1 &lt;= q_len) { // ctx = 0 的 padding 行: 没有可看的 key
+            @memset(o[0..hd], 0);
+            continue;
+        }
+        const n_keys = ctx - q_len + (t - q_beg) + 1; // 因果: 看得到位置 0..pos
+        const kvh = h / group;
+        const qr = a.q + (t * a.nq + h) * hd;
+        const bt = a.block_tables + s * a.max_blocks;
+        @memset(acc[0..hd], 0);
+        var m: f32 = -std.math.inf(f32);
+        var l: f32 = 0;
+        for (0..n_keys) |p| {
+            const blk: usize = @intCast(bt[p / a.bs]);
+            const row = ((blk * a.nkv + kvh) * a.bs + p % a.bs) * hd;
+            const score = c.dotBf16(qr, a.kc + row, hd) * a.scale;
+            const m_new = @max(m, score);
+            const corr = @exp(m - m_new);
+            const pw = @exp(score - m_new);
+            l = l * corr + pw;
+            const vr = a.vc + row;
+            for (0..hd) |d| acc[d] = acc[d] * corr + pw * c.bf2f(vr[d]);
+            m = m_new;
+        }
+        for (0..hd) |d| o[d] = c.f2bf(acc[d] / l);
+    }
+}
+
+/// 分页因果 GQA(不写 KV). 供 PagedAttentionImpl 与单测用.
+pub fn attend(a: Args, n_tok: usize) void {
+    std.debug.assert(a.hd &lt;= MAX_HD);
+    c.parallelFor(n_tok * a.nq, 4, a, heads);
+}
+
+/// src[0]=q[T, nq, hd], src[1]=k[T, nkv, hd], src[2]=v[T, nkv, hd] → out[T, nq, hd].
+pub const PagedAttentionImpl = struct {
+    pub fn execute(out: *Tensor, dev_id: i32) !void {
+        _ = dev_id;
+        const s = &amp;c.g_step;
+        const kv = try c.kvOf(out.layer_id);
+        const n_tok: usize = @intCast(s.n_tok);
+        const nkv: usize = @intCast(s.n_kv_head);
+        const hd: usize = @intCast(s.head_dim);
+        const bs: usize = @intCast(s.block_size);
+        const kc = c.ptrAs(c.bf16, kv.k);
+        const vc = c.ptrAs(c.bf16, kv.v);
+        storeKv(c.bf16Of(out.src[1].?), c.bf16Of(out.src[2].?), c.ptrAs(i32, s.slots), kc, vc, n_tok, nkv, hd, bs);
+        attend(.{
+            .out = c.bf16Of(out),
+            .q = c.bf16Of(out.src[0].?),
+            .kc = kc,
+            .vc = vc,
+            .block_tables = c.ptrAs(i32, s.block_tables),
+            .ctx_lens = c.ptrAs(i32, s.ctx),
+            .cu_q = c.ptrAs(i32, s.cu_q),
+            .n_seq = @intCast(s.n_seq),
+            .nq = @intCast(s.n_head),
+            .nkv = nkv,
+            .hd = hd,
+            .max_blocks = @intCast(s.max_blocks),
+            .bs = bs,
+            .scale = s.attn_scale,
+        }, n_tok);
+    }
+};</code></pre></div>
+<p>几个值得看的地方：</p>
+<ul>
+  <li><b>一条路径管三种情况。</b>CUDA 版有 decode（split-K）和 prefill（FA2）两个 kernel。CPU 版只有一个 <code>heads</code>：对每个 (token, q 头)，用 <code>cu_q</code> 二分找到它属于哪条序列，算出它能看到的 key 数 <code>n_keys = ctx − q_len + 序列内序号 + 1</code>，然后顺序扫。decode（q_len = 1）、prefill、chunked prefill 的后半段、混批都是这一个公式。</li>
+  <li><b>在线 softmax。</b>和主线第 13 步讲的是同一个算法，只是这里一次只来一个 key：维护运行最大值 <code>m</code>、分母 <code>l</code>、加权和 <code>acc</code>，每来一个分数就把旧的按 <code>exp(m − m_new)</code> 缩一下。不需要先存下所有分数。</li>
+  <li><b>padding 行。</b><code>ctx = 0</code> 的行没有可看的 key，输出 0。CPU 不录 CUDA Graph，执行层不会产生 padding 行，但测试里覆盖了，行为和 CUDA 一致。</li>
+  <li><b>并行粒度。</b>按 (token, q 头) 切，<code>grain = 4</code>。decode 时 16 个头分给 4 个线程；prefill 时 T × 16 个工作单元铺满所有核。<code>acc</code> 是 <code>heads</code> 栈上的数组，每个线程一份。</li>
+  <li><b>没有 GQA 共享。</b>CUDA 版一个 block 里同组的 q 头共用一次 KV 读取；这里每个 q 头各读各的。CPU 上 KV 在缓存里，重复读的代价小得多，不值得为它把代码写复杂。</li>
+</ul>
+<div class="codeblock diff"><div class="cap"><span><b>src/backend/cpu/attention.zig：用 lab 的整个文件覆盖（含末尾两个测试），改这几处</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln del">const T = @import(&quot;../../tensor.zig&quot;);</span><span class="ln add">const Tensor = @import(&quot;../../Tensor.zig&quot;);</span><span class="ln ctx">const c = @import(&quot;common.zig&quot;);</span><span class="ln del">const Tensor = T.Tensor;</span><span class="ln ctx">...</span><span class="ln del">/// src[0]=q[T, nq, hd], src[1]=k[T, nkv, hd], src[2]=v[T, nkv, hd] → out[T, nq, hd].</span><span class="ln add">/// src[0] = q [1, T, nq, hd], src[1] = k [1, T, nkv, hd], src[2] = v [1, T, nkv, hd] → out [1, T, nq, hd]</span><span class="ln ctx">pub const PagedAttentionImpl = struct {</span><span class="ln del">    pub fn execute(out: *Tensor, dev_id: i32) !void {</span><span class="ln del">        _ = dev_id;</span><span class="ln add">    pub fn execute(_: i32, out: *Tensor) !void {</span><span class="ln ctx">        const s = &amp;c.g_step;</span><span class="ln ctx">        ...</span><span class="ln ctx">    }</span><span class="ln ctx">};</span><span class="ln add"> </span><span class="ln add">/// 旧的 FLASH_ATTN / NAIVE 图节点走同一个实现</span><span class="ln add">pub const FlashAttentionImpl = PagedAttentionImpl;</span><span class="ln add">pub const NaiveAttentionImpl = PagedAttentionImpl;</span></code></pre></div>
+<div class="codeblock diff"><div class="cap"><span><b>src/backend/cpu/impls.zig</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">pub const MemcpyImpl = @import(&quot;memcpy.zig&quot;).MemcpyImpl;</span><span class="ln add">pub const GatherLastImpl = @import(&quot;memcpy.zig&quot;).GatherLastImpl;</span><span class="ln add">pub const SampleImpl = @import(&quot;sample.zig&quot;).SampleImpl;</span><span class="ln ctx">pub const EmbeddingImpl = @import(&quot;embedding.zig&quot;).EmbeddingImpl;</span><span class="ln ctx">...</span><span class="ln ctx">pub const PagedAttentionImpl = @import(&quot;attention.zig&quot;).PagedAttentionImpl;</span><span class="ln ctx">pub const NaiveAttentionImpl = @import(&quot;attention.zig&quot;).NaiveAttentionImpl;</span><span class="ln ctx">pub const FlashAttentionImpl = @import(&quot;attention.zig&quot;).FlashAttentionImpl;</span></code></pre></div>
+<p>主线第 06 步“把还在用旧接口的地方处理掉”那一小步，CPU 这边就是这一节：不要留返回错误的占位，直接换成真实现。</p>
+
+<h2 id="gather">gather_last（主线第 08 步，必须）</h2>
+<p><code>ops.zig</code> 的派发对每个设备分支都会实例化，CPU 特化必须存在。主线第 08 步给过一个临时版本，这里换成和 lab 一致的写法：</p>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cpu/memcpy.zig</b> <span class="tag edit">修改</span></span><button type="button">复制</button></div><pre><code class="language-zig">// ---- src/backend/cpu/memcpy.zig: 取代主线第 08 步给的临时版本 ----
+const c = @import(&quot;common.zig&quot;);
+
+/// x [1, T, H] → out [1, S, H]:每条序列取本步最后一个 token 的行, 行号在元数据的 last[S]
+pub const GatherLastImpl = struct {
+    pub fn execute(_: i32, out_tensor: *Tensor) !void {
+        const H: usize = @intCast(c.g_step.hidden);
+        const last = c.ptrAs(i32, c.g_step.last);
+        const src_rows = c.bf16Of(out_tensor.src[0].?);
+        const dst = c.bf16Of(out_tensor);
+        for (0..@intCast(c.g_step.n_seq)) |s| {
+            const r: usize = @intCast(last[s]);
+            @memcpy(dst[s * H ..][0..H], src_rows[r * H ..][0..H]);
+        }
+    }
+};</code></pre></div>
+
+<h2 id="sample">sample（主线第 09 步，必须）</h2>
+<p>和 <code>sample.cu</code> 是<b>同一个算法、同一个随机数</b>：<code>splitmix64(seed, 行, token id)</code> 给出均匀随机数，Gumbel-max 取 argmax；温度 ≤ 0 时是 greedy；并列取小下标。所以同一个 seed 下，CPU 和 CUDA 抽到的 token 在 logits 相同时也相同。</p>
+<div class="codeblock"><div class="cap"><span><b>backend/cpu/sample.zig</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">const std = @import(&quot;std&quot;);
+const T = @import(&quot;../../tensor.zig&quot;);
+const c = @import(&quot;common.zig&quot;);
+const Tensor = T.Tensor;
+
+pub fn splitmix64(x0: u64) u64 {
+    var x = x0 +% 0x9E3779B97F4A7C15;
+    x = (x ^ (x &gt;&gt; 30)) *% 0xBF58476D1CE4E5B9;
+    x = (x ^ (x &gt;&gt; 27)) *% 0x94D049BB133111EB;
+    return x ^ (x &gt;&gt; 31);
+}
+
+const Ctx = struct { out: [*]i32, logits: [*]const c.bf16, temps: [*]const f32, seed: u64, v: usize };
+
+fn rows(ctx: Ctx, s0: usize, s1: usize) void {
+    for (s0..s1) |s| {
+        const row = ctx.logits + s * ctx.v;
+        const temp = ctx.temps[s];
+        const seed = splitmix64(ctx.seed ^ (@as(u64, s) &lt;&lt; 40));
+        var best = -std.math.inf(f32);
+        var best_i: usize = 0;
+        for (0..ctx.v) |i| {
+            var val = c.bf2f(row[i]);
+            if (temp &gt; 0) {
+                const r = splitmix64(seed +% i);
+                const u = (@as(f32, @floatFromInt(r &gt;&gt; 40)) + 0.5) * (1.0 / 16777216.0); // (0,1)
+                val = val * (1 / temp) - @log(-@log(u));
+            }
+            if (val &gt; best) { // 严格大于: 并列保留小下标
+                best = val;
+                best_i = i;
+            }
+        }
+        ctx.out[s] = @intCast(best_i);
+    }
+}
+
+/// src[0]=logits[S, V] BF16 → out[S] int32.
+pub const SampleImpl = struct {
+    pub fn execute(out: *Tensor, dev_id: i32) !void {
+        _ = dev_id;
+        const s = &amp;c.g_step;
+        const logits = out.src[0].?;
+        c.parallelFor(@intCast(s.n_seq), 1, Ctx{
+            .out = c.ptrAs(i32, out.data),
+            .logits = c.bf16Of(logits),
+            .temps = c.ptrAs(f32, s.temps),
+            .seed = c.ptrAs(u64, s.seed)[0],
+            .v = @intCast(c.dimAt(logits, 1)),
+        }, rows);
+    }
+};</code></pre></div>
+<div class="codeblock diff"><div class="cap"><span><b>src/backend/cpu/sample.zig：用 lab 的文件新建，改这几处；backend/cpu/impls.zig 里导出 SampleImpl</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln del">const T = @import(&quot;../../tensor.zig&quot;);</span><span class="ln add">const Tensor = @import(&quot;../../Tensor.zig&quot;);</span><span class="ln ctx">const c = @import(&quot;common.zig&quot;);</span><span class="ln del">const Tensor = T.Tensor;</span><span class="ln ctx">...</span><span class="ln del">/// src[0]=logits[S, V] BF16 → out[S] int32.</span><span class="ln add">/// src[0] = logits [1, S, V] bf16 → out [1, S] i32</span><span class="ln ctx">pub const SampleImpl = struct {</span><span class="ln del">    pub fn execute(out: *Tensor, dev_id: i32) !void {</span><span class="ln del">        _ = dev_id;</span><span class="ln add">    pub fn execute(_: i32, out: *Tensor) !void {</span><span class="ln ctx">        ...</span><span class="ln del">            .v = @intCast(c.dimAt(logits, 1)),</span><span class="ln add">            .v = c.dimAt(logits, 2), // llmgen 的 logits 多一维 batch</span></code></pre></div>
+<p>CUDA 版拆成 32 段并行；CPU 版一个线程扫完整行（15 万个元素，约 0.1–0.2 ms），按行并行（批处理时每条序列一个线程）。带温度时每个元素要算两次 <code>log</code>，会慢到几毫秒；greedy 不受影响。</p>
+<p><code>fetchOut</code> 在 CPU 上直接读输出节点，主线第 09 步的代码已经处理了。</p>
+
+<h2>对拍验证</h2>
+<ul>
+  <li><code>zig build test</code>：lab 的 attention 文件自带两个测试（混批对 f32 参考、<code>storeKv</code> 的 slot 寻址），随文件一起搬过来了。</li>
+  <li>端到端：纯 CPU 构建跑 <code>chat</code>，greedy 输出通顺。</li>
+  <li>CPU 对 CUDA：主线第 06 步做完后两边都换了注意力，但 CUDA 的 norm / linear 还是旧 kernel，近似并列处允许分叉；第 12 步之后应该逐 token 相同。</li>
+</ul>
+<div class="codeblock"><div class="cap"><span><b>backend/cpu/attention.zig · 测试</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">// ============================================================
+// 测试: 与朴素 f32 参考对拍(分页 + GQA + 因果 + 两条序列混批 + padding 行)
+// ============================================================
+const testing = std.testing;
+
+fn refOne(q: []const c.bf16, kc: []const c.bf16, vc: []const c.bf16, bt: []const i32, nq: usize, nkv: usize, hd: usize, bs: usize, t_q: usize, h: usize, n_keys: usize, out: []f32) void {
+    const kvh = h / (nq / nkv);
+    const scores = testing.allocator.alloc(f32, n_keys) catch unreachable;
+    defer testing.allocator.free(scores);
+    var mx: f32 = -std.math.inf(f32);
+    for (0..n_keys) |p| {
+        const blk: usize = @intCast(bt[p / bs]);
+        const row = ((blk * nkv + kvh) * bs + p % bs) * hd;
+        var dot: f32 = 0;
+        for (0..hd) |d| dot += c.bf2f(q[(t_q * nq + h) * hd + d]) * c.bf2f(kc[row + d]);
+        scores[p] = dot / @sqrt(@as(f32, @floatFromInt(hd)));
+        mx = @max(mx, scores[p]);
+    }
+    var sum: f32 = 0;
+    for (scores) |*sc| {
+        sc.* = @exp(sc.* - mx);
+        sum += sc.*;
+    }
+    @memset(out, 0);
+    for (0..n_keys) |p| {
+        const blk: usize = @intCast(bt[p / bs]);
+        const row = ((blk * nkv + kvh) * bs + p % bs) * hd;
+        for (0..hd) |d| out[d] += scores[p] / sum * c.bf2f(vc[row + d]);
+    }
+}
+
+test &quot;PagedAttention&lt;CPU&gt;: 分页 + GQA + 因果, 混批(prefill 后半段 + decode + padding)对上 f32 参考&quot; {
+    const a = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(11);
+    const rng = prng.random();
+    const nq = 4;
+    const nkv = 2;
+    const hd = 64;
+    const bs = 16;
+    const n_blocks = 24;
+    const max_blocks = 8;
+    const kc = try a.alloc(c.bf16, n_blocks * nkv * bs * hd);
+    defer a.free(kc);
+    const vc = try a.alloc(c.bf16, n_blocks * nkv * bs * hd);
+    defer a.free(vc);
+    for (kc) |*e| e.* = c.f2bf(rng.float(f32) * 2 - 1);
+    for (vc) |*e| e.* = c.f2bf(rng.float(f32) * 2 - 1);
+    // 序列 0: ctx=70, 本步 q_len=30(chunked prefill 后半段); 序列 1: ctx=41 的 decode; 序列 2: padding(ctx=0)
+    var bt = [_]i32{0} ** (3 * max_blocks);
+    for (0..max_blocks) |i| {
+        bt[i] = @intCast((i * 5 + 1) % n_blocks);
+        bt[max_blocks + i] = @intCast((i * 7 + 2) % n_blocks);
+    }
+    const cu_q = [_]i32{ 0, 30, 31, 32 };
+    const ctx = [_]i32{ 70, 41, 0 };
+    const n_tok = 32;
+    const q = try a.alloc(c.bf16, n_tok * nq * hd);
+    defer a.free(q);
+    for (q) |*e| e.* = c.f2bf(rng.float(f32) * 2 - 1);
+    const out = try a.alloc(c.bf16, n_tok * nq * hd);
+    defer a.free(out);
+    attend(.{ .out = out.ptr, .q = q.ptr, .kc = kc.ptr, .vc = vc.ptr, .block_tables = &amp;bt, .ctx_lens = &amp;ctx, .cu_q = &amp;cu_q, .n_seq = 3, .nq = nq, .nkv = nkv, .hd = hd, .max_blocks = max_blocks, .bs = bs, .scale = 1.0 / @sqrt(@as(f32, hd)) }, n_tok);
+
+    var ref: [hd]f32 = undefined;
+    for (0..n_tok) |t| {
+        for (0..nq) |h| {
+            const got = out[(t * nq + h) * hd ..][0..hd];
+            if (t == 31) { // padding 行
+                for (got) |g| try testing.expectEqual(@as(f32, 0), c.bf2f(g));
+                continue;
+            }
+            const s: usize = if (t &lt; 30) 0 else 1;
+            const n_keys: usize = if (s == 0) 70 - 30 + t + 1 else 41;
+            refOne(q, kc, vc, bt[s * max_blocks ..][0..max_blocks], nq, nkv, hd, bs, t, h, n_keys, &amp;ref);
+            for (ref, got) |r, g| try testing.expectApproxEqAbs(r, c.bf2f(g), 1e-2);
+        }
+    }
+}
+
+test &quot;storeKv: 按 slot 写进分页 cache, slot &lt; 0 跳过&quot; {
+    const nkv = 2;
+    const hd = 4;
+    const bs = 2;
+    var k: [3 * nkv * hd]c.bf16 = undefined;
+    var v: [3 * nkv * hd]c.bf16 = undefined;
+    for (0..k.len) |i| {
+        k[i] = c.f2bf(@floatFromInt(i));
+        v[i] = c.f2bf(@floatFromInt(100 + i));
+    }
+    var kc = [_]c.bf16{0} ** (3 * nkv * bs * hd);
+    var vc = [_]c.bf16{0} ** (3 * nkv * bs * hd);
+    const slots = [_]i32{ 5, -1, 0 }; // token0 → 块 2 偏移 1; token1 跳过; token2 → 块 0 偏移 0
+    storeKv(&amp;k, &amp;v, &amp;slots, &amp;kc, &amp;vc, 3, nkv, hd, bs);
+    // token0 的 kv 头 1 → dst = ((2*2+1)*2+1)*4 = 44
+    try testing.expectEqual(k[1 * hd], kc[44]);
+    try testing.expectEqual(v[1 * hd + 3], vc[47]);
+    // token2 的 kv 头 0 → dst = 0
+    try testing.expectEqual(k[2 * nkv * hd], kc[0]);
+    // token1 没写: 块 1 仍为 0
+    for (kc[16..32]) |e| try testing.expectEqual(@as(c.bf16, 0), e);
+}</code></pre></div>
+<h2>性能收益</h2>
+<h3>依据</h3>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th class="num">改前</th><th class="num">改后</th><th>来源</th></tr></thead><tbody><tr><td>llmgen 早期 CPU 基线：APPLY_ROPE</td><td class="num">852.6 µs / 次</td><td class="num">—</td><td><span class="src start">llmgen 早期 CPU 日志</span></td></tr><tr><td>lab：CPU 与 CUDA 的 greedy 输出</td><td class="num">—</td><td class="num">64 个 token 逐个相同</td><td><span class="src lab">lab CPU 实测</span></td></tr></tbody></table></div>
+<h3>对 llmgen 的预期</h3>
+<p>这五个算子不是 CPU 上的时间大头（大头是 Linear，见 C4），这一页的目的是<b>保持能跑、保持和 CUDA 对齐</b>。</p>
+<ul>
+  <li><b>rope</b>：从逐元素 <code>elemF32</code> 变成 bf16 直读 + 按 token 并行。prefill 时快一个数量级以上 <span class="src est">推算</span>；decode 时只有 1 个 token，不开线程。</li>
+  <li><b>attention</b>：单线程变多线程；写 KV 从“逐 token × 逐头 memcpy 进每层自己的块池”变成按 slot 直接写。长 prompt 的 prefill 是 O(T²)，这是 CPU 上除 Linear 外最重的算子。</li>
+  <li><b>embedding / gather / sample</b>：都是微秒到亚毫秒级，对总时间没有可见影响。</li>
+</ul>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>CPU 单请求 decode (tok/s)</td><td class="num fill" contenteditable="true" data-key="cpu-3-kernels-layout.html|CPU 单请求 decode (tok/s)|before"></td><td class="num fill" contenteditable="true" data-key="cpu-3-kernels-layout.html|CPU 单请求 decode (tok/s)|after"></td><td class="num gain"></td></tr><tr><td>APPLY_ROPE 平均耗时 · prefill (µs)</td><td class="num fill" contenteditable="true" data-key="cpu-3-kernels-layout.html|APPLY_ROPE 平均耗时 · prefill (µs)|before"></td><td class="num fill" contenteditable="true" data-key="cpu-3-kernels-layout.html|APPLY_ROPE 平均耗时 · prefill (µs)|after"></td><td class="num gain"></td></tr><tr><td>PAGED_ATTN 平均耗时 · prefill (µs)</td><td class="num fill" contenteditable="true" data-key="cpu-3-kernels-layout.html|PAGED_ATTN 平均耗时 · prefill (µs)|before"></td><td class="num fill" contenteditable="true" data-key="cpu-3-kernels-layout.html|PAGED_ATTN 平均耗时 · prefill (µs)|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td>CPU 输出乱码，CUDA 正常（第 05 步之后）</td><td>rope 还是旧的 head-major 版本。</td></tr><tr><td>编译报 <code>no member named appendKVFromTensor</code></td><td>attention 还是旧文件。用 lab 的整个文件覆盖。</td></tr><tr><td><code>error.NoAttentionManager</code>（CPU）</td><td><code>common.g_attn_mgr</code> 是按 <code>input_tensor.device_type</code> 取的；CPU 上 KV 池也要建（第 06 步的调度器代码对所有设备都建）。</td></tr><tr><td>CPU 第 17 个 token 开始错</td><td>和 CUDA 同一个原因：块表。<code>bt[p / bs]</code> 的 <code>bs</code> 要和 <code>BlockManager</code> 的块大小一致。</td></tr><tr><td>sample 在 CPU 上总是返回 0</td><td><code>temps</code> 指向的不是 f32，或 <code>seed</code> 没对齐到 8 字节。元数据包里 seed 在偏移 0，占 8 字节。</td></tr><tr><td>编译报 <code>SampleImpl&lt;CPU&gt; 未实现</code></td><td><code>backend/cpu/impls.zig</code> 里没导出。</td></tr><tr><td>注意力测试里 <code>MAX_HD</code> 断言失败</td><td>head_dim 超过 256。Qwen3-0.6B 是 128。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li>主线第 05、06 步做完后，纯 CPU 构建能跑 <code>chat</code></li><li>主线第 09 步做完后，CPU 的 greedy 输出和第 08 步相同</li><li><code>zig build test</code> 里 attention 的两个测试通过</li><li>代码里没有 <code>CpuAttentionNotPorted</code> / <code>CpuSampleNotPorted</code> 这类占位</li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="cpu-2-tools.html"><small>← 上一步</small>CPU：并行与 SIMD 工具</a><a class="next" href="cpu-4-kernels-math.html"><small>下一步 →</small>CPU：计算类算子</a></div>
+</main>
+</div>
+</body>
+</html>

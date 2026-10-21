@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StepState：元数据一次上传 · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html" class="active"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">阶段 1 · 去掉主机开销</div>
+<h1>StepState：元数据一次上传</h1>
+<p class="lead">每步的小数据打成一包，一次 H2D。</p>
+<div class="callout goal"><span class="t">本步目标</span>把每一步 kernel 需要的“小数据”（token id、位置、KV 的 slot、块表、每条序列的长度、温度、随机种子）打成一个包，每步只上传一次。这一步先让 embedding 从包里读 ids；包里其余字段后面几步陆续用上。</div>
+<h2>原理</h2>
+<h3>kernel 除了张量还需要什么</h3>
+<p>一步前向里，各个 kernel 需要一些随步变化的小数据：</p>
+<div class="tablewrap"><table><thead><tr><th>数据</th><th>谁用</th><th>现在放在哪</th></tr></thead><tbody><tr><td>token id</td><td>embedding</td><td>第 03 步的 <code>ids_dev</code></td></tr><tr><td>每个 token 的位置</td><td>RoPE</td><td><code>op_params[2]</code> 里的起点，kernel 里现算 <code>start + s</code></td></tr><tr><td>每个 token 写进 KV 的哪个槽</td><td>写 KV</td><td>host 上逐个算，逐个 memcpy</td></tr><tr><td>块表</td><td>注意力</td><td>host 上的 <code>page_table</code>，每层 cudaMalloc + H2D + cudaFree</td></tr><tr><td>上下文长度</td><td>注意力</td><td>函数参数 <code>total_cached</code></td></tr><tr><td>每条序列最后一个 token 的行号</td><td>gather_last（第 08 步）</td><td>还没有</td></tr><tr><td>温度、随机种子</td><td>GPU 采样（第 09 步）</td><td>还没有</td></tr></tbody></table></div>
+<p>这些数据加起来很小：S1 的 decode 步不到 300 字节，512 token 的 prefill 约 6 KB。分散着传，每传一次就是一次 CUDA API 调用；打成一包，每步就只有一次 H2D。</p>
+
+<h3>为什么它们不能当函数参数传</h3>
+<p>单序列时，“位置起点”“上下文长度”这些是标量，当 kernel 参数传没问题。多条序列一起跑时（第 19 步），每条序列的起点和长度都不同，必须是数组；数组要 kernel 读，就得在显存里。现在就按数组的形式设计，后面批处理不用返工。</p>
+<p>第 17 步的 CUDA Graph 还有一个更硬的要求：录制时 kernel 的参数会被固化，回放时改不了。所以随步变化的东西<b>只能</b>放在显存里，每步更新显存内容，而指针保持不变。</p>
+
+<h3>布局</h3>
+<div class="codeblock"><div class="cap"><span><b>executor.zig · Layout</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">/// 一步的元数据在 host/device 上的紧凑布局(字节偏移). 同一 (T,S,tiles) 布局恒定 → CUDA Graph 可复用.
+const Layout = struct {
+    seed: usize = 0,
+    ids: usize,
+    pos: usize,
+    slots: usize,
+    cu_q: usize,
+    ctx: usize,
+    last: usize,
+    temps: usize,
+    tile_seq: usize,
+    tile_q0: usize,
+    bt: usize,
+    total: usize,
+
+    fn init(n_tok: usize, n_seq: usize, n_tiles: usize, max_blocks: usize) Layout {
+        var o: usize = 8;
+        var l: Layout = undefined;
+        l.seed = 0;
+        l.ids = o;
+        o += 4 * n_tok;
+        l.pos = o;
+        o += 4 * n_tok;
+        l.slots = o;
+        o += 4 * n_tok;
+        l.cu_q = o;
+        o += 4 * (n_seq + 1);
+        l.ctx = o;
+        o += 4 * n_seq;
+        l.last = o;
+        o += 4 * n_seq;
+        l.temps = o;
+        o += 4 * n_seq;
+        l.tile_seq = o;
+        o += 4 * n_tiles;
+        l.tile_q0 = o;
+        o += 4 * n_tiles;
+        l.bt = o;
+        o += 4 * n_seq * max_blocks;
+        l.total = o;
+        return l;
+    }
+};</code></pre></div>
+<div class="diagram">
+<div class="gridviz" style="grid-template-columns: 0.6fr 2fr 2fr 2fr 1.2fr 1fr 1fr 1fr 1fr 1fr 2.4fr">
+  <div class="on">seed<br>8B</div><div class="on">ids<br>4·T</div><div class="on">pos<br>4·T</div><div class="on">slots<br>4·T</div>
+  <div class="on">cu_q<br>4·(S+1)</div><div class="on">ctx<br>4·S</div><div class="on">last<br>4·S</div><div class="on">temps<br>4·S</div>
+  <div class="on">tile_seq</div><div class="on">tile_q0</div><div class="on">块表<br>4·S·max_blocks</div>
+</div>
+<div class="cap2">T = 本步 token 总数，S = 本步序列数。布局只由 (T, S, tile 数) 决定，同样的规模每步偏移都相同。</div>
+</div>
+<div class="tablewrap"><table><thead><tr><th>字段</th><th>含义</th><th>第几步开始用</th></tr></thead><tbody><tr><td><code>ids[T]</code></td><td>token id</td><td>本步</td></tr><tr><td><code>pos[T]</code></td><td>每个 token 在自己序列里的位置</td><td>05（RoPE）</td></tr><tr><td><code>slots[T]</code></td><td>每个 token 的 K/V 写到 KV cache 的哪个槽，<code>块号 × 16 + 块内偏移</code>；-1 表示不写</td><td>06</td></tr><tr><td><code>cu_q[S+1]</code></td><td>每条序列的 query 在 T 里的前缀和：序列 s 占 <code>[cu_q[s], cu_q[s+1])</code></td><td>06（prefill 注意力）</td></tr><tr><td><code>ctx[S]</code></td><td>每条序列算完这步后 KV 里有多少 token</td><td>06</td></tr><tr><td><code>last[S]</code></td><td>每条序列最后一个 token 在 T 里的行号</td><td>08</td></tr><tr><td><code>temps[S]</code>、<code>seed</code></td><td>采样温度、本步随机种子</td><td>09</td></tr><tr><td><code>tile_seq / tile_q0</code></td><td>prefill 注意力把 query 切成 64 行一块，每块属于哪条序列、从第几个 query 开始</td><td>06</td></tr><tr><td>块表 <code>[S, max_blocks]</code></td><td>每条序列的逻辑块 → 物理块</td><td>06</td></tr></tbody></table></div>
+
+<h3>StepState：kernel 怎么拿到这些指针</h3>
+<p>llmgen 的 <code>XxxImpl.execute(device_id, out_tensor)</code> 签名里没有地方放这么多指针。lab 的做法是一个全局结构，Executor 每步写一次，各后端的 Impl 读：</p>
+<div class="codeblock"><div class="cap"><span><b>backend/cpu/common.zig · StepState</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">pub const StepState = struct {
+    n_tok: c_int = 0, // 本趟 token 数 T(CUDA Graph 桶里 = S)
+    n_seq: c_int = 0, // 本趟序列数 S(含 CUDA Graph 桶的 padding 行)
+    n_tiles: c_int = 0, // prefill 注意力的 query tile 数
+    decode: bool = false,
+    // 模型超参
+    hidden: c_int = 0,
+    n_head: c_int = 0,
+    n_kv_head: c_int = 0,
+    head_dim: c_int = 0,
+    attn_scale: f32 = 0,
+    // 分页 KV
+    block_size: c_int = 0,
+    max_blocks: c_int = 0, // 块表列数
+    max_model_len: usize = 0,
+    // 本步元数据(设备指针; CPU / Metal 下是 host 指针. 布局见 executor.zig 的 Layout)
+    seed: ?*anyopaque = null,
+    pos: ?*anyopaque = null,
+    slots: ?*anyopaque = null,
+    cu_q: ?*anyopaque = null,
+    ctx: ?*anyopaque = null,
+    last: ?*anyopaque = null,
+    temps: ?*anyopaque = null,
+    tile_seq: ?*anyopaque = null,
+    tile_q0: ?*anyopaque = null,
+    block_tables: ?*anyopaque = null,
+    // 常驻 workspace
+    cos_sin: ?*anyopaque = null,
+    part_o: ?*anyopaque = null,
+    part_ml: ?*anyopaque = null,
+    sample_scratch: ?*anyopaque = null,
+};
+
+pub var g_step: StepState = .{};
+/// 对照 C++ 全局 g_mem_manager-&gt;get_attention_manager: 注意力 / 写 KV 的节点按 layer_id 取本层 K/V.
+pub var g_attn_mgr: ?*paged.PagedAttentionManager = null;</code></pre></div>
+<p>它存的是<b>指针和规模</b>，不是数据本身。CUDA 下这些指针指向显存，只在 host 侧发射 kernel 时当参数传进去。</p>
+
+<h2>改动</h2>
+<h3><span class="stepno">1</span>StepState 和 setStep</h3>
+<div class="codeblock"><div class="cap"><span><b>common.zig / ops.zig</b> <span class="tag new">新增</span></span><button type="button">复制</button></div><pre><code class="language-zig">// ---- 加在 src/backend/cpu/common.zig ----
+// (把上面 lab 的 StepState 整段贴进来, 然后:)
+pub var g_step: StepState = .{};
+
+// ---- 加在 src/ops.zig ----
+pub fn setStep(step: common.StepState) void {
+    common.g_step = step;
+}</code></pre></div>
+
+<h3><span class="stepno">2</span>pinned 内存</h3>
+<div class="codeblock diff"><div class="cap"><span><b>pinned 内存的三处声明</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">// ---- src/backend/cuda/memcpy.cu ----</span><span class="ln add">// pinned(页锁定)host 内存:H2D 不用先拷到内部暂存区, 第 07 步之后还能异步拷</span><span class="ln add">extern &quot;C&quot; void *cuda_host_alloc(size_t bytes) {</span><span class="ln add">    void *p = nullptr;</span><span class="ln add">    if (cudaMallocHost(&amp;p, bytes) != cudaSuccess) return nullptr;</span><span class="ln add">    return p;</span><span class="ln add">}</span><span class="ln add">extern &quot;C&quot; void cuda_host_free(void *p) { if (p) cudaFreeHost(p); }</span><span class="ln ctx"> </span><span class="ln ctx">// ---- src/backend/cuda/cuda_shim.h ----</span><span class="ln add">void  *cuda_host_alloc(size_t bytes);</span><span class="ln add">void   cuda_host_free(void *host);</span><span class="ln ctx"> </span><span class="ln ctx">// ---- src/backend/cuda/cuda.zig ----</span><span class="ln add">pub extern fn cuda_host_alloc(bytes: usize) ?*anyopaque;</span><span class="ln add">pub extern fn cuda_host_free(host: ?*anyopaque) void;</span><span class="ln add">pub extern fn cuda_h2d(dst_dev: ?*anyopaque, src_host: ?*const anyopaque, bytes: usize) void; // 原来没 pub, 加上</span></code></pre></div>
+
+<h3><span class="stepno">3</span>Executor：Layout、缓冲、辅助函数</h3>
+<div class="codeblock"><div class="cap"><span><b>src/executor.zig</b> <span class="tag new">新增</span></span><button type="button">复制</button></div><pre><code class="language-zig">const batching = @import(&quot;runner/batching.zig&quot;);
+const Sequence = batching.Sequence;
+const Entry = batching.Entry;
+
+const BLOCK_SIZE: usize = 16; // = page_atten.PAGE_BLOCK_SIZE
+const PF_TILE: usize = 64; //    prefill 注意力的 query tile 大小(第 06 步换成 cuda_attn_prefill_tile())
+const MAX_SEQS: usize = 1; //    一步最多几条序列;第 19 步改成配置项
+
+// (把上面 lab 的 Layout 整段贴到这里)
+
+// ---- Executor 的新字段 ----
+    model_cfg: qwen3.Config, //      init 多收一个参数, llmgen.zig 里传 qwen3.Config.fromGGUF(gguf_info)
+    max_blocks: usize, //            块表列数 = ceil(max_seq / BLOCK_SIZE)
+    meta_host: [*]u8 = undefined, // 元数据的 host 缓冲(CUDA 下是 pinned)
+    meta_dev: usize = 0, //          元数据在显存里的地址(从 activation 池切, 常驻)
+    step_seed: u64 = 0x5eed,</code></pre></div>
+<div class="codeblock"><div class="cap"><span><b>src/executor.zig</b> <span class="tag new">新增</span></span><button type="button">复制</button></div><pre><code class="language-zig">    /// 按最大规模切一块常驻的元数据缓冲。取代第 03 步的 ids_dev。
+    fn allocMeta(self: *Self) !void {
+        const lay = Layout.init(self.max_seq, MAX_SEQS, self.max_seq / PF_TILE + MAX_SEQS, self.max_blocks);
+        const dev_type = self.input_tensor.device_type;
+        const dp = self.memory_manager.get(dev_type, 0) orelse return error.NoDevicePools;
+        const pool = &amp;(dp.activation orelse return error.NoActivationPool);
+        const blk = try pool.allocate(lay.total, pools.POOL_ALIGN);
+        pool.markPersistent();
+        self.meta_dev = @intFromPtr(blk.ptr);
+        if (opts.have_cuda and dev_type == .CUDA) {
+            self.meta_host = @ptrCast(cuda.cuda_host_alloc(lay.total) orelse return error.PinnedAllocFailed);
+        } else {
+            self.meta_host = blk.ptr; // CPU 的池 host 可寻址, 直接往里写
+        }
+    }
+
+    fn i32At(self: *Self, off: usize) [*]i32 {
+        return @ptrCast(@alignCast(self.meta_host + off));
+    }
+    fn f32At(self: *Self, off: usize) [*]f32 {
+        return @ptrCast(@alignCast(self.meta_host + off));
+    }
+    fn devAt(self: *const Self, off: usize) ?*anyopaque {
+        return @ptrFromInt(self.meta_dev + off);
+    }
+
+    fn uploadMeta(self: *Self, bytes: usize) void {
+        if (opts.have_cuda and self.input_tensor.device_type == .CUDA) {
+            cuda.cuda_h2d(self.devAt(0), self.meta_host, bytes); // 第 07 步换成异步
+        }
+    }</code></pre></div>
+<p>在 <code>init</code> 里算好 <code>max_blocks = (max_seq + BLOCK_SIZE - 1) / BLOCK_SIZE</code>，调 <code>allocMeta()</code>；在 <code>deinit</code> 里 <code>cuda_host_free(self.meta_host)</code>。第 03 步加的 <code>ids_dev</code> 和 <code>input_buf</code> 可以删掉。</p>
+
+<h3><span class="stepno">4</span>fillMeta 和 bindStep</h3>
+<p>lab 的原版作对照：</p>
+<div class="codeblock"><div class="cap"><span><b>executor.zig · fillMeta</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">    fn fillMeta(self: *Executor, lay: Layout, entries: []const sch.Entry, Sn: usize, n_tiles: usize) void {
+        self.step_seed +%= 0x9E3779B97F4A7C15;
+        std.mem.writeInt(u64, self.meta_host.?[0..8], self.step_seed, .little);
+        const bs = self.sc.block_size;
+        const mb = self.lim.max_blocks;
+        const ids = self.i32At(lay.ids);
+        const pos = self.i32At(lay.pos);
+        const slots = self.i32At(lay.slots);
+        const cu_q = self.i32At(lay.cu_q);
+        const ctx = self.i32At(lay.ctx);
+        const last = self.i32At(lay.last);
+        const temps = self.f32At(lay.temps);
+        const tseq = self.i32At(lay.tile_seq);
+        const tq0 = self.i32At(lay.tile_q0);
+        const bt = self.i32At(lay.bt);
+        var t: usize = 0;
+        var tile: usize = 0;
+        cu_q[0] = 0;
+        for (entries, 0..) |e, s| {
+            const seq = e.seq;
+            for (0..e.q_len) |j| {
+                const p = e.q_start + j;
+                ids[t] = seq.token_ids.items[p];
+                pos[t] = @intCast(p);
+                slots[t] = seq.slotOf(p, bs);
+                t += 1;
+            }
+            cu_q[s + 1] = @intCast(t);
+            ctx[s] = @intCast(e.q_start + e.q_len);
+            last[s] = @intCast(t - 1);
+            temps[s] = seq.params.temperature;
+            const row = bt + s * mb;
+            const nb = seq.block_table.items.len;
+            @memcpy(row[0..nb], seq.block_table.items);
+            @memset(row[nb..mb], 0);
+            if (n_tiles &gt; 0) {
+                var q0: usize = 0;
+                while (q0 &lt; e.q_len) : (q0 += self.lim.pf_tile) {
+                    tseq[tile] = @intCast(s);
+                    tq0[tile] = @intCast(q0);
+                    tile += 1;
+                }
+            }
+        }
+        // CUDA Graph 桶的 padding 行: ctx=0(注意力输出 0)、slot=-1(不写 KV)
+        var s = entries.len;
+        while (s &lt; Sn) : (s += 1) {
+            ids[t] = 0;
+            pos[t] = 0;
+            slots[t] = -1;
+            t += 1;
+            cu_q[s + 1] = @intCast(t);
+            ctx[s] = 0;
+            last[s] = @intCast(t - 1);
+            temps[s] = 0;
+            @memset((bt + s * mb)[0..mb], 0);
+        }
+    }</code></pre></div>
+<p>llmgen 的版本：</p>
+<div class="codeblock"><div class="cap"><span><b>src/executor.zig</b> <span class="tag new">新增</span></span><button type="button">复制</button></div><pre><code class="language-zig">    /// 把本步的 Entry 列表写成紧凑元数据。和 lab 的 fillMeta 同一份逻辑, 只有两处不同:
+    /// 块表在第 06 步之前还是空的(slot 先填 -1);CUDA Graph 桶的 padding 行第 17 步再加。
+    fn fillMeta(self: *Self, lay: Layout, entries: []const Entry, n_tiles: usize) void {
+        self.step_seed +%= 0x9E3779B97F4A7C15;
+        std.mem.writeInt(u64, self.meta_host[0..8], self.step_seed, .little);
+        const mb = self.max_blocks;
+        const ids = self.i32At(lay.ids);
+        const pos = self.i32At(lay.pos);
+        const slots = self.i32At(lay.slots);
+        const cu_q = self.i32At(lay.cu_q);
+        const ctx = self.i32At(lay.ctx);
+        const last = self.i32At(lay.last);
+        const temps = self.f32At(lay.temps);
+        const tseq = self.i32At(lay.tile_seq);
+        const tq0 = self.i32At(lay.tile_q0);
+        const bt = self.i32At(lay.bt);
+        var t: usize = 0;
+        var tile: usize = 0;
+        cu_q[0] = 0;
+        for (entries, 0..) |e, s| {
+            const seq = e.seq;
+            const has_blocks = seq.block_table.items.len &gt; 0;
+            for (0..e.q_len) |j| {
+                const p = e.q_start + j;
+                ids[t] = seq.token_ids.items[p];
+                pos[t] = @intCast(p);
+                slots[t] = if (has_blocks) seq.slotOf(p, BLOCK_SIZE) else -1;
+                t += 1;
+            }
+            cu_q[s + 1] = @intCast(t);
+            ctx[s] = @intCast(e.q_start + e.q_len);
+            last[s] = @intCast(t - 1);
+            temps[s] = seq.params.temperature;
+            const row = bt + s * mb;
+            const nb = seq.block_table.items.len;
+            @memcpy(row[0..nb], seq.block_table.items);
+            @memset(row[nb..mb], 0);
+            if (n_tiles &gt; 0) {
+                var q0: usize = 0;
+                while (q0 &lt; e.q_len) : (q0 += PF_TILE) {
+                    tseq[tile] = @intCast(s);
+                    tq0[tile] = @intCast(q0);
+                    tile += 1;
+                }
+            }
+        }
+    }
+
+    /// 把本步的规模和各段元数据的显存地址交给 kernel(经 common.g_step)。
+    fn bindStep(self: *Self, lay: Layout, n_tok: usize, n_seq: usize, n_tiles: usize, decode: bool) void {
+        self.input_tensor.data = @ptrCast(self.devAt(lay.ids));
+        const c = self.model_cfg;
+        ops.setStep(.{
+            .n_tok = @intCast(n_tok),
+            .n_seq = @intCast(n_seq),
+            .n_tiles = @intCast(n_tiles),
+            .decode = decode,
+            .hidden = @intCast(c.embedding_length),
+            .n_head = @intCast(c.head_count),
+            .n_kv_head = @intCast(c.head_count_kv),
+            .head_dim = @intCast(c.key_length),
+            .attn_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.key_length))),
+            .block_size = @intCast(BLOCK_SIZE),
+            .max_blocks = @intCast(self.max_blocks),
+            .max_model_len = self.max_seq,
+            .seed = self.devAt(lay.seed),
+            .pos = self.devAt(lay.pos),
+            .slots = self.devAt(lay.slots),
+            .cu_q = self.devAt(lay.cu_q),
+            .ctx = self.devAt(lay.ctx),
+            .last = self.devAt(lay.last),
+            .temps = self.devAt(lay.temps),
+            .tile_seq = self.devAt(lay.tile_seq),
+            .tile_q0 = self.devAt(lay.tile_q0),
+            .block_tables = self.devAt(lay.bt),
+        });
+    }</code></pre></div>
+
+<h3><span class="stepno">5</span>forward 改吃 Entry 列表</h3>
+<p><code>Entry</code> 和 <code>Sequence</code> 在 <code>runner/batching.zig</code> 里已经有了：一条 Entry 表示“序列 seq 的 <code>[q_start, q_start + q_len)</code> 这段 token 进本步前向”。prefill 是 <code>(0, prompt.len)</code>，decode 是 <code>(len - 1, 1)</code>。</p>
+<div class="codeblock diff"><div class="cap"><span><b>src/executor.zig · forward()</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln del">    fn forward(self: *Self, tokens: []const i32) !void {</span><span class="ln add">    fn forward(self: *Self, entries: []const Entry) !void {</span><span class="ln ctx">        var timer = try std.time.Timer.start();</span><span class="ln ctx">        defer self.metrics.forward_ns += timer.read(); // prefill + decode</span><span class="ln del">        self.cur_tokens = tokens.len;</span><span class="ln add"> </span><span class="ln add">        var n_tok: usize = 0;</span><span class="ln add">        var decode = true; // 只有&quot;每条都是 1 个 token 且在序列末尾&quot;才算纯 decode 步</span><span class="ln add">        for (entries) |e| {</span><span class="ln add">            n_tok += e.q_len;</span><span class="ln add">            if (!(e.q_len == 1 and e.emits())) decode = false;</span><span class="ln add">        }</span><span class="ln add">        const n_seq = entries.len;</span><span class="ln add">        var n_tiles: usize = 0;</span><span class="ln add">        if (!decode) {</span><span class="ln add">            for (entries) |e| n_tiles += (e.q_len + PF_TILE - 1) / PF_TILE;</span><span class="ln add">        }</span><span class="ln add">        self.cur_tokens = n_tok;</span><span class="ln ctx"> </span><span class="ln ctx">        ops.setGlobalAllocator(self.allocator);</span><span class="ln ctx"> </span><span class="ln del">        self.resolveDims(1, @intCast(tokens.len));</span><span class="ln del"> </span><span class="ln del">        @memcpy(self.input_buf[0..tokens.len], tokens);</span><span class="ln del">        if (self.ids_dev) |dev| {</span><span class="ln del">            ...</span><span class="ln del">        }</span><span class="ln add">        const lay = Layout.init(n_tok, n_seq, n_tiles, self.max_blocks);</span><span class="ln add">        self.fillMeta(lay, entries, n_tiles);</span><span class="ln add">        self.uploadMeta(lay.total);</span><span class="ln add">        self.resolveDims(1, @intCast(n_tok));</span><span class="ln add">        self.bindStep(lay, n_tok, n_seq, n_tiles, decode);</span><span class="ln ctx"> </span><span class="ln ctx">        // Phase 1:持久节点只算一次, 然后记下每个激活池的水位</span></code></pre></div>
+<div class="codeblock diff"><div class="cap"><span><b>src/executor.zig · generate()（prefill / decodeStep / decodeStepTokens 三个小函数可以删了）</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln del">        // output = prompt + 已生成(不用 KV cache 时整段喂回去)</span><span class="ln del">        var output: std.ArrayList(i32) = .empty;</span><span class="ln del">        defer output.deinit(self.allocator);</span><span class="ln del">        try output.appendSlice(self.allocator, prompt);</span><span class="ln add">        // 单请求也用 Sequence 表示:token_ids = prompt + 已生成。第 19 步多条序列时 forward 不用再改。</span><span class="ln add">        var seq = try Sequence.init(self.allocator, 0, prompt, .{</span><span class="ln add">            .temperature = self.graph_scheduler.config.temperature,</span><span class="ln add">            .max_tokens = max_tokens,</span><span class="ln add">            .ignore_eos = eos &lt; 0,</span><span class="ln add">        });</span><span class="ln add">        defer seq.deinit();</span><span class="ln add"> </span><span class="ln add">        self.setRopeStart(0); // 第 05 步删掉:RoPE 改从元数据里读位置</span><span class="ln add">        try self.forward(&amp;.{.{ .seq = &amp;seq, .q_start = 0, .q_len = prompt.len }});</span><span class="ln add">        self.seq_pos = prompt.len;</span><span class="ln add">        self.metrics.prefill_ns = total_timer.read();</span><span class="ln ctx"> </span><span class="ln ctx">...</span><span class="ln del">            try output.append(self.allocator, next);</span><span class="ln add">            try seq.token_ids.append(self.allocator, next);</span><span class="ln ctx">...</span><span class="ln del">            if (self.use_kv_cache) {</span><span class="ln del">                try self.decodeStep(next);</span><span class="ln del">            } else {</span><span class="ln del">                try self.decodeStepTokens(output.items);</span><span class="ln del">            }</span><span class="ln add">            if (self.use_kv_cache) {</span><span class="ln add">                self.setRopeStart(seq.len() - 1);</span><span class="ln add">                try self.forward(&amp;.{.{ .seq = &amp;seq, .q_start = seq.len() - 1, .q_len = 1 }});</span><span class="ln add">            } else {</span><span class="ln add">                // 整段重跑(调试用):一条覆盖整个序列的 Entry 就是一次 prefill</span><span class="ln add">                self.memory_manager.resetKVCache();</span><span class="ln add">                self.setRopeStart(0);</span><span class="ln add">                try self.forward(&amp;.{.{ .seq = &amp;seq, .q_start = 0, .q_len = seq.len() }});</span><span class="ln add">            }</span><span class="ln add">            self.seq_pos = seq.len();</span><span class="ln ctx">...</span><span class="ln del">        return self.allocator.dupe(i32, output.items[prompt.len..]);</span><span class="ln add">        return self.allocator.dupe(i32, seq.token_ids.items[prompt.len..]);</span></code></pre></div>
+<div class="callout warn"><span class="t">runner/batching.zig 现在编译不过</span><code>BatchScheduler</code> 里有几处错误（<code>scheduled</code> 声明成了 <code>ArrayList(*Entry)</code> 却 append 值、<code>add</code> 的 self 是 <code>*const</code>）。Zig 只分析用到的声明，这一步只用 <code>Sequence</code> 和 <code>Entry</code>，不受影响。那些错误留到第 19 步一起修。</div>
+
+<h2>对拍验证</h2>
+<p>这一步没有改任何计算，greedy 输出必须和基线逐 token 相同。想确认元数据填对了，可以在 <code>fillMeta</code> 末尾临时打印 decode 步的 <code>pos[0]</code> 和 <code>ctx[0]</code>：应该分别是 <code>seq.len() - 1</code> 和 <code>seq.len()</code>。</p>
+<h2>CPU 同步</h2>
+<div class="callout cpu"><span class="t">这一步 CPU 后端要做的事</span><b>不用动。</b>CPU 的内存池 host 可寻址，<code>allocMeta</code> 里 <code>meta_host</code> 直接指向池里那块缓冲，<code>uploadMeta</code> 在 CPU 上什么都不做。CPU 的 embedding 从同一个指针读 ids。 <a href="cpu-1-overview.html">去看 →</a></div>
+<h2>性能收益</h2>
+<h3>依据</h3>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th class="num">改前</th><th class="num">改后</th><th>来源</th></tr></thead><tbody><tr><td>融合版 S1：每步 cudaMemcpyAsync 次数</td><td class="num">—</td><td class="num">2708 次 / 1338 步 ≈ 2 次</td><td><span class="src lab">nsys 实测</span></td></tr><tr><td>module-style：每 token 的 cudaMemcpy 次数</td><td class="num">11088 次 / 40 token ≈ 277 次</td><td class="num">—</td><td><span class="src lab">nsys 实测</span></td></tr></tbody></table></div>
+<h3>对 llmgen 的预期</h3>
+<p>目标形态里每步只有 2 次拷贝：一次 H2D 元数据，一次 D2H 采样结果。</p>
+<p>这一步本身只把 ids 的上传并进了元数据包，速度没有可见变化。它的价值在后面兑现：第 05 步 RoPE 的位置、第 06 步的 slot 和块表、第 08 / 09 步的 last 和温度都从这个包里读，每步的上传次数始终是 1。把 nsys 里每步的 <code>cudaMemcpy</code> 次数记下来，第 06 步做完再比。</p>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>cudaMemcpy 次数 / 步（nsys）</td><td class="num fill" contenteditable="true" data-key="04-step-state.html|cudaMemcpy 次数 / 步（nsys）|before"></td><td class="num fill" contenteditable="true" data-key="04-step-state.html|cudaMemcpy 次数 / 步（nsys）|after"></td><td class="num gain"></td></tr><tr><td>S1 ITL mean (ms)</td><td class="num fill" contenteditable="true" data-key="04-step-state.html|S1 ITL mean (ms)|before"></td><td class="num fill" contenteditable="true" data-key="04-step-state.html|S1 ITL mean (ms)|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td><code>incorrect alignment</code> panic 在 <code>i32At</code></td><td>Layout 的各段偏移必须是 4 的倍数。<code>seed</code> 占 8 字节，后面全是 4 字节一项，照抄 lab 的 <code>Layout.init</code> 不会错；自己改顺序时注意。</td></tr><tr><td><code>OutOfPoolMemory</code>（activation 池）</td><td>元数据缓冲按最大规模切，<code>max_seq = 1024</code> 时约 13 KB，不该撑爆。多半是 <code>allocMeta</code> 被调了多次，或 <code>markPersistent</code> 之后又有人 <code>reset</code> 到 0。</td></tr><tr><td>decode 第二步起输出乱</td><td><code>emits()</code> 判断的是 <code>q_start + q_len == seq.len()</code>。先 append 新 token 再构造 Entry，顺序反了就会把上一个 token 再喂一遍。</td></tr><tr><td>RoPE 位置错（输出语无伦次）</td><td>这一步 RoPE 还读 <code>op_params[2]</code>，<code>setRopeStart</code> 必须在 <code>forward</code> 之前调，值是本步第一个 token 的位置。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li>greedy 输出和基线逐 token 相同</li><li><code>forward</code> 的参数是 <code>[]const Entry</code>，<code>generate</code> 里用 <code>Sequence</code> 存 token</li><li><code>input_tensor.data</code> 指向元数据包里的 ids 段</li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="03-all-on-gpu.html"><small>← 上一步</small>全图上 GPU</a><a class="next" href="05-token-major-view.html"><small>下一步 →</small>token-major 零拷贝拆头</a></div>
+</main>
+</div>
+</body>
+</html>

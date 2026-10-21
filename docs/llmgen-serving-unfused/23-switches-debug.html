@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>附录：回退开关与排错 · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html" class="active"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">阶段 6 · 收尾</div>
+<h1>附录：回退开关与排错</h1>
+<p class="lead">出问题时怎么二分。</p>
+<div class="callout goal"><span class="t">本步目标</span>把一路上留下的回退开关汇总成一张表，给出出问题时的二分顺序。这一页是工具书，不改代码。</div>
+<h2>回退开关</h2>
+<p>每个开关都把某一项优化关掉，退回到“改之前”的行为。默认值都是优化开启，开关关闭时没有额外开销。</p>
+<div class="tablewrap"><table><thead><tr><th>开关</th><th>关掉的是</th><th>加在哪一步</th><th>用途</th></tr></thead><tbody><tr><td><code>--eager</code></td><td>CUDA Graph：decode 步逐 kernel 发射</td><td><a href="17-cuda-graph.html">17</a></td><td>排查“回放和录制不一致”；量 Graph 的收益</td></tr><tr><td><code>--sync-each</code></td><td>异步：每个节点后同步一次</td><td><a href="07-stream-sync.html">07</a></td><td>排查漏改 stream 的偶发错误；量同步的代价</td></tr><tr><td><code>--debug-sync</code></td><td>同上，另外打印节点名、检查 CUDA 错误</td><td>本页</td><td>定位哪个节点的 kernel 发射失败</td></tr><tr><td><code>SV_GEMV_MAX_M=0</code></td><td>自写 GEMV：Linear 全走 cuBLAS</td><td><a href="12-linear-gemv.html">12</a></td><td>量 GEMV 的收益；怀疑 GEMV 算错时对照</td></tr><tr><td><code>SV_GEMV_MAX_M=8</code></td><td>把 GEMV 的阈值从 2 调到 8</td><td><a href="12-linear-gemv.html">12</a></td><td>看阈值过大的代价（S4）</td></tr><tr><td><code>SV_ATTN_PART=100000</code></td><td>split-K：每条序列只切 1 段</td><td><a href="13-flash-decoding.html">13</a></td><td>量 split-K 的收益</td></tr><tr><td><code>--policy chunked</code></td><td>prefill_first 调度</td><td><a href="20-scheduling.html">20</a></td><td>在线负载下保护 decode 的 ITL</td></tr><tr><td><code>--kv-blocks N</code></td><td>按显存比例自动算 KV</td><td><a href="18-block-manager.html">18</a></td><td>对齐 KV 容量的对比；复现抢占</td></tr><tr><td><code>--pass-tokens N</code></td><td>单趟 token 上限（默认 8192）</td><td><a href="19-batched-forward.html">19</a></td><td>激活区大小和 KV 容量的取舍</td></tr><tr><td><code>LLMGEN_PROFILE=1</code></td><td>（不是回退）算子级计时，强制 eager + 逐算子同步</td><td><a href="02-where-time-goes.html">02</a></td><td>看各类算子的耗时占比</td></tr></tbody></table></div>
+<div class="callout warn"><span class="t">SV_* 开关在第一次调用时读一次</span>它们是 <code>.cu</code> 里的 <code>static</code> 变量，进程启动后第一次用到时读环境变量并缓存。CUDA Graph 录制时读到的值会被录死。所以必须在启动进程<b>之前</b>设好，中途改无效。</div>
+
+<h3>每个开关值多少</h3>
+<div class="codeblock"><div class="cap"><span><b>cuda-course/results-serving.txt · 第二轮消融（融合版引擎；unfused-* 是它的 SV_UNFUSED=1 模式）</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="nohighlight">  实验                     吞吐     TTFT均    TTFT99    ITL均   ITL99    抢占     步数     图步    显存MB   RSS    加载s
+  base-s1             485.0      11.5      12.1    2.03    2.18     0   1280   1338   21674   490   0.74
+  base-s4            2129.8      49.6      50.5    2.71    2.99     0   1512   1572   21788   490   0.70
+  eager-s1            435.7      11.5      12.1    2.26    2.80     0   1280      0   21714   453   0.38
+  eager-s4           1938.0      49.2      51.1    3.00    3.31     0   1512      0   21714   453   0.38
+  gemv0-s1            439.2      11.4      11.5    2.24    2.64     0   1280   1338   21790   514   0.72
+  gemv0-s4           2105.5      48.2      48.3    2.73    3.18     0   1512   1572   21790   514   0.72
+  gemv8-s1            484.3      11.7      12.4    2.03    2.18     0   1280   1338   21784   489   0.70
+  gemv8-s4           1660.5      49.6      51.3    3.66    4.20     0   1512   1572   21784   489   0.70
+  nosplit-s1          328.5      11.7      12.6    3.01    3.44     0   1280   1338   21788   490   0.70
+  nosplit-s4         1659.4      49.0      50.5    3.39    3.84     0   1512   1572   21788   490   0.71
+  synceach-s1         292.4      13.5      14.0    3.38    3.58     0   1280      0   21714   453   0.39
+  synceach-s4        1208.6      51.1      52.6    4.89    6.02     0   1512      0   21714   453   0.38
+  unfused-eager-s1    385.6      12.2      12.6    2.56    2.93     0   1280      0   21714   453   0.38
+  unfused-s1          439.0      12.2      12.3    2.24    2.92     0   1280   1338   21814   504   0.72
+  unfused-s4         1971.5      54.8      55.0    2.93    3.46     0   1512   1572   21814   504   0.72</code></pre></div>
+<div class="tablewrap"><table><thead><tr><th>优化</th><th class="num">S1（单请求）</th><th class="num">S4（8 并发）</th><th>说明</th></tr></thead><tbody><tr><td>一步一同步（对比 synceach）</td><td class="num">1.49×</td><td class="num">1.60×</td><td>对比的是 eager 模式</td></tr><tr><td>CUDA Graph（对比 eager）</td><td class="num">1.11×</td><td class="num">1.10×</td><td>unfused 图上是 1.14×</td></tr><tr><td>GEMV M ≤ 2（对比全 cuBLAS）</td><td class="num">1.10×</td><td class="num">1.01×</td><td>S4 的批是 4–8，本来就走 cuBLAS</td></tr><tr><td>GEMV 阈值 2（对比阈值 8）</td><td class="num">1.00×</td><td class="num">1.28×</td><td>阈值不是越大越好</td></tr><tr><td>split-K（对比不切分）</td><td class="num">1.48×</td><td class="num">1.28×</td><td>长上下文（S5）是 3.21×</td></tr></tbody></table></div>
+<p>这些倍数量的是<b>融合版引擎</b>关掉某一项之后的变化 <span class="src lab">消融实测</span>。你在 llmgen 上用同样的开关量出来的倍数应该相近；把它们记在各自那一步的“你的实测”表里。</p>
+
+<h2>出错时的二分顺序</h2>
+<p>症状是“输出不对”时，按下面的顺序缩小范围。每一步都只换一个变量。</p>
+<div class="codeblock"><div class="cap"><span><b>终端</b> <span class="tag out">命令</span></span><button type="button">复制</button></div><pre><code class="language-bash"># 1. 先确定是不是 CUDA Graph 的问题
+./zig-out/bin/llminfer chat &quot;中国的首都是哪里？&quot; 64 --eager
+
+# 2. 是不是异步 / stream 的问题
+./zig-out/bin/llminfer chat &quot;中国的首都是哪里？&quot; 64 --sync-each
+
+# 3. 哪个节点开始出错(每个节点后同步 + 检查 CUDA 错误 + 打印节点名)
+./zig-out/bin/llminfer chat &quot;中国的首都是哪里？&quot; 64 --debug-sync 2&gt;&amp;1 | tail -30
+
+# 4. 单个 kernel 对不对
+make llmgen-cuda-test
+
+# 5. 和目标 lab 逐 token 比
+&lt;Genllm&gt;/study/zig-out/bin/lab-module-serving-unfused chat &quot;中国的首都是哪里？&quot; 64 | grep &quot;token ids&quot;</code></pre></div>
+<div class="tablewrap"><table><thead><tr><th>观察</th><th>结论</th><th>去哪查</th></tr></thead><tbody><tr><td><code>--eager</code> 对，默认错</td><td>CUDA Graph 录进了会变的东西</td><td>第 <a href="17-cuda-graph.html">17</a> 步“参数是录死的”那张表，逐项对</td></tr><tr><td><code>--sync-each</code> 对，<code>--eager</code> 错</td><td>执行顺序问题：有 kernel 或拷贝不在 <code>g_cuda_stream</code> 上</td><td>第 <a href="07-stream-sync.html">07</a> 步的 grep</td></tr><tr><td><code>--sync-each</code> 也错，每次错得一样</td><td>某个 kernel 或元数据算错了</td><td><code>--debug-sync</code> + kernel_test</td></tr><tr><td>每次错得不一样</td><td>读了未初始化的显存，或两个活着的激活重叠</td><td>第 <a href="16-memory-plan.html">16</a> 步；padding 行（第 17 步）</td></tr><tr><td>CUDA 错，<code>--device cpu</code> 对</td><td>执行层和元数据没问题，是某个 CUDA kernel 或它的 Impl 传参</td><td>CPU 是活参考：<a href="cpu-4-kernels-math.html#tests">C4</a> 的逐 token 对拍；再用 kernel_test 定位</td></tr><tr><td>CPU 和 CUDA 都错，且错得一样</td><td>执行层：元数据、块表、图结构</td><td><code>fillMeta</code>、<code>BlockManager</code></td></tr><tr><td>单请求对，批处理错</td><td>序列边界：<code>cu_q</code> / <code>last</code> / 块表的行偏移</td><td>第 <a href="19-batched-forward.html">19</a> 步“8 份相同 prompt”的检查</td></tr><tr><td>前 16 个 token 对，之后错</td><td>块表：第 17 个 token 进第二块</td><td>第 <a href="06-store-kv.html">06</a> 步</td></tr><tr><td>短 prompt 对，长 prompt 错</td><td>prefill 的 tile（&gt; 64 token）或多趟切分（&gt; 8192 token）</td><td>第 <a href="14-fa2-prefill.html">14</a>、<a href="19-batched-forward.html">19</a> 步</td></tr><tr><td>kernel_test 全过，端到端错</td><td>kernel 没问题，是 Impl 传参或元数据</td><td>对着 lab 的 <code>backend/cuda/*.zig</code> 逐个比参数</td></tr></tbody></table></div>
+<p><code>--debug-sync</code> 在 lab 里是这样实现的，搬到 llmgen 的 <code>executorTensor</code> 里即可：</p>
+<div class="codeblock"><div class="cap"><span><b>executor.zig · executeTensor（--debug-sync / --sync-each）</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">    fn executeTensor(self: *Executor, node: *Tensor) !void {
+        // 视图节点(拆头 / attn_tr 的 reshape)与根共享地址(见 plan.zig), 不发 kernel
+        if (node.type == .TENSOR_TYPE_VIEW) return;
+        const dev_id = self.devIdOf(node);
+        // 读写分页 KV 的节点(本 lab 只有注意力: 先写本步 k/v 再读):按本节点所在设备取对应 PagedAttentionManager.
+        if (node.op_type == .OP_TYPE_PAGED_ATTN) {
+            ops.setAttnMgr(self.mm.getAttentionManager(node.device, @intCast(dev_id)) orelse return error.NoAttentionManager);
+        }
+        try dispatchKernel(node, dev_id);
+        if (self.cfg.sync_each) self.syncDevice();
+        if (self.cfg.debug_sync) {
+            self.syncDevice();
+            std.debug.print(&quot;[debug] {s} ok\n&quot;, .{node.name});
+            if (comptime opts.have_cuda) {
+                if (self.device == .CUDA) cu.check(node.name) catch std.debug.panic(&quot;kernel 失败: {s}&quot;, .{node.name});
+            }
+        }
+    }</code></pre></div>
+
+<h2>性能不对时</h2>
+<div class="codeblock"><div class="cap"><span><b>终端</b> <span class="tag out">命令</span></span><button type="button">复制</button></div><pre><code class="language-bash"># 时间线(每个 prefill / decode 步一个 NVTX 区间, 需要把 lab 的 cuda_nvtx_push / pop 也搬过来)
+nsys profile --trace=cuda,nvtx -o /tmp/llmgen ./zig-out/bin/llminfer bench …/s1.json
+nsys stats --report cuda_api_sum --report cuda_gpu_kern_sum /tmp/llmgen.nsys-rep
+
+# 单个 kernel 的硬件计数器(带宽、占用率)
+ncu --kernel-name gemv_kernel --launch-count 1 ./zig-out/bin/llminfer chat &quot;你好&quot; 8 --eager</code></pre></div>
+<div class="tablewrap"><table><thead><tr><th>观察</th><th>可能的原因</th></tr></thead><tbody><tr><td><code>cuda_api_sum</code> 里有 <code>cudaMalloc</code> / <code>cudaFree</code> / 同步 <code>cudaMemcpy</code></td><td>热路径上还有没清掉的分配或拷贝（阶段 1）</td></tr><tr><td><code>cudaLaunchKernel</code> 次数 ≈ 步数 × 500</td><td>CUDA Graph 没生效：看 <code>graph_steps</code>，是不是被 profile / sync-each 强制 eager 了</td></tr><tr><td><code>cudaStreamSynchronize</code> 次数远大于步数</td><td>有地方多同步了：<code>cuda_h2d</code>（同步版）被用在了热路径上</td></tr><tr><td>kernel 表里 <code>gemv_kernel</code> 平均耗时明显大于 13.3 µs</td><td>GPU 被别的进程占着，或者没升频（没预热）</td></tr><tr><td>S3 的 <code>steps</code> 比目标多很多</td><td>抢占（<code>preemptions</code> &gt; 0）或单趟上限太小</td></tr><tr><td>ITL p99 远大于 mean</td><td>prefill_first 下大 prefill 挡住了 decode；或 host 上有偶发的慢操作（分配器、打印）</td></tr></tbody></table></div>
+
+<h2>可以清理的旧代码</h2>
+<p>教程做完之后，这些文件不再被引用：</p>
+<div class="tablewrap"><table><thead><tr><th>路径</th><th>被什么取代</th></tr></thead><tbody><tr><td><code>backend/cuda/shape.cu</code>、<code>shape.zig</code> 里的 PermuteImpl</td><td>第 05 步：拆头是视图</td></tr><tr><td><code>backend/cuda/softmax.cu</code>、<code>softmax.zig</code></td><td>softmax 在注意力 kernel 内在线完成</td></tr><tr><td><code>backend/cuda/norm_warp.cu</code>、<code>norm_naive.cu</code></td><td>第 11 步的 <code>normalization.cu</code></td></tr><tr><td><code>backend/cuda/linear_naive.cu</code>、<code>linear_hosted.cu</code>、<code>linear_cublas.cu</code>、<code>linear_common.cuh</code></td><td>第 12 步的 <code>linear.cu</code></td></tr><tr><td><code>backend/cuda/tests.zig</code></td><td>第 15 步的 <code>kernel_test.zig</code></td></tr><tr><td><code>backend/cuda-v1/</code>、<code>cuda-v2/</code>、<code>cpu-v1/</code></td><td>只有 README 的占位目录</td></tr><tr><td><code>sampling.zig</code></td><td>第 09 步的 GPU 采样（它的单测可以留着当 Gumbel-max 的参考）</td></tr><tr><td><code>Executor.generate</code> 相关的 <code>GenMetrics</code> 打点</td><td>第 19 步的 Engine + Recorder</td></tr><tr><td><code>llmgen_v1.zig</code></td><td>早期入口</td></tr></tbody></table></div>
+<p>CPU 后端（<code>backend/cpu/</code>）跟着 <a href="cpu-1-overview.html">CPU 支线</a>同步改过之后仍然可用，它的文件里要清理的是：<code>shape.zig</code>（permute）、<code>softmax.zig</code>、空的 <code>transpose.zig</code>，以及 <code>common.zig</code> 里的 <code>elemF32 / storeF32 / global_allocator</code>（确认没人引用之后）。</p>
+
+<h2>接下来可以做什么</h2>
+<div class="tablewrap"><table><thead><tr><th>方向</th><th>预期</th><th>参考</th></tr></thead><tbody><tr><td>算子融合</td><td>S1 再快 21%（401.3 → 484.3 tok/s）、S4 再快 27%（1670.1 → 2128.0）；S3 只快 3%</td><td><code>labs/module-serving</code>：打包 GEMM、<code>add_rmsnorm</code>、<code>qk_norm_rope_kv</code>、<code>silu_mul</code></td></tr><tr><td>prefix cache</td><td>重复前缀的请求跳过 prefill</td><td>nano-vllm 的 <code>block_manager.py</code>（xxhash 链式哈希 + 引用计数）；<code>todos.md</code> 里已经列了</td></tr><tr><td>Metal 后端</td><td>mac 上用 GPU：约 30–39 tok/s（同一台机器 CPU 约 20–29）</td><td>目标 lab 的 <code>backend/metal/</code>；CPU 已经在 CPU 支线里做了</td></tr><tr><td>在线负载的 bench</td><td>按到达时间提交请求，才能体现 chunked 的价值</td><td>—</td></tr><tr><td>top-k / top-p</td><td>GPU 上要部分排序</td><td>—</td></tr></tbody></table></div>
+<h2>检查点</h2>
+<ul class="checklist"><li>每个回退开关都试过一次，知道它的症状</li><li>清理了不再引用的文件，<code>zig build</code> 和 <code>make llmgen-cuda-test</code> 仍然通过</li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="22-final-bench.html"><small>← 上一步</small>最终对比</a><a class="next" href="cpu-1-overview.html"><small>下一步 →</small>CPU：一套执行层两个后端</a></div>
+</main>
+</div>
+</body>
+</html>

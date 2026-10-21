@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>最终对比 · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html" class="active"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">阶段 6 · 收尾</div>
+<h1>最终对比</h1>
+<p class="lead">同一 workload、同一采样器，三个引擎跑一遍。</p>
+<div class="callout goal"><span class="t">本步目标</span>在同一块 3090、同一份 workload、同一个显存采样器下，把 llmgen、目标 lab、nano-vllm 三个引擎各跑一遍 S1–S4，出一张对比表。llmgen 对目标 lab 的比值落在 0.9–1.1 之间，就是做到了。</div>
+<h2>原理：怎么比才公平</h2>
+<div class="tablewrap"><table><thead><tr><th></th><th>做法</th><th>为什么</th></tr></thead><tbody><tr><td>workload</td><td>三个引擎读同一份 JSON（token id，不是文本）</td><td>不受 tokenizer 和 chat 模板差异影响</td></tr><tr><td>输出长度</td><td><code>ignore_eos = True</code>，每条请求固定 <code>max_tokens</code></td><td>三边输出 token 数严格相等，吞吐才可比</td></tr><tr><td>采样</td><td><code>temperature = 0.6</code></td><td>nano-vllm 不支持 greedy（温度必须 &gt; 0）</td></tr><tr><td>prompt</td><td>每轮不同</td><td>nano-vllm 有 prefix cache，重复的 prompt 会命中缓存，不是同一份工作量</td></tr><tr><td>显存</td><td>进程外 NVML 采样</td><td>各引擎自报的口径不同</td></tr><tr><td>KV 容量</td><td>默认都用 <code>gpu_memory_utilization = 0.9</code>；另跑一组“对齐 KV 容量”</td><td>0.9 时各家实际分到的 KV 不同，会影响抢占次数</td></tr><tr><td>环境</td><td>跑之前停掉其它占 GPU 的进程</td><td>KV 预算按“总显存 − 已用”算</td></tr><tr><td>顺序</td><td>同一场景三个引擎挨着跑，间隔 3 秒</td><td>温度、频率状态尽量一致</td></tr></tbody></table></div>
+
+<h2>目标：lab 的完整结果</h2>
+<p>下面五张表直接读自目标 lab 的 <code>bench/RESULTS.md</code> <span class="src lab">lab 实测</span>。第一列（unfused）就是你要对齐的数字。</p>
+<h3>s1-single: 1 请求 × 5 轮, 每轮输入 512 / 输出 256 token</h3>
+<div class="tablewrap"><table><thead><tr><th>指标</th><th class="num">unfused</th><th class="num">module-serving(融合)</th><th class="num">nano-vllm</th><th>unfused vs nano-vllm</th><th>unfused vs 融合</th></tr></thead><tbody><tr><td>输出吞吐 (tok/s)</td><td class="num">401.3</td><td class="num">484.3</td><td class="num">289.1</td><td>✅ 1.39×</td><td>❌ 0.83×</td></tr><tr><td>总吞吐 in+out (tok/s)</td><td class="num">1204.0</td><td class="num">1452.8</td><td class="num">867.2</td><td>✅ 1.39×</td><td>❌ 0.83×</td></tr><tr><td>墙钟 (s)</td><td class="num">0.638</td><td class="num">0.529</td><td class="num">0.886</td><td>✅ 1.39×</td><td>❌ 0.83×</td></tr><tr><td>TTFT mean (ms)</td><td class="num">13.47</td><td class="num">11.38</td><td class="num">56.34</td><td>✅ 4.18×</td><td>❌ 0.84×</td></tr><tr><td>TTFT p50 (ms)</td><td class="num">13.48</td><td class="num">11.32</td><td class="num">55.65</td><td>✅ 4.13×</td><td>❌ 0.84×</td></tr><tr><td>TTFT p99 (ms)</td><td class="num">13.48</td><td class="num">11.55</td><td class="num">58.86</td><td>✅ 4.37×</td><td>❌ 0.86×</td></tr><tr><td>ITL mean (ms)</td><td class="num">2.449</td><td class="num">2.029</td><td class="num">3.241</td><td>✅ 1.32×</td><td>❌ 0.83×</td></tr><tr><td>ITL p50 (ms)</td><td class="num">2.433</td><td class="num">2.022</td><td class="num">3.226</td><td>✅ 1.33×</td><td>❌ 0.83×</td></tr><tr><td>ITL p99 (ms)</td><td class="num">3.016</td><td class="num">2.201</td><td class="num">3.631</td><td>✅ 1.20×</td><td>❌ 0.73×</td></tr><tr><td>峰值 RSS (MB)</td><td class="num">519</td><td class="num">490</td><td class="num">2275</td><td>✅ 4.39×</td><td>❌ 0.94×</td></tr><tr><td>峰值显存, 外部 NVML 采样 (MB)</td><td class="num">21144</td><td class="num">21134</td><td class="num">20842</td><td>❌ 0.99×</td><td>❌ 1.00×</td></tr><tr><td>KV cache 容量 (token)</td><td class="num">176384</td><td class="num">176736</td><td class="num">174336</td><td>✅ 1.01×</td><td>❌ 1.00×</td></tr><tr><td>加载耗时 (s)</td><td class="num">0.79</td><td class="num">0.72</td><td class="num">16.22</td><td>✅ 20.41×</td><td>❌ 0.90×</td></tr></tbody></table></div><h3>s2-concurrent32: 32 请求 × 1 轮, 每轮输入 9479 / 输出 9655 token</h3>
+<div class="tablewrap"><table><thead><tr><th>指标</th><th class="num">unfused</th><th class="num">module-serving(融合)</th><th class="num">nano-vllm</th><th>unfused vs nano-vllm</th><th>unfused vs 融合</th></tr></thead><tbody><tr><td>输出吞吐 (tok/s)</td><td class="num">3786.1</td><td class="num">4418.8</td><td class="num">3111.3</td><td>✅ 1.22×</td><td>❌ 0.86×</td></tr><tr><td>总吞吐 in+out (tok/s)</td><td class="num">7503.2</td><td class="num">8757.0</td><td class="num">6165.8</td><td>✅ 1.22×</td><td>❌ 0.86×</td></tr><tr><td>墙钟 (s)</td><td class="num">2.550</td><td class="num">2.185</td><td class="num">3.103</td><td>✅ 1.22×</td><td>❌ 0.86×</td></tr><tr><td>TTFT mean (ms)</td><td class="num">169.42</td><td class="num">156.87</td><td class="num">373.31</td><td>✅ 2.20×</td><td>❌ 0.93×</td></tr><tr><td>TTFT p50 (ms)</td><td class="num">169.42</td><td class="num">156.87</td><td class="num">373.31</td><td>✅ 2.20×</td><td>❌ 0.93×</td></tr><tr><td>TTFT p99 (ms)</td><td class="num">169.42</td><td class="num">156.87</td><td class="num">373.31</td><td>✅ 2.20×</td><td>❌ 0.93×</td></tr><tr><td>ITL mean (ms)</td><td class="num">5.245</td><td class="num">4.545</td><td class="num">5.937</td><td>✅ 1.13×</td><td>❌ 0.87×</td></tr><tr><td>ITL p50 (ms)</td><td class="num">5.460</td><td class="num">4.776</td><td class="num">6.185</td><td>✅ 1.13×</td><td>❌ 0.87×</td></tr><tr><td>ITL p99 (ms)</td><td class="num">6.068</td><td class="num">5.497</td><td class="num">6.558</td><td>✅ 1.08×</td><td>❌ 0.91×</td></tr><tr><td>峰值 RSS (MB)</td><td class="num">519</td><td class="num">490</td><td class="num">2277</td><td>✅ 4.39×</td><td>❌ 0.94×</td></tr><tr><td>峰值显存, 外部 NVML 采样 (MB)</td><td class="num">21184</td><td class="num">21134</td><td class="num">21182</td><td>❌ 1.00×</td><td>❌ 1.00×</td></tr><tr><td>KV cache 容量 (token)</td><td class="num">176736</td><td class="num">176736</td><td class="num">174336</td><td>✅ 1.01×</td><td>≈ 1.00×</td></tr><tr><td>加载耗时 (s)</td><td class="num">0.77</td><td class="num">0.71</td><td class="num">16.51</td><td>✅ 21.35×</td><td>❌ 0.92×</td></tr></tbody></table></div><h3>s3-bench256: 256 请求 × 1 轮, 每轮输入 142827 / 输出 133966 token</h3>
+<div class="tablewrap"><table><thead><tr><th>指标</th><th class="num">unfused</th><th class="num">module-serving(融合)</th><th class="num">nano-vllm</th><th>unfused vs nano-vllm</th><th>unfused vs 融合</th></tr></thead><tbody><tr><td>输出吞吐 (tok/s)</td><td class="num">5580.0</td><td class="num">5745.3</td><td class="num">4265.7</td><td>✅ 1.31×</td><td>❌ 0.97×</td></tr><tr><td>总吞吐 in+out (tok/s)</td><td class="num">11529.1</td><td class="num">11870.6</td><td class="num">8813.6</td><td>✅ 1.31×</td><td>❌ 0.97×</td></tr><tr><td>墙钟 (s)</td><td class="num">24.008</td><td class="num">23.317</td><td class="num">31.405</td><td>✅ 1.31×</td><td>❌ 0.97×</td></tr><tr><td>TTFT mean (ms)</td><td class="num">1355.78</td><td class="num">1278.20</td><td class="num">1402.14</td><td>✅ 1.03×</td><td>❌ 0.94×</td></tr><tr><td>TTFT p50 (ms)</td><td class="num">1400.16</td><td class="num">1318.78</td><td class="num">1441.58</td><td>✅ 1.03×</td><td>❌ 0.94×</td></tr><tr><td>TTFT p99 (ms)</td><td class="num">2482.60</td><td class="num">2336.81</td><td class="num">2454.30</td><td>❌ 0.99×</td><td>❌ 0.94×</td></tr><tr><td>ITL mean (ms)</td><td class="num">27.293</td><td class="num">26.679</td><td class="num">36.490</td><td>✅ 1.34×</td><td>❌ 0.98×</td></tr><tr><td>ITL p50 (ms)</td><td class="num">27.103</td><td class="num">26.600</td><td class="num">28.744</td><td>✅ 1.06×</td><td>❌ 0.98×</td></tr><tr><td>ITL p99 (ms)</td><td class="num">30.591</td><td class="num">29.588</td><td class="num">87.501</td><td>✅ 2.86×</td><td>❌ 0.97×</td></tr><tr><td>峰值 RSS (MB)</td><td class="num">523</td><td class="num">495</td><td class="num">2282</td><td>✅ 4.36×</td><td>❌ 0.95×</td></tr><tr><td>峰值显存, 外部 NVML 采样 (MB)</td><td class="num">21184</td><td class="num">21134</td><td class="num">21660</td><td>✅ 1.02×</td><td>❌ 1.00×</td></tr><tr><td>KV cache 容量 (token)</td><td class="num">176736</td><td class="num">176736</td><td class="num">174336</td><td>✅ 1.01×</td><td>≈ 1.00×</td></tr><tr><td>加载耗时 (s)</td><td class="num">0.76</td><td class="num">0.70</td><td class="num">16.51</td><td>✅ 21.74×</td><td>❌ 0.93×</td></tr></tbody></table></div><h3>s4-concurrent8: 8 请求 × 3 轮, 每轮输入 2770 / 输出 2955 token</h3>
+<div class="tablewrap"><table><thead><tr><th>指标</th><th class="num">unfused</th><th class="num">module-serving(融合)</th><th class="num">nano-vllm</th><th>unfused vs nano-vllm</th><th>unfused vs 融合</th></tr></thead><tbody><tr><td>输出吞吐 (tok/s)</td><td class="num">1670.1</td><td class="num">2128.0</td><td class="num">1424.5</td><td>✅ 1.17×</td><td>❌ 0.78×</td></tr><tr><td>总吞吐 in+out (tok/s)</td><td class="num">3235.6</td><td class="num">4122.9</td><td class="num">2759.7</td><td>✅ 1.17×</td><td>❌ 0.78×</td></tr><tr><td>墙钟 (s)</td><td class="num">1.769</td><td class="num">1.389</td><td class="num">2.074</td><td>✅ 1.17×</td><td>❌ 0.78×</td></tr><tr><td>TTFT mean (ms)</td><td class="num">57.86</td><td class="num">48.26</td><td class="num">159.10</td><td>✅ 2.75×</td><td>❌ 0.83×</td></tr><tr><td>TTFT p50 (ms)</td><td class="num">57.78</td><td class="num">48.22</td><td class="num">60.36</td><td>✅ 1.04×</td><td>❌ 0.83×</td></tr><tr><td>TTFT p99 (ms)</td><td class="num">58.07</td><td class="num">48.36</td><td class="num">356.78</td><td>✅ 6.14×</td><td>❌ 0.83×</td></tr><tr><td>ITL mean (ms)</td><td class="num">3.489</td><td class="num">2.721</td><td class="num">4.006</td><td>✅ 1.15×</td><td>❌ 0.78×</td></tr><tr><td>ITL p50 (ms)</td><td class="num">3.522</td><td class="num">2.741</td><td class="num">3.993</td><td>✅ 1.13×</td><td>❌ 0.78×</td></tr><tr><td>ITL p99 (ms)</td><td class="num">4.006</td><td class="num">3.290</td><td class="num">4.376</td><td>✅ 1.09×</td><td>❌ 0.82×</td></tr><tr><td>峰值 RSS (MB)</td><td class="num">519</td><td class="num">490</td><td class="num">2277</td><td>✅ 4.39×</td><td>❌ 0.94×</td></tr><tr><td>峰值显存, 外部 NVML 采样 (MB)</td><td class="num">21184</td><td class="num">21134</td><td class="num">20946</td><td>❌ 0.99×</td><td>❌ 1.00×</td></tr><tr><td>KV cache 容量 (token)</td><td class="num">176736</td><td class="num">176736</td><td class="num">174336</td><td>✅ 1.01×</td><td>≈ 1.00×</td></tr><tr><td>加载耗时 (s)</td><td class="num">0.77</td><td class="num">0.70</td><td class="num">16.46</td><td>✅ 21.28×</td><td>❌ 0.91×</td></tr></tbody></table></div><h3>s3-bench256 @ 对齐 KV 容量: 256 请求 × 1 轮, 每轮输入 142827 / 输出 133966 token</h3>
+<div class="tablewrap"><table><thead><tr><th>指标</th><th class="num">unfused</th><th class="num">module-serving(融合)</th><th class="num">nano-vllm</th><th>unfused vs nano-vllm</th><th>unfused vs 融合</th></tr></thead><tbody><tr><td>输出吞吐 (tok/s)</td><td class="num">4490.0</td><td class="num">4790.0</td><td class="num">3595.6</td><td>✅ 1.25×</td><td>❌ 0.94×</td></tr><tr><td>总吞吐 in+out (tok/s)</td><td class="num">9277.0</td><td class="num">9896.8</td><td class="num">7429.0</td><td>✅ 1.25×</td><td>❌ 0.94×</td></tr><tr><td>墙钟 (s)</td><td class="num">29.837</td><td class="num">27.968</td><td class="num">37.258</td><td>✅ 1.25×</td><td>❌ 0.94×</td></tr><tr><td>TTFT mean (ms)</td><td class="num">7205.33</td><td class="num">6860.94</td><td class="num">10193.10</td><td>✅ 1.41×</td><td>❌ 0.95×</td></tr><tr><td>TTFT p50 (ms)</td><td class="num">1405.80</td><td class="num">1325.64</td><td class="num">9642.14</td><td>✅ 6.86×</td><td>❌ 0.94×</td></tr><tr><td>TTFT p99 (ms)</td><td class="num">20777.01</td><td class="num">19725.85</td><td class="num">27936.47</td><td>✅ 1.34×</td><td>❌ 0.95×</td></tr><tr><td>ITL mean (ms)</td><td class="num">19.469</td><td class="num">18.490</td><td class="num">21.600</td><td>✅ 1.11×</td><td>❌ 0.95×</td></tr><tr><td>ITL p50 (ms)</td><td class="num">16.000</td><td class="num">15.193</td><td class="num">15.735</td><td>❌ 0.98×</td><td>❌ 0.95×</td></tr><tr><td>ITL p99 (ms)</td><td class="num">59.307</td><td class="num">52.234</td><td class="num">73.923</td><td>✅ 1.25×</td><td>❌ 0.88×</td></tr><tr><td>峰值 RSS (MB)</td><td class="num">525</td><td class="num">496</td><td class="num">2282</td><td>✅ 4.35×</td><td>❌ 0.94×</td></tr><tr><td>峰值显存, 外部 NVML 采样 (MB)</td><td class="num">11260</td><td class="num">11210</td><td class="num">12000</td><td>✅ 1.07×</td><td>❌ 1.00×</td></tr><tr><td>KV cache 容量 (token)</td><td class="num">86016</td><td class="num">86016</td><td class="num">86016</td><td>≈ 1.00×</td><td>≈ 1.00×</td></tr><tr><td>加载耗时 (s)</td><td class="num">0.76</td><td class="num">0.70</td><td class="num">16.45</td><td>✅ 21.67×</td><td>❌ 0.92×</td></tr></tbody></table></div>
+
+<h2>改动</h2>
+<h3><span class="stepno">1</span>把三个脚本拷过来</h3>
+<div class="codeblock"><div class="cap"><span><b>终端</b> <span class="tag out">命令</span></span><button type="button">复制</button></div><pre><code class="language-bash">LAB=&lt;Genllm&gt;/study/labs/module-serving-unfused/bench
+cp $LAB/bench_nanovllm.py $LAB/gpu_mon.py $LAB/report.py src/bench/
+# 3090 上需要: ~/nano-vllm(含 .venv, 装了 pynvml)、~/huggingface/Qwen3-0.6B</code></pre></div>
+
+<h3><span class="stepno">2</span>run_all.sh</h3>
+<p>lab 的原版同时跑 unfused、融合版、nano-vllm：</p>
+<div class="codeblock"><div class="cap"><span><b>bench/run_all.sh</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-bash">#!/bin/bash
+# 在 RTX 3090 上依次压测 module-serving-unfused / module-serving / nano-vllm(同一 workload / 同一外部显存采样器), 汇总成 RESULTS.md.
+#
+# 用法(在 study/ 目录下):
+#   bash labs/module-serving-unfused/bench/run_all.sh [场景...]        # 默认 s1 s2 s3 s4
+# 环境变量:
+#   NANO_DIR   nano-vllm 源码目录(含 .venv), 默认 ~/nano-vllm
+#   HF_MODEL   nano-vllm 用的 HF 权重目录, 默认 ~/huggingface/Qwen3-0.6B
+#   OUT_DIR    结果目录, 默认 /tmp/genllm-bench-unfused
+#   MS_ARGS    追加给两个 Zig 引擎的参数(如 &quot;--policy chunked&quot;)
+#   NV_ARGS    追加给 nano-vllm 的参数
+#   GPU_UTIL   三边共用的 gpu_memory_utilization, 默认 0.9
+#   FUSED      1(默认)= 同时跑融合版 module-serving 作参照; 0 = 只比 unfused 与 nano-vllm
+#   MATCHED    1(默认)= 追加「对齐 KV 容量」场景 s3kv: nano-vllm 用 MATCHED_UTIL(默认 0.5), Zig 引擎分配同样多 KV
+set -euo pipefail
+
+HERE=&quot;$(cd &quot;$(dirname &quot;$0&quot;)&quot; &amp;&amp; pwd)&quot;
+STUDY=&quot;$(cd &quot;$HERE/../../..&quot; &amp;&amp; pwd)&quot;
+NANO_DIR=&quot;${NANO_DIR:-$HOME/nano-vllm}&quot;
+HF_MODEL=&quot;${HF_MODEL:-$HOME/huggingface/Qwen3-0.6B}&quot;
+OUT_DIR=&quot;${OUT_DIR:-/tmp/genllm-bench-unfused}&quot;
+GPU_UTIL=&quot;${GPU_UTIL:-0.9}&quot;
+FUSED=&quot;${FUSED:-1}&quot;
+PY=&quot;$NANO_DIR/.venv/bin/python&quot;
+GGUF=&quot;$STUDY/weights/Qwen3-0.6B-BF16.gguf&quot;
+SCENES=(&quot;$@&quot;)
+[ ${#SCENES[@]} -eq 0 ] &amp;&amp; SCENES=(s1 s2 s3 s4)
+
+ZIG_ENGINES=(module-serving-unfused)
+[ &quot;$FUSED&quot; = &quot;1&quot; ] &amp;&amp; ZIG_ENGINES+=(module-serving)
+
+mkdir -p &quot;$OUT_DIR/wl&quot;
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
+
+echo &quot;== 构建 ${ZIG_ENGINES[*]}(ReleaseFast)&quot;
+STEPS=()
+for e in &quot;${ZIG_ENGINES[@]}&quot;; do STEPS+=(&quot;install-lab-$e&quot;); done
+(cd &quot;$STUDY&quot; &amp;&amp; zig build &quot;${STEPS[@]}&quot; -Dcuda=true -Dnvcc=/usr/local/cuda/bin/nvcc -Dmetal=false -Doptimize=ReleaseFast)
+&quot;$PY&quot; &quot;$HERE/gen_workload.py&quot; &quot;$OUT_DIR/wl&quot;
+
+# run &lt;engine&gt; &lt;scene&gt; &lt;cmd...&gt;: 后台启动, 外部采样显存, 等结束
+run() {
+    local eng=$1 scene=$2
+    shift 2
+    echo &quot;== $eng / $scene&quot;
+    &quot;$@&quot; &gt; &quot;$OUT_DIR/$eng-$scene.log&quot; 2&gt;&amp;1 &amp;
+    local pid=$!
+    &quot;$PY&quot; &quot;$HERE/gpu_mon.py&quot; $pid &quot;$OUT_DIR/$eng-$scene.gpu.json&quot; &amp;
+    local mon=$!
+    wait $pid || { echo &quot;!! $eng/$scene 失败, 见 $OUT_DIR/$eng-$scene.log&quot;; tail -20 &quot;$OUT_DIR/$eng-$scene.log&quot;; }
+    wait $mon || true
+    grep -E &quot;轮&quot; &quot;$OUT_DIR/$eng-$scene.log&quot; || true
+    sleep 3 # 让显存彻底释放
+}
+
+for s in &quot;${SCENES[@]}&quot;; do
+    for e in &quot;${ZIG_ENGINES[@]}&quot;; do
+        run &quot;$e&quot; &quot;$s&quot; &quot;$STUDY/zig-out/bin/lab-$e&quot; bench &quot;$OUT_DIR/wl/$s.json&quot; \
+            --model &quot;$GGUF&quot; --gpu-util &quot;$GPU_UTIL&quot; --out &quot;$OUT_DIR/$e-$s.json&quot; ${MS_ARGS:-}
+    done
+    run nano-vllm &quot;$s&quot; &quot;$PY&quot; &quot;$HERE/bench_nanovllm.py&quot; &quot;$OUT_DIR/wl/$s.json&quot; \
+        --model &quot;$HF_MODEL&quot; --gpu-util &quot;$GPU_UTIL&quot; --out &quot;$OUT_DIR/nano-vllm-$s.json&quot; ${NV_ARGS:-}
+done
+
+# ---- 对齐 KV 容量的显存对比(默认开; MATCHED=0 关闭) ----
+# 先用 MATCHED_UTIL 跑 nano-vllm, 读出它的 KV token 数, 再让 Zig 引擎用 --kv-blocks 分配同样多的 KV.
+REPORT_SCENES=(&quot;${SCENES[@]}&quot;)
+if [ &quot;${MATCHED:-1}&quot; = &quot;1&quot; ]; then
+    MU=&quot;${MATCHED_UTIL:-0.5}&quot;
+    ms=&quot;s3kv&quot;
+    cp &quot;$OUT_DIR/wl/s3.json&quot; &quot;$OUT_DIR/wl/$ms.json&quot;
+    run nano-vllm &quot;$ms&quot; &quot;$PY&quot; &quot;$HERE/bench_nanovllm.py&quot; &quot;$OUT_DIR/wl/$ms.json&quot; \
+        --model &quot;$HF_MODEL&quot; --gpu-util &quot;$MU&quot; --out &quot;$OUT_DIR/nano-vllm-$ms.json&quot; ${NV_ARGS:-}
+    KV_TOK=$(&quot;$PY&quot; -c &quot;import json;print(json.load(open(&#x27;$OUT_DIR/nano-vllm-$ms.json&#x27;))[&#x27;kv_tokens&#x27;])&quot;)
+    BS=16
+    for e in &quot;${ZIG_ENGINES[@]}&quot;; do
+        run &quot;$e&quot; &quot;$ms&quot; &quot;$STUDY/zig-out/bin/lab-$e&quot; bench &quot;$OUT_DIR/wl/$ms.json&quot; \
+            --model &quot;$GGUF&quot; --block-size $BS --kv-blocks $((KV_TOK / BS)) \
+            --out &quot;$OUT_DIR/$e-$ms.json&quot; ${MS_ARGS:-}
+    done
+    REPORT_SCENES+=(&quot;$ms&quot;)
+fi
+
+&quot;$PY&quot; &quot;$HERE/report.py&quot; &quot;$OUT_DIR&quot; &quot;${REPORT_SCENES[@]}&quot; | tee &quot;$OUT_DIR/RESULTS.md&quot;</code></pre></div>
+<p>llmgen 的版本把“融合版”那一列换成目标 lab 本身，这样 llmgen 和目标是<b>同一天、同一状态</b>下量的：</p>
+<div class="codeblock"><div class="cap"><span><b>src/bench/run_all.sh</b> <span class="tag new">新建文件</span></span><button type="button">复制</button></div><pre><code class="language-bash">#!/bin/bash
+# src/bench/run_all.sh -- llmgen / module-serving-unfused / nano-vllm 同一 workload 对比
+# 用法(仓库根目录): bash src/bench/run_all.sh [场景...]     默认 s1 s2 s3 s4
+set -euo pipefail
+
+HERE=&quot;$(cd &quot;$(dirname &quot;$0&quot;)&quot; &amp;&amp; pwd)&quot;
+ROOT=&quot;$(git rev-parse --show-toplevel)&quot;
+STUDY=&quot;${STUDY:-$HOME/Genllm/study}&quot;                 # 目标 lab 所在的 study/ 目录
+NANO_DIR=&quot;${NANO_DIR:-$HOME/nano-vllm}&quot;
+HF_MODEL=&quot;${HF_MODEL:-$HOME/huggingface/Qwen3-0.6B}&quot;
+GGUF=&quot;${LLMGEN_MODEL:-/home/deploy/qwen/qwen306b/models/Qwen3-0.6B-BF16.gguf}&quot;
+OUT_DIR=&quot;${OUT_DIR:-/tmp/llmgen-bench}&quot;
+GPU_UTIL=&quot;${GPU_UTIL:-0.9}&quot;
+PY=&quot;$NANO_DIR/.venv/bin/python&quot;
+SCENES=(&quot;$@&quot;); [ ${#SCENES[@]} -eq 0 ] &amp;&amp; SCENES=(s1 s2 s3 s4)
+
+mkdir -p &quot;$OUT_DIR/wl&quot;
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
+
+(cd &quot;$ROOT&quot; &amp;&amp; zig build -Dcuda=true -Dnvcc=/usr/local/cuda/bin/nvcc -Doptimize=ReleaseFast)
+(cd &quot;$STUDY&quot; &amp;&amp; zig build install-lab-module-serving-unfused -Dcuda=true -Dnvcc=/usr/local/cuda/bin/nvcc -Dmetal=false -Doptimize=ReleaseFast)
+&quot;$PY&quot; &quot;$HERE/gen_workload.py&quot; &quot;$OUT_DIR/wl&quot;
+
+# run &lt;引擎&gt; &lt;场景&gt; &lt;命令...&gt;: 后台启动, 进程外采样显存, 等结束
+run() {
+    local eng=$1 scene=$2; shift 2
+    echo &quot;== $eng / $scene&quot;
+    &quot;$@&quot; &gt; &quot;$OUT_DIR/$eng-$scene.log&quot; 2&gt;&amp;1 &amp;
+    local pid=$!
+    &quot;$PY&quot; &quot;$HERE/gpu_mon.py&quot; $pid &quot;$OUT_DIR/$eng-$scene.gpu.json&quot; &amp;
+    local mon=$!
+    wait $pid || { echo &quot;!! $eng/$scene 失败&quot;; tail -20 &quot;$OUT_DIR/$eng-$scene.log&quot;; }
+    wait $mon || true
+    sleep 3   # 让显存彻底释放
+}
+
+for s in &quot;${SCENES[@]}&quot;; do
+    run llmgen &quot;$s&quot; &quot;$ROOT/zig-out/bin/llminfer&quot; bench &quot;$OUT_DIR/wl/$s.json&quot; \
+        --model &quot;$GGUF&quot; --gpu-util &quot;$GPU_UTIL&quot; --out &quot;$OUT_DIR/llmgen-$s.json&quot;
+    run module-serving-unfused &quot;$s&quot; &quot;$STUDY/zig-out/bin/lab-module-serving-unfused&quot; bench &quot;$OUT_DIR/wl/$s.json&quot; \
+        --model &quot;$GGUF&quot; --gpu-util &quot;$GPU_UTIL&quot; --out &quot;$OUT_DIR/module-serving-unfused-$s.json&quot;
+    run nano-vllm &quot;$s&quot; &quot;$PY&quot; &quot;$HERE/bench_nanovllm.py&quot; &quot;$OUT_DIR/wl/$s.json&quot; \
+        --model &quot;$HF_MODEL&quot; --gpu-util &quot;$GPU_UTIL&quot; --out &quot;$OUT_DIR/nano-vllm-$s.json&quot;
+done
+
+&quot;$PY&quot; &quot;$HERE/report.py&quot; &quot;$OUT_DIR&quot; &quot;${SCENES[@]}&quot; | tee &quot;$OUT_DIR/RESULTS.md&quot;</code></pre></div>
+
+<h3><span class="stepno">3</span>report.py 改列名</h3>
+<div class="codeblock diff"><div class="cap"><span><b>src/bench/report.py</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln del">UF, MS, NV = &quot;module-serving-unfused&quot;, &quot;module-serving&quot;, &quot;nano-vllm&quot;</span><span class="ln add"># 第一列是被测的 llmgen, 第二列是目标 lab, 第三列是 nano-vllm</span><span class="ln add">UF, MS, NV = &quot;llmgen&quot;, &quot;module-serving-unfused&quot;, &quot;nano-vllm&quot;</span><span class="ln ctx">...</span><span class="ln del">            print(&quot;| 指标 | unfused | module-serving(融合) | nano-vllm | unfused vs nano-vllm | unfused vs 融合 |&quot;)</span><span class="ln add">            print(&quot;| 指标 | llmgen | unfused(目标) | nano-vllm | llmgen vs nano-vllm | llmgen vs 目标 |&quot;)</span></code></pre></div>
+
+<h2>运行</h2>
+<p><code>bash src/bench/run_all.sh</code>，全程约 5 分钟（S3 每个引擎 25–30 秒，nano-vllm 加载 16 秒）。结果在 <code>/tmp/llmgen-bench/RESULTS.md</code>。</p>
+<div class="callout warn"><span class="t">别把结果目录提交进仓库</span><code>OUT_DIR</code> 默认在 <code>/tmp</code>。要留档的话，把 <code>RESULTS.md</code> 和各场景的 JSON 拷到 <code>src/bench/&lt;commit&gt;/</code>，和现有的 <code>bench/40da889-dirty/</code> 同样的约定。workload JSON 不要提交。</div>
+
+<h2>怎么读结果</h2>
+<div class="tablewrap"><table><thead><tr><th>“llmgen vs 目标”这一列</th><th>说明</th></tr></thead><tbody><tr><td>0.95–1.05</td><td>做到了。剩下的是测量波动（lab 自己两次复测的差别在 ±0.5% 以内）</td></tr><tr><td>S1 偏低，其余正常</td><td>单序列路径上还有 host 开销。用 <code>--eager</code> 对比，再看 nsys 的 API 表（第 02 步的方法）</td></tr><tr><td>S4 偏低，S1 正常</td><td>批 4–8 的路径：cuBLAS 的 GEMM（第 12 步的阈值）、CUDA Graph 的桶 4 / 8（第 17 步）</td></tr><tr><td>S3 偏低，其余正常</td><td>大批：看 JSON 里的 <code>preemptions</code>（KV 不够，第 18 步）和 <code>steps</code>（多趟切分，第 19 步）</td></tr><tr><td>TTFT 偏高，吞吐正常</td><td>prefill 路径：gather_last（第 08 步）、FA2（第 14 步）、prefill 步是不是被切成了多趟</td></tr><tr><td>RSS / 加载偏高</td><td>第 21 步</td></tr></tbody></table></div>
+<h2>CPU 同步</h2>
+<div class="callout cpu"><span class="t">这一步 CPU 后端要做的事</span><b>做一次 CPU / CUDA 逐 token 对拍。</b><code>run_all.sh</code> 不用加 CPU 列（S1–S4 对 CPU 太大，也没有可比的对象），单独记一个 CPU 的单请求数字即可。 <a href="cpu-5-exec-cli.html#final">去看 →</a></div>
+<h2>性能收益</h2>
+<h3>依据</h3>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th class="num">改前</th><th class="num">改后</th><th>来源</th></tr></thead><tbody><tr><td>S1 输出吞吐：nano-vllm → unfused（tok/s）</td><td class="num">289.1</td><td class="num">401.3</td><td><span class="src lab">lab 实测</span></td></tr><tr><td>S2 输出吞吐（tok/s）</td><td class="num">3111.3</td><td class="num">3786.1</td><td><span class="src lab">lab 实测</span></td></tr><tr><td>S3 输出吞吐（tok/s）</td><td class="num">4265.7</td><td class="num">5580</td><td><span class="src lab">lab 实测</span></td></tr><tr><td>S4 输出吞吐（tok/s）</td><td class="num">1424.5</td><td class="num">1670.1</td><td><span class="src lab">lab 实测</span></td></tr><tr><td>S3 @ 对齐 KV 容量（tok/s）</td><td class="num">3595.6</td><td class="num">4490</td><td><span class="src lab">lab 实测</span></td></tr><tr><td>llmgen 起点（单请求 decode，tok/s）</td><td class="num">15.5</td><td class="num">—</td><td><span class="src start">llmgen 起点实测</span></td></tr></tbody></table></div>
+<h3>对 llmgen 的预期</h3>
+<p>从起点的 15.5 tok/s 到 S1 的 401.3 tok/s 是 26 倍；到 S3 的 5580 tok/s 是 360 倍。</p>
+<p>到这里是里程碑 M3。把四个场景的数字填进下面的表，再回总览页把汇总表填完。</p>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>S1 输出吞吐 (tok/s)</td><td class="num fill" contenteditable="true" data-key="22-final-bench.html|S1 输出吞吐 (tok/s)|before"></td><td class="num fill" contenteditable="true" data-key="22-final-bench.html|S1 输出吞吐 (tok/s)|after"></td><td class="num gain"></td></tr><tr><td>S2 输出吞吐 (tok/s)</td><td class="num fill" contenteditable="true" data-key="22-final-bench.html|S2 输出吞吐 (tok/s)|before"></td><td class="num fill" contenteditable="true" data-key="22-final-bench.html|S2 输出吞吐 (tok/s)|after"></td><td class="num gain"></td></tr><tr><td>S3 输出吞吐 (tok/s)</td><td class="num fill" contenteditable="true" data-key="22-final-bench.html|S3 输出吞吐 (tok/s)|before"></td><td class="num fill" contenteditable="true" data-key="22-final-bench.html|S3 输出吞吐 (tok/s)|after"></td><td class="num gain"></td></tr><tr><td>S4 输出吞吐 (tok/s)</td><td class="num fill" contenteditable="true" data-key="22-final-bench.html|S4 输出吞吐 (tok/s)|before"></td><td class="num fill" contenteditable="true" data-key="22-final-bench.html|S4 输出吞吐 (tok/s)|after"></td><td class="num gain"></td></tr><tr><td>S1 TTFT mean (ms)</td><td class="num fill" contenteditable="true" data-key="22-final-bench.html|S1 TTFT mean (ms)|before"></td><td class="num fill" contenteditable="true" data-key="22-final-bench.html|S1 TTFT mean (ms)|after"></td><td class="num gain"></td></tr><tr><td>S1 ITL mean (ms)</td><td class="num fill" contenteditable="true" data-key="22-final-bench.html|S1 ITL mean (ms)|before"></td><td class="num fill" contenteditable="true" data-key="22-final-bench.html|S1 ITL mean (ms)|after"></td><td class="num gain"></td></tr><tr><td>S3 ITL p99 (ms)</td><td class="num fill" contenteditable="true" data-key="22-final-bench.html|S3 ITL p99 (ms)|before"></td><td class="num fill" contenteditable="true" data-key="22-final-bench.html|S3 ITL p99 (ms)|after"></td><td class="num gain"></td></tr><tr><td>峰值 RSS (MB)</td><td class="num fill" contenteditable="true" data-key="22-final-bench.html|峰值 RSS (MB)|before"></td><td class="num fill" contenteditable="true" data-key="22-final-bench.html|峰值 RSS (MB)|after"></td><td class="num gain"></td></tr><tr><td>加载耗时 (s)</td><td class="num fill" contenteditable="true" data-key="22-final-bench.html|加载耗时 (s)|before"></td><td class="num fill" contenteditable="true" data-key="22-final-bench.html|加载耗时 (s)|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td>nano-vllm 报 flash-attn 空 query</td><td>prompt 长度恰为 256 的整数倍、且命中 prefix cache 时触发。workload 每轮 prompt 不同就是为了避开它。别自己改成重复 prompt。</td></tr><tr><td><code>gpu_mon.py</code> 报找不到 pynvml</td><td>装在 nano-vllm 的 venv 里：<code>~/nano-vllm/.venv/bin/pip install pynvml</code>。</td></tr><tr><td>第二个引擎报显存不够</td><td>上一个进程的显存还没释放完。把 <code>sleep 3</code> 调大。</td></tr><tr><td>三个引擎的 KV 容量差很多</td><td>0.9 的比例下各家扣除项不同，属正常（lab 的表里是 176736 / 176736 / 174336）。差到一倍以上说明 llmgen 的预算算错了。</td></tr><tr><td>llmgen 的 S3 TTFT p99 比目标高很多</td><td>S3 的 256 条 prompt 共 14 万 token，prefill 要好几步。看是不是 <code>max_num_batched_tokens</code> 设小了。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li><code>RESULTS.md</code> 里四个场景三个引擎都有数字</li><li>“llmgen vs 目标”一列在 0.9–1.1 之间</li><li>M3：S2 / S3 / S4 的吞吐和延迟全面超过 nano-vllm</li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="21-cli-load.html"><small>← 上一步</small>CLI 与快速加载</a><a class="next" href="23-switches-debug.html"><small>下一步 →</small>附录：回退开关与排错</a></div>
+</main>
+</div>
+</body>
+</html>

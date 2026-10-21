@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CPU：执行层与命令行 · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html" class="active"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">CPU 支线</div>
+<h1>CPU：执行层与命令行</h1>
+<p class="lead">KV 预算、加载、--device，以及最终的 CPU / CUDA 对拍。</p>
+<div class="callout goal"><span class="t">本步目标</span>主线阶段 4–6（激活规划、CUDA Graph、KV 预算、批处理、命令行、加载）在 CPU 上各自意味着什么。大部分不用动；要动的是 KV 预算的缺省值、权重加载和 <code>--device</code>。</div>
+<h2>原理：哪些和设备无关，哪些有关</h2>
+<div class="tablewrap"><table><thead><tr><th>主线</th><th>在 CPU 上</th><th>要做的事</th></tr></thead><tbody><tr><td><a href="16-memory-plan.html">16</a> 激活规划</td><td>完全一样。规划的是“每行偏移”，基址是 CPU 池里的地址</td><td>无</td></tr><tr><td><a href="17-cuda-graph.html">17</a> CUDA Graph</td><td>没有。每步都是 eager：逐节点派发，同步执行</td><td>无（<code>enforce_eager</code> 已经对非 CUDA 设备恒为真）</td></tr><tr><td><a href="18-block-manager.html">18</a> KV 预算</td><td>不能按“总显存 × 比例”算</td><td><b>给固定块数</b></td></tr><tr><td><a href="19-batched-forward.html">19</a> 批量前向</td><td>完全一样。变长打包、多趟切分都是 host 逻辑</td><td>无</td></tr><tr><td><a href="20-scheduling.html">20</a> 调度</td><td>完全一样</td><td>无</td></tr><tr><td><a href="21-cli-load.html">21</a> 加载</td><td>不需要 pinned 暂存区，磁盘直接读进池</td><td><b>改 CPU 分支</b></td></tr><tr><td><a href="21-cli-load.html">21</a> CLI</td><td>多一个 <code>--device</code></td><td><b>加选项</b></td></tr></tbody></table></div>
+<p>padding 行（主线第 17 步）只在回放 CUDA Graph 时出现，CPU 上 <code>Sn</code> 恒等于实际序列数，<code>fillMeta</code> 的 padding 循环不执行。</p>
+
+<h2>先过一遍执行层</h2>
+<p>主线各步给出的执行层代码已经带了设备判断。CPU 支线做到这里，值得对着下面的清单把 <code>executor.zig</code> 通读一遍，确认没有漏网的 CUDA 调用：</p>
+<div class="codeblock"><div class="cap"><span><b>src/executor.zig：检查清单</b> <span class="tag out">示意，不落地</span></span><button type="button">复制</button></div><pre><code class="language-zig">// 执行层里所有碰 CUDA 的地方, 都要带这两个条件之一(主线各步的代码已经是这样):
+if (opts.have_cuda and self.input_tensor.device_type == .CUDA) { ... }   // 运行时在 CPU 上就跳过
+if (comptime opts.have_cuda) { ... }                                     // 纯 CPU 构建时这段不编译
+
+// 逐项:
+//   allocMeta      CPU: meta_host = 池里那块缓冲本身;不切 part_o / part_ml / sample_scratch;不分配 out_host
+//   uploadMeta     CPU: 什么都不做(fillMeta 已经直接写进池里了)
+//   fetchOutAt     CPU: 直接把输出节点的 data 当 [*]const i32 读
+//   executorTensor CPU: 不同步
+//   init           CPU: enforce_eager = true, 不调 captureGraphs
+//   deinit         CPU: 不调 cuda_host_free / cuda_graph_destroy</code></pre></div>
+<div class="callout tip"><span class="t">最容易漏的一处</span>主线第 09 步的 <code>fetchOut</code> 里，CUDA 分支之后是 <code>cuda.CudaContext.instance().sync()</code>。如果把 sync 写在分支外面，纯 CPU 构建会编译不过（<code>cuda</code> 是空结构），带 CUDA 构建跑 CPU 时会无谓地初始化 CUDA 上下文。</div>
+
+<h2 id="kv">KV 预算（主线第 18 步）</h2>
+<p>主线第 18 步的预算公式是 <code>total_memory × gpu_memory_utilization − used − 权重 − 激活</code>。llmgen 的 <code>CPUBackendProvider</code> 把 CPU 的总内存写死成 16 GB（<code>backend/backend.zig</code>），按这个公式会一口气申请十几 GB 的 KV。</p>
+<p>lab 的做法是 CPU 不自动算，给保守的固定值：</p>
+<div class="codeblock"><div class="cap"><span><b>main.zig</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">const HOST_KV_BLOCKS: usize = 512; // × 16 token × 28 层 × K/V × 8 头 × 128 × 2B ≈ 0.9 GB
+const HOST_PASS_TOKENS: usize = 2048;</code></pre></div>
+<div class="codeblock"><div class="cap"><span><b>main.zig · 按设备给缺省值</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">    const on_cuda = dev_info.device == .CUDA;
+    const pass_tokens = o.pass_tokens orelse if (on_cuda) 8192 else HOST_PASS_TOKENS;
+    const kv_blocks = o.kv_blocks orelse if (on_cuda) 0 else HOST_KV_BLOCKS;</code></pre></div>
+<div class="tablewrap"><table><thead><tr><th></th><th>CUDA 缺省</th><th>CPU 缺省</th><th>为什么</th></tr></thead><tbody><tr><td>KV 块数</td><td>按显存比例自动算（约 1.1 万块）</td><td>512 块 = 8192 token，约 0.9 GB</td><td>主机内存要留给系统和权重（1.2 GB）</td></tr><tr><td>单趟 token 上限</td><td>8192</td><td>2048</td><td>激活 token 区 = 21.5 KB × 上限。CPU 上一趟算 8192 个 token 也没有意义</td></tr><tr><td><code>max_num_seqs</code></td><td>256</td><td>256（序列区 75 MB）</td><td>嫌大可以调小，序列区主要是每条序列一行 logits</td></tr></tbody></table></div>
+<div class="codeblock diff"><div class="cap"><span><b>src/llmgen.zig</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln add">    const on_cuda = picked[0].device_type == .CUDA;</span><span class="ln ctx">    var graph_scheduler = GraphScheduler.init(allocator, compute_graph, .{</span><span class="ln ctx">        ...</span><span class="ln del">        .max_tokens = @max(pass_tokens, max_num_seqs),</span><span class="ln del">        .gpu_memory_utilization = 0.9,</span><span class="ln add">        // CPU 没有&quot;显存比例&quot;这回事:BackendInfo 里 CPU 的总内存是写死的 16 GB, 按比例算会申请十几 GB</span><span class="ln add">        .max_tokens = @max(if (on_cuda) pass_tokens else 2048, max_num_seqs),</span><span class="ln add">        .gpu_memory_utilization = 0.9,</span><span class="ln add">        .num_kv_blocks = if (on_cuda) 0 else 512, // 512 块 × 16 = 8192 token, 约 0.9 GB</span></code></pre></div>
+
+<h2 id="load">权重加载（主线第 21 步）</h2>
+<p>主线第 21 步把 GGUF 改成只解析头部、权重留在磁盘。CUDA 要经一块 pinned 暂存区再 H2D；CPU 的池就是普通内存，直接 <code>pread</code> 进去，一次拷贝都不多：</p>
+<div class="codeblock"><div class="cap"><span><b>manager.zig · loadOne：stage 为空就是 CPU</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">                .bf16 =&gt; {
+                    if (p.dtype != .GGML_TYPE_BF16) return error.WeightMustBeBf16;
+                    const total = p.bytes();
+                    const file_off = parser.dataOffset() + p.offset;
+                    if (stage) |st| {
+                        if (comptime !opts.have_cuda) unreachable;
+                        // 分块: pread → pinned → H2D(同步), 暂存区只有 32MB
+                        var done: usize = 0;
+                        while (done &lt; total) {
+                            const chunk = @min(STAGE_BYTES, total - done);
+                            const n = try parser.file.?.preadAll(st[0..chunk], file_off + done);
+                            if (n != chunk) return error.ShortRead;
+                            cu.cuda_h2d(dev_base + dst_off + done, st, chunk);
+                            done += chunk;
+                        }
+                    } else {
+                        const n = try parser.file.?.preadAll(dev_base[dst_off..][0..total], file_off);
+                        if (n != total) return error.ShortRead;
+                    }
+                    dst_off += total;
+                },</code></pre></div>
+<div class="codeblock diff"><div class="cap"><span><b>src/memory/manager.zig · loadWeights 的 CPU 分支（主线第 21 步之后）</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">        for (cpu_weights.items) |e| {</span><span class="ln ctx">            ...</span><span class="ln del">            const raw = parser.tensorData(parser.getInfo().findTensor(e.tensor.name).?);</span><span class="ln del">            const block = try wp.allocate(raw.len, 32);</span><span class="ln del">            @memcpy(block.ptr[0..raw.len], raw);</span><span class="ln add">            // 池本身就是 host 内存:从磁盘直接读进去, 不经过中转</span><span class="ln add">            const info = parser.getInfo().findTensor(e.tensor.name).?;</span><span class="ln add">            const total = info.bytes();</span><span class="ln add">            const block = try wp.allocate(total, 32);</span><span class="ln add">            const n = try parser.file.preadAll(block.ptr[0..total], parser.data_offset + info.offset);</span><span class="ln add">            if (n != total) return error.ShortRead;</span></code></pre></div>
+<p>主线第 03 步之后 CPU 分支在“整张图在 GPU”时是空的（只剩 RoPE 表，它不是权重）；整张图在 CPU 时，全部权重都走这个分支。同名权重去重（embedding 和 lm_head 共用 <code>token_embd.weight</code>）用的是原来就有的 <code>bound</code> 表。</p>
+
+<h2 id="device">--device（主线第 21 步）</h2>
+<div class="codeblock"><div class="cap"><span><b>main.zig · pickDevice</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">/// --device 给了就按名字找; 否则按 cuda &gt; metal &gt; cpu 挑第一台可用的.
+fn pickDevice(devices: []const @import(&quot;backend/backend.zig&quot;).BackendInfo, want: ?[]const u8) ?@import(&quot;backend/backend.zig&quot;).BackendInfo {
+    const T = @import(&quot;tensor.zig&quot;);
+    const order = [_]T.Device{ .CUDA, .METAL, .CPU };
+    for (order) |dev| {
+        if (want) |name| {
+            if (!std.ascii.eqlIgnoreCase(name, @tagName(dev))) continue;
+        }
+        for (devices) |d| {
+            if (d.device == dev) return d;
+        }
+    }
+    return null;
+}</code></pre></div>
+<p>把 <a href="cpu-1-overview.html">C1</a> 里临时的 <code>LLMGEN_DEVICE</code> 换成命令行选项。缺省挑“最好的可用设备”（cuda &gt; cpu），纯 CPU 构建时自然落到 CPU。<code>--eager</code> / <code>--sync-each</code> 以及 <code>SV_*</code> 开关在 CPU 上没有意义，解析但忽略。</p>
+
+<h2 id="final">最终验证（主线第 22 步）</h2>
+<div class="codeblock"><div class="cap"><span><b>终端</b> <span class="tag out">命令</span></span><button type="button">复制</button></div><pre><code class="language-bash"># mac
+zig build -Doptimize=ReleaseFast
+./zig-out/bin/llminfer chat &quot;中国的首都是哪里？&quot; 64
+
+# 3090:同一个二进制两个后端
+./zig-out/bin/llminfer chat &quot;中国的首都是哪里？&quot; 64 --device cpu
+./zig-out/bin/llminfer chat &quot;中国的首都是哪里？&quot; 64 --device cuda
+
+# CPU 上的小规模批处理(S1–S4 对 CPU 太大, 自己造一个 4 条 × 32 → 32 的 workload)
+./zig-out/bin/llminfer bench /tmp/tiny.json --device cpu --kv-blocks 512</code></pre></div>
+<ul>
+  <li><b>逐 token 对拍</b>：<code>--device cpu</code> 和 <code>--device cuda</code> 的 greedy token id 相同。lab 的结果是 64 个 token 全部相同，mac 上的 CPU 也和 3090 上的 CUDA 相同 <span class="src lab">lab CPU 实测</span>。</li>
+  <li><b>批处理</b>：CPU 上跑一个小 workload，8 份相同 prompt 的输出互相相同（主线第 19 步的检查），且和 CUDA 相同。</li>
+  <li><b>速度</b>：单请求 decode 和 lab 同量级。</li>
+</ul>
+<p>主线第 22 步的 <code>run_all.sh</code> 对比的是 CUDA 的数字，不用加 CPU 列：S1–S4 在 CPU 上要跑很久，而且没有可比的对象（nano-vllm 没有 CPU 后端）。</p>
+<h2>性能收益</h2>
+<h3>依据</h3>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th class="num">改前</th><th class="num">改后</th><th>来源</th></tr></thead><tbody><tr><td>lab：3090 主机 CPU 单请求 decode（tok/s）</td><td class="num">—</td><td class="num">21</td><td><span class="src lab">lab CPU 实测</span></td></tr><tr><td>lab：mac M3 Pro CPU 单请求 decode（tok/s）</td><td class="num">—</td><td class="num">20–29</td><td><span class="src lab">lab CPU 实测</span></td></tr><tr><td>lab：同一块 3090 上 CUDA 的 S1（tok/s）</td><td class="num">—</td><td class="num">401.3</td><td><span class="src lab">lab 实测</span></td></tr><tr><td>lab：CPU 与 CUDA 的 greedy 输出</td><td class="num">—</td><td class="num">64 个 token 逐个相同</td><td><span class="src lab">lab CPU 实测</span></td></tr></tbody></table></div>
+<h3>对 llmgen 的预期</h3>
+<p>这一页没有速度上的改动。CPU 后端最终的位置：</p>
+<ul>
+  <li>单请求 decode 约 20 tok/s，是 CUDA 的 1/20。瓶颈是内存带宽，不是代码。</li>
+  <li>批处理在 CPU 上同样能提高吞吐（权重读一遍、多行输入共用），但 CPU 的算力不像 GPU 那样有大量富余，批到 4–8 之后就不再线性了 <span class="src est">推算</span>。</li>
+  <li>RSS：权重 1.2 GB + KV 0.9 GB + 激活几十 MB，约 2.2 GB。</li>
+</ul>
+<p>它的价值是<b>随处能跑、随时能对拍</b>：mac 上开发执行层，CPU 当 CUDA 的参考，没有 GPU 的机器上也能演示。</p>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>CPU 单请求 decode (tok/s)</td><td class="num fill" contenteditable="true" data-key="cpu-5-exec-cli.html|CPU 单请求 decode (tok/s)|before"></td><td class="num fill" contenteditable="true" data-key="cpu-5-exec-cli.html|CPU 单请求 decode (tok/s)|after"></td><td class="num gain"></td></tr><tr><td>CPU 峰值 RSS (MB)</td><td class="num fill" contenteditable="true" data-key="cpu-5-exec-cli.html|CPU 峰值 RSS (MB)|before"></td><td class="num fill" contenteditable="true" data-key="cpu-5-exec-cli.html|CPU 峰值 RSS (MB)|after"></td><td class="num gain"></td></tr><tr><td>CPU / CUDA 相同的 token 数</td><td class="num fill" contenteditable="true" data-key="cpu-5-exec-cli.html|CPU / CUDA 相同的 token 数|before"></td><td class="num fill" contenteditable="true" data-key="cpu-5-exec-cli.html|CPU / CUDA 相同的 token 数|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td>CPU 启动时申请十几 GB 内存 / 被 OOM 杀掉</td><td>KV 按“显存比例”算了。CPU 要给固定的 <code>num_kv_blocks</code>。</td></tr><tr><td>纯 CPU 构建编译报 <code>struct has no member named cuda_…</code></td><td>执行层有 CUDA 调用没包在 <code>if (opts.have_cuda …)</code> 里。<code>opts.have_cuda</code> 是编译期常量，这样写的分支在纯 CPU 构建时不会被分析。</td></tr><tr><td>带 CUDA 构建跑 <code>--device cpu</code> 仍然初始化了 CUDA</td><td><code>DeviceManager</code> 发现设备时会建 CUDA 上下文，这是预期的；但之后不应再有 CUDA 调用。</td></tr><tr><td>CPU 上 <code>error.OutOfBlocks</code></td><td>512 块只有 8192 token。长对话或批大了用 <code>--kv-blocks</code> 调大（每 512 块约 0.9 GB）。</td></tr><tr><td>CPU 和 CUDA 在带温度采样时输出不同</td><td>采样的随机数相同，但 logits 有 f32 最后一位的差别时，Gumbel-max 可能选到不同的 token。只用 greedy 做逐 token 对拍。</td></tr><tr><td>CPU 加载比 CUDA 慢</td><td>1.2 GB 权重要真的读进内存（CUDA 是读进暂存区再传走）。冷缓存时受磁盘速度限制。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li><code>--device cpu</code> 和 <code>--device cuda</code> 的 greedy 输出逐 token 相同</li><li>CPU 上能跑小规模的 <code>bench</code></li><li>纯 CPU 构建（mac）能编译、能跑 <code>chat</code> 和 <code>zig build test</code></li><li>把 CPU 的数字填进本页和 C1 的表里</li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="cpu-4-kernels-math.html"><small>← 上一步</small>CPU：计算类算子</a><span></span></div>
+</main>
+</div>
+</body>
+</html>

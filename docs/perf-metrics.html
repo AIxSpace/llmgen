@@ -1,0 +1,2585 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llmgen 性能指标</title>
+<style>
+:root {
+  --bg: #fbfaf7;
+  --bg-soft: #f2f0ea;
+  --panel: #ffffff;
+  --fg: #22211f;
+  --fg-muted: #6b675f;
+  --border: #e3dfd5;
+  --accent: #b4532a;
+  --accent-soft: #f6e6dc;
+  --code-bg: #f4f2ec;
+  --code-fg: #2b2a27;
+  --tok-kw: #9a3412;
+  --tok-str: #3f6212;
+  --tok-com: #8a857a;
+  --tok-num: #1d4ed8;
+  --add-bg: #e4f3e1;
+  --add-fg: #2f6b25;
+  --del-bg: #fae3e0;
+  --del-fg: #a3352a;
+  --tip: #1f6f5c;
+  --tip-bg: #e3f2ee;
+  --warn: #9a5b00;
+  --warn-bg: #fbefd9;
+  --check: #3b4fa0;
+  --check-bg: #e7ebf8;
+  --err: #a3352a;
+  --err-bg: #fbe7e4;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #171614;
+    --bg-soft: #1f1e1b;
+    --panel: #1c1b19;
+    --fg: #ebe8e1;
+    --fg-muted: #a39e93;
+    --border: #34322d;
+    --accent: #e7895c;
+    --accent-soft: #3a261c;
+    --code-bg: #22211e;
+    --code-fg: #e6e2d9;
+    --tok-kw: #f0a372;
+    --tok-str: #a8cf7a;
+    --tok-com: #7f7a70;
+    --tok-num: #8fb4ff;
+    --add-bg: #1d3320;
+    --add-fg: #9fd892;
+    --del-bg: #3a1f1c;
+    --del-fg: #f0a197;
+    --tip: #7fd1bb;
+    --tip-bg: #17302a;
+    --warn: #f0c070;
+    --warn-bg: #33270f;
+    --check: #a9b8f0;
+    --check-bg: #1e2440;
+    --err: #f0a197;
+    --err-bg: #3a1f1c;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #171614;
+  --bg-soft: #1f1e1b;
+  --panel: #1c1b19;
+  --fg: #ebe8e1;
+  --fg-muted: #a39e93;
+  --border: #34322d;
+  --accent: #e7895c;
+  --accent-soft: #3a261c;
+  --code-bg: #22211e;
+  --code-fg: #e6e2d9;
+  --tok-kw: #f0a372;
+  --tok-str: #a8cf7a;
+  --tok-com: #7f7a70;
+  --tok-num: #8fb4ff;
+  --add-bg: #1d3320;
+  --add-fg: #9fd892;
+  --del-bg: #3a1f1c;
+  --del-fg: #f0a197;
+  --tip: #7fd1bb;
+  --tip-bg: #17302a;
+  --warn: #f0c070;
+  --warn-bg: #33270f;
+  --check: #a9b8f0;
+  --check-bg: #1e2440;
+  --err: #f0a197;
+  --err-bg: #3a1f1c;
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.75 -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+code, pre { font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; }
+
+.layout { display: grid; grid-template-columns: 260px minmax(0, 1fr); max-width: 1200px; margin: 0 auto; }
+nav.toc {
+  position: sticky; top: 0; align-self: start; height: 100vh; overflow-y: auto;
+  padding: 32px 16px 32px 24px; border-right: 1px solid var(--border); font-size: 14px;
+}
+nav.toc .brand { font-weight: 700; font-size: 15px; margin-bottom: 4px; }
+nav.toc .sub { color: var(--fg-muted); font-size: 12px; margin-bottom: 20px; }
+nav.toc ol { list-style: none; padding: 0; margin: 0; }
+nav.toc li { margin: 2px 0; }
+nav.toc a {
+  display: block; padding: 5px 10px; border-radius: 6px; color: var(--fg-muted); text-decoration: none; line-height: 1.4;
+}
+nav.toc a:hover { background: var(--bg-soft); color: var(--fg); }
+nav.toc a.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+nav.toc .num { display: inline-block; width: 1.6em; font-variant-numeric: tabular-nums; }
+.theme-btn {
+  margin-top: 20px; font: inherit; font-size: 12px; padding: 6px 10px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--panel); color: var(--fg-muted); cursor: pointer;
+}
+
+main { padding: 40px 48px 120px; min-width: 0; }
+header.hero { margin-bottom: 40px; padding-bottom: 28px; border-bottom: 1px solid var(--border); }
+header.hero h1 { font-size: 32px; line-height: 1.3; margin: 0 0 12px; letter-spacing: -0.01em; }
+header.hero p { color: var(--fg-muted); margin: 6px 0; max-width: 48em; }
+
+section { padding-top: 24px; margin-bottom: 64px; scroll-margin-top: 16px; }
+h2 { font-size: 24px; margin: 0 0 6px; line-height: 1.35; }
+h2 .chap { color: var(--accent); font-variant-numeric: tabular-nums; margin-right: 10px; }
+.level { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 999px; background: var(--bg-soft); color: var(--fg-muted); border: 1px solid var(--border); vertical-align: middle; margin-left: 6px; font-weight: 500; }
+h3 { font-size: 18px; margin: 32px 0 8px; }
+h3 .step {
+  display: inline-block; min-width: 1.9em; padding: 0 6px; margin-right: 8px; border-radius: 6px;
+  background: var(--accent); color: var(--bg); font-size: 13px; text-align: center; font-variant-numeric: tabular-nums; vertical-align: 2px;
+}
+p, li { max-width: 54em; }
+a { color: var(--accent); }
+:not(pre) > code {
+  background: var(--code-bg); padding: 1px 6px; border-radius: 4px; font-size: 0.88em; color: var(--code-fg);
+}
+.note { color: var(--fg-muted); font-size: 14px; }
+
+.code {
+  position: relative; background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+  margin: 12px 0 18px; overflow: hidden;
+}
+.code .bar {
+  display: flex; justify-content: space-between; align-items: center; gap: 8px;
+  padding: 6px 12px; font-size: 12px; color: var(--fg-muted); border-bottom: 1px solid var(--border);
+}
+.code .bar .tag { font-size: 11px; padding: 0 6px; border-radius: 4px; border: 1px solid var(--border); margin-left: 6px; }
+.code .bar button {
+  font: inherit; border: 1px solid var(--border); background: var(--panel); color: var(--fg-muted);
+  padding: 1px 8px; border-radius: 4px; cursor: pointer; flex: none;
+}
+.code pre { margin: 0; padding: 14px 0; overflow-x: auto; font-size: 13px; line-height: 1.6; color: var(--code-fg); }
+.code pre code { display: block; min-width: max-content; }
+.code .ln { display: block; padding: 0 16px; white-space: pre; }
+.code .ln.add { background: var(--add-bg); }
+.code .ln.del { background: var(--del-bg); }
+.code .ln.add::before { content: "+ "; color: var(--add-fg); font-weight: 700; }
+.code .ln.del::before { content: "- "; color: var(--del-fg); font-weight: 700; }
+.code .ln.ctx::before { content: "  "; }
+.code .ln.del, .code .ln.del span { color: var(--del-fg); }
+.tk-kw { color: var(--tok-kw); font-weight: 600; }
+.tk-str { color: var(--tok-str); }
+.tk-com { color: var(--tok-com); font-style: italic; }
+.tk-num { color: var(--tok-num); }
+
+.callout { border-radius: 8px; padding: 12px 16px; margin: 16px 0; font-size: 15px; border-left: 4px solid; }
+.callout > b:first-child { display: block; margin-bottom: 2px; }
+.callout.tip { background: var(--tip-bg); border-color: var(--tip); }
+.callout.tip > b:first-child { color: var(--tip); }
+.callout.warn { background: var(--warn-bg); border-color: var(--warn); }
+.callout.warn > b:first-child { color: var(--warn); }
+.callout.check { background: var(--check-bg); border-color: var(--check); }
+.callout.check > b:first-child { color: var(--check); }
+.callout.err { background: var(--err-bg); border-color: var(--err); }
+.callout.err > b:first-child { color: var(--err); }
+.callout ul, .callout ol { margin: 4px 0 0; padding-left: 20px; }
+.callout li { margin: 2px 0; }
+
+.formula {
+  background: var(--panel); border: 1px dashed var(--border); border-radius: 8px; padding: 12px 16px;
+  margin: 12px 0; font-family: "JetBrains Mono", "SF Mono", Menlo, monospace; font-size: 14px; overflow-x: auto; white-space: pre;
+}
+.goal { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; margin: 12px 0 8px; font-size: 15px; }
+.goal dt { color: var(--fg-muted); font-weight: 600; white-space: nowrap; }
+.goal dd { margin: 0; }
+
+.tbl { overflow-x: auto; margin: 12px 0 18px; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { background: var(--bg-soft); font-weight: 600; white-space: nowrap; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.kind { display: inline-block; font-size: 12px; padding: 0 6px; border-radius: 4px; white-space: nowrap; }
+.kind.new { background: var(--add-bg); color: var(--add-fg); }
+.kind.mod { background: var(--warn-bg); color: var(--warn); }
+.kind.del { background: var(--del-bg); color: var(--del-fg); }
+
+details.full { border: 1px solid var(--border); border-radius: 8px; margin: 16px 0; background: var(--panel); }
+details.full > summary { cursor: pointer; padding: 10px 14px; font-weight: 600; font-size: 15px; }
+details.full > .inner { padding: 0 14px 4px; }
+
+.flow { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 12px 0; font-size: 13px; }
+.flow span { padding: 4px 10px; border-radius: 6px; background: var(--panel); border: 1px solid var(--border); }
+.flow span.hot { border-color: var(--accent); color: var(--accent); }
+.flow i { color: var(--fg-muted); font-style: normal; }
+
+.timeline { margin: 16px 0; }
+.timeline svg { width: 100%; height: auto; display: block; }
+
+@media (max-width: 860px) {
+  .layout { display: block; }
+  nav.toc { position: static; height: auto; border-right: none; border-bottom: 1px solid var(--border); padding: 20px 16px; }
+  nav.toc ol { columns: 2; column-gap: 8px; }
+  main { padding: 24px 16px 80px; }
+  header.hero h1 { font-size: 26px; }
+}
+@media (max-width: 480px) { nav.toc ol { columns: 1; } }
+</style>
+</head>
+<body>
+<div class="layout">
+<nav class="toc" aria-label="目录">
+  <div class="brand">llmgen 性能指标实战</div>
+  <div class="sub">由浅入深 · 10 章 + 附录</div>
+  <ol>
+    <li><a href="#how"><span class="num">··</span>怎么读这份教程</a></li>
+    <li><a href="#ch0"><span class="num">00</span>测量基础</a></li>
+    <li><a href="#ch1"><span class="num">01</span>TTFT 与 E2E</a></li>
+    <li><a href="#ch2"><span class="num">02</span>TPOT / ITL 与分位数</a></li>
+    <li><a href="#ch3"><span class="num">03</span>吞吐 tokens/s</a></li>
+    <li><a href="#ch4"><span class="num">04</span>按阶段统计与时间拆解</a></li>
+    <li><a href="#ch5"><span class="num">05</span>MFU 与 MBU</a></li>
+    <li><a href="#ch6"><span class="num">06</span>算子级 Roofline</a></li>
+    <li><a href="#ch7"><span class="num">07</span>内存与 KV Cache</a></li>
+    <li><a href="#ch8"><span class="num">08</span>批处理与调度</a></li>
+    <li><a href="#ch9"><span class="num">09</span>报告与基准方法</a></li>
+    <li><a href="#appx"><span class="num">附</span>速查表与常见坑</a></li>
+  </ol>
+  <button class="theme-btn" id="themeBtn" type="button">切换深浅色</button>
+</nav>
+
+<main>
+<header class="hero">
+  <h1>给 llmgen 加上性能指标：从一个计时器到完整的性能报告</h1>
+  <p>按"先能测，再测准，再解释"的顺序，一步步把常见的推理性能指标加进 <code>src</code>。每一步都写清楚改哪个文件、改哪个函数、改动前后长什么样，以及调用方要跟着改什么。</p>
+  <p>第 0–4 章只涉及 <code>executor.zig</code> 和 <code>profiler/</code> 目录；第 5–7 章开始算硬件效率；第 8 章面向还在开发中的 <code>runner/</code> 连续批处理路径；第 9 章把结果变成可对比的报告。</p>
+</header>
+
+<!-- ============================================================ -->
+<section id="how">
+<h2><span class="chap">··</span>怎么读这份教程</h2>
+
+<h3>代码块的三种形式</h3>
+<ul>
+  <li><b>完整代码</b>：新文件或新函数，标签为"新增"，可以整段复制。</li>
+  <li><b>改动对比（diff）</b>：修改已有函数，标签为"修改"。<span class="kind new">+ 绿色行</span>是要加的，<span class="kind del">- 红色行</span>是要删的，没有标记的是上下文，用来帮你定位，<b>不要改</b>。复制按钮只会复制改完之后的代码（去掉红色行和 +/- 标记）。</li>
+  <li><b>运行输出</b>：终端里应该看到的内容，数字只是示意。</li>
+</ul>
+
+<h3>每章固定结构</h3>
+<p><b>目标 → 改动清单 → 原理 → 分步骤改动 → 本章结束时的完整代码（折叠） → 运行 → 预期输出 → 常见编译错误 → 检查点</b>。</p>
+
+<h3>目录约定</h3>
+<p>本教程把所有统计相关代码放在 <code>src/profiler/</code> 下：</p>
+<div class="tbl"><table>
+  <thead><tr><th>文件</th><th>职责</th><th>引入章节</th></tr></thead>
+  <tbody>
+    <tr><td><code>profiler/common.zig</code></td><td>单位换算、均值、分位数、每秒速率等纯函数</td><td>1（之后逐章补充）</td></tr>
+    <tr><td><code>profiler/metrics.zig</code></td><td><code>GenMetrics</code>：一次 generate 的请求级指标；以及 MFU/MBU、内存报告、JSON</td><td>1</td></tr>
+    <tr><td><code>profiler/profiler.zig</code></td><td><code>OpProfiler</code>：算子级耗时（原来的 <code>src/profiler.zig</code> 挪过来）</td><td>1 挪位置，4、6 扩展</td></tr>
+  </tbody>
+</table></div>
+
+<div class="callout warn"><b>命名冲突提醒</b><code>executor.zig</code> 里已经有 <code>const common = @import("backend/cpu/common.zig");</code>（用来读 bf16 元素）。所以在 <code>executor.zig</code> 里<b>不要</b>再把 <code>profiler/common.zig</code> 导入成 <code>common</code>。本教程的做法是：所有用到统计工具函数的打印逻辑都写在 <code>profiler/</code> 里面，<code>executor.zig</code> 只负责打点和调用。</div>
+
+<h3>构建与运行</h3>
+<div class="code" data-lang="sh" data-title="终端"><script type="text/plain">
+# 验证埋点逻辑(Debug, 编译快)
+LLMGEN_METRICS=1 zig build run
+
+# 真正测性能(数字以这个为准)
+LLMGEN_METRICS=1 zig build run -Doptimize=ReleaseFast
+
+# 同时打开算子级 profile
+LLMGEN_METRICS=1 LLMGEN_PROFILE=1 zig build run -Doptimize=ReleaseFast
+
+# 单元测试
+zig build test
+</script></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="ch0">
+<h2><span class="chap">00</span>测量基础<span class="level">入门</span></h2>
+<p>这一章不改代码。先搞清楚"怎么测才算数"：性能数字最怕的不是慢，而是<b>测错了却不知道</b>。</p>
+
+<h3>generate 的调用链</h3>
+<div class="flow">
+  <span>llmgen.run()</span><i>→</i>
+  <span class="hot">Executor.generate()</span><i>→</i>
+  <span>prefill(prompt) → forward()</span><i>→</i>
+  <span>循环: sample() → tokenizer.decode + print → decodeStep() → forward()</span>
+</div>
+<div class="flow">
+  <span>forward()</span><i>→</i>
+  <span>resolveDims</span><i>→</i>
+  <span>持久节点(只算一次)</span><i>→</i>
+  <span>step_nodes 逐个</span><i>→</i>
+  <span class="hot">executorTensor()</span><i>→</i>
+  <span>allocateOutput → dispatchKernel → (CUDA) sync</span>
+</div>
+
+<h3>改动前已有的基础设施</h3>
+<ul>
+  <li><code>generate()</code> 里有一个 <code>std.time.Timer</code>，叫 <code>total_timer</code>，用来算总耗时。</li>
+  <li><code>executorTensor()</code> 在 profile 开启时为每个算子计时，交给 <code>OpProfiler.record(op, device, ns)</code>。</li>
+  <li><code>OpProfiler</code> 由环境变量 <code>LLMGEN_PROFILE</code> 开启，关闭时连 Timer 都不启动。打印时把算子以外的时间归到"(其它)"。</li>
+  <li>CUDA 设备上每个算子执行完都会调用 <code>CudaContext.sync()</code>。</li>
+</ul>
+
+<h3>五条测量原则</h3>
+<ol>
+  <li><b>用单调时钟。</b><code>std.time.Timer</code> 基于单调时钟，三个方法的区别见下面的示意。</li>
+  <li><b>用 ReleaseFast 测性能。</b>Debug 构建带安全检查、不做优化，数字可能慢 10 倍以上，只能用来验证埋点逻辑。</li>
+  <li><b>区分冷启动和稳态。</b>第一次 <code>forward()</code> 会计算持久节点（<code>persistent_computed</code>），还有 CUDA 上下文初始化、kernel 首次加载、页缺失等开销。</li>
+  <li><b>GPU 计时必须同步。</b>kernel 发射是异步的。计时区间里没有 sync 的话，量到的只是"提交"的时间。</li>
+  <li><b>别让测量污染结果。</b><code>generate()</code> 里每个 token 都会 <code>tokenizer.decode</code> 再 <code>std.debug.print</code>（stderr 无缓冲），这部分会被算进 TPOT，第 4 章会把它单独拆出来。</li>
+</ol>
+
+<div class="code" data-lang="zig" data-title="Timer 三个方法的区别（后面会反复用到）"><script type="text/plain">
+var t = try std.time.Timer.start(); // 起点 = 现在
+// ... 做 A, 耗时 3ms ...
+const a = t.lap();  // a = 3ms, 起点移到现在
+// ... 做 B, 耗时 5ms ...
+const b = t.read(); // b = 5ms, 起点不动
+// ... 做 C, 耗时 2ms ...
+const c = t.lap();  // c = 7ms(B + C), 起点移到现在
+t.reset();          // 起点移到现在, 不返回值
+</script></div>
+
+<div class="callout check"><b>检查点</b>
+<ul>
+  <li>能说清 <code>read()</code>、<code>lap()</code>、<code>reset()</code> 的区别。</li>
+  <li>运行一次 <code>LLMGEN_PROFILE=1 zig build run</code>，能读懂算子耗时表和"(其它)"那一行。</li>
+</ul></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="ch1">
+<h2><span class="chap">01</span>第一个指标：TTFT 与 E2E<span class="level">入门</span></h2>
+<dl class="goal">
+  <dt>目标</dt><dd>整理出 <code>profiler/</code> 目录，新建 <code>GenMetrics</code>，在 <code>generate()</code> 里测出首 token 延迟（TTFT）、prefill 耗时和端到端延迟（E2E）。</dd>
+  <dt>开关</dt><dd>新增环境变量 <code>LLMGEN_METRICS</code>。</dd>
+</dl>
+
+<h3>改动清单</h3>
+<div class="tbl"><table>
+  <thead><tr><th>文件</th><th>位置</th><th>类型</th><th>内容</th></tr></thead>
+  <tbody>
+    <tr><td><code>profiler.zig</code> → <code>profiler/profiler.zig</code></td><td>整个文件</td><td><span class="kind mod">移动</span></td><td>挪进 profiler 目录，修正 import 路径，<code>initFromEnv</code> 改名为 <code>init</code></td></tr>
+    <tr><td><code>profiler/common.zig</code></td><td>新文件</td><td><span class="kind new">新增</span></td><td><code>nsToMs</code></td></tr>
+    <tr><td><code>profiler/metrics.zig</code></td><td>新文件</td><td><span class="kind new">新增</span></td><td><code>GenMetrics</code> 第一版</td></tr>
+    <tr><td><code>executor.zig</code></td><td>import、<code>Executor</code> 字段、<code>init()</code>、<code>generate()</code></td><td><span class="kind mod">修改</span></td><td>持有 <code>metrics</code>，三处打点</td></tr>
+    <tr><td><code>llmgen.zig</code></td><td><code>test {}</code> 块</td><td><span class="kind mod">修改</span></td><td>更新 profiler 的 import 路径</td></tr>
+  </tbody>
+</table></div>
+
+<h3>原理</h3>
+<p>一次 <code>generate()</code> 的时间线如下。TTFT 是"用户看到第一个字"的时刻，所以<b>包含 prefill 和第一次 sample</b>，不只是 prefill。</p>
+<div class="timeline" role="img" aria-label="generate 时间线：prefill、首 token、若干 decode 步、结束">
+<svg viewBox="0 0 760 120" xmlns="http://www.w3.org/2000/svg" font-size="12" font-family="sans-serif">
+  <line x1="20" y1="60" x2="740" y2="60" stroke="var(--border)" stroke-width="2"/>
+  <rect x="20" y="44" width="220" height="32" rx="4" fill="var(--accent-soft)" stroke="var(--accent)"/>
+  <text x="130" y="64" text-anchor="middle" fill="var(--accent)">prefill (P 个 token)</text>
+  <rect x="240" y="44" width="24" height="32" fill="var(--bg-soft)" stroke="var(--border)"/>
+  <text x="252" y="38" text-anchor="middle" fill="var(--fg-muted)">sample</text>
+  <g fill="var(--panel)" stroke="var(--border)">
+    <rect x="270" y="44" width="80" height="32" rx="3"/><rect x="356" y="44" width="80" height="32" rx="3"/>
+    <rect x="442" y="44" width="80" height="32" rx="3"/><rect x="528" y="44" width="80" height="32" rx="3"/>
+    <rect x="614" y="44" width="80" height="32" rx="3"/>
+  </g>
+  <g fill="var(--fg-muted)" text-anchor="middle">
+    <text x="310" y="64">decode</text><text x="396" y="64">decode</text><text x="482" y="64">decode</text><text x="568" y="64">decode</text><text x="654" y="64">decode</text>
+  </g>
+  <line x1="264" y1="20" x2="264" y2="100" stroke="var(--accent)" stroke-dasharray="3 3"/>
+  <text x="264" y="14" text-anchor="middle" fill="var(--accent)">首 token</text>
+  <line x1="20" y1="94" x2="264" y2="94" stroke="var(--fg)"/>
+  <text x="142" y="112" text-anchor="middle" fill="var(--fg)">TTFT</text>
+  <line x1="356" y1="94" x2="442" y2="94" stroke="var(--fg)"/>
+  <text x="399" y="112" text-anchor="middle" fill="var(--fg)">ITL</text>
+  <line x1="700" y1="20" x2="700" y2="100" stroke="var(--fg-muted)" stroke-dasharray="3 3"/>
+  <text x="700" y="14" text-anchor="middle" fill="var(--fg-muted)">结束 (E2E)</text>
+</svg>
+</div>
+<div class="formula">prefill = t(prefill 返回)          − t(generate 开始)
+TTFT    = t(第一次 sample 返回)    − t(generate 开始)
+E2E     = t(generate 准备 return) − t(generate 开始)</div>
+
+<h3><span class="step">1</span>把 profiler.zig 挪进 profiler/ 目录</h3>
+<div class="code" data-lang="sh" data-title="终端（在仓库根目录）"><script type="text/plain">
+mkdir -p src/profiler
+git mv src/profiler.zig src/profiler/profiler.zig
+</script></div>
+<p>挪完之后有四处要跟着改：</p>
+<div class="code" data-lang="diff" data-title="profiler/profiler.zig · 文件开头" data-kind="修改"><script type="text/plain">
+ const std = @import("std");
+-const types = @import("types.zig");
++
++const types = @import("../types.zig");
++
++const common = @import("common.zig");
+</script></div>
+<div class="code" data-lang="diff" data-title="profiler/profiler.zig · init 改名，删掉调试打印" data-kind="修改"><script type="text/plain">
+     /// LLMGEN_PROFILE 设了就开启; 关闭时 executor 连 Timer 都不启动, 零开销
+-    pub fn initFromEnv() Self {
++    pub fn init() Self {
+         const profile_env = std.posix.getenv("LLMGEN_PROFILE");
+-        std.debug.print("profile env = {any}\n", .{profile_env});
+         return .{
+             .enabled = (profile_env != null),
+         };
+     }
+</script></div>
+<p><code>print()</code> 里所有 <code>nsToMs(...)</code> 改成 <code>common.nsToMs(...)</code>，然后删掉文件末尾的私有函数：</p>
+<div class="code" data-lang="diff" data-title="profiler/profiler.zig · OpProfiler 结构体末尾" data-kind="修改"><script type="text/plain">
+-
+-    fn nsToMs(ns: u64) f64 {
+-        return @as(f64, @floatFromInt(ns)) / 1e6;
+-    }
+ };
+</script></div>
+<div class="code" data-lang="diff" data-title="executor.zig · import" data-kind="修改"><script type="text/plain">
+ const ops = @import("ops.zig");
+-const OpProfiler = @import("profiler.zig").OpProfiler;
++
++const OpProfiler = @import("profiler/profiler.zig").OpProfiler;
++const GenMetrics = @import("profiler/metrics.zig").GenMetrics;
+</script></div>
+<div class="code" data-lang="diff" data-title="llmgen.zig · test 块" data-kind="修改"><script type="text/plain">
+     _ = @import("module/norm.zig");
+-    _ = @import("profiler.zig");
++    _ = @import("profiler/profiler.zig");
+     _ = @import("sampling.zig");
+</script></div>
+
+<h3><span class="step">2</span>新建 profiler/common.zig</h3>
+<div class="code" data-lang="zig" data-title="src/profiler/common.zig" data-kind="新增"><script type="text/plain">
+const std = @import("std");
+
+// ns -> ms
+pub fn nsToMs(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1e6;
+}
+</script></div>
+
+<h3><span class="step">3</span>新建 profiler/metrics.zig（第一版）</h3>
+<p>写法照着 <code>OpProfiler</code>：用环境变量开关，内部只存 ns，打印时再换算单位。两个细节一开始就定好，后面几章就不用回头改了：</p>
+<ul>
+  <li><code>reset()</code> <b>逐个字段清零</b>，不要写成 <code>self.* = .{ .enabled = self.enabled }</code>。第 2 章会加一个 <code>ArrayList</code> 字段，整体赋值会把它的内存弄丢，<code>DebugAllocator</code> 会报泄漏。</li>
+  <li><code>print()</code> 的接收者用 <code>*Self</code>，因为第 2 章要在里面原地排序。</li>
+</ul>
+<div class="code" data-lang="zig" data-title="src/profiler/metrics.zig" data-kind="新增"><script type="text/plain">
+const std = @import("std");
+
+const common = @import("common.zig");
+
+// TTFT = t(第一次 sample 返回) − t(generate 开始)
+// E2E  = t(generate 返回) − t(generate 开始)
+
+pub const GenMetrics = struct {
+    enabled: bool = false,
+    prompt_tokens_len: usize = 0, // prefill 的 token 数
+    gen_tokens_len: usize = 0, // 生成的 token 数(不含 eos)
+
+    prefill_ns: u64 = 0, // prefill 耗时
+    ttft_ns: u64 = 0, // 首 token 延迟
+    e2e_ns: u64 = 0, // 端到端耗时
+
+    const Self = @This();
+
+    /// LLMGEN_METRICS 设了就开启
+    pub fn init() Self {
+        return .{
+            .enabled = (std.posix.getenv("LLMGEN_METRICS") != null),
+        };
+    }
+
+    /// 每次 generate 开始时调用, enabled 保持不变
+    pub fn reset(self: *Self) void {
+        self.prompt_tokens_len = 0;
+        self.gen_tokens_len = 0;
+
+        self.prefill_ns = 0;
+        self.ttft_ns = 0;
+        self.e2e_ns = 0;
+    }
+
+    pub fn print(self: *Self) void {
+        std.debug.print("\n=== 生成指标 ===\n", .{});
+        std.debug.print("prompt tokens len : {d}\n", .{self.prompt_tokens_len});
+        std.debug.print("gen tokens len    : {d}\n", .{self.gen_tokens_len});
+        std.debug.print("prefill           : {d:.2} ms\n", .{common.nsToMs(self.prefill_ns)});
+        std.debug.print("TTFT              : {d:.2} ms\n", .{common.nsToMs(self.ttft_ns)});
+        std.debug.print("E2E               : {d:.2} ms\n", .{common.nsToMs(self.e2e_ns)});
+    }
+};
+</script></div>
+
+<h3><span class="step">4</span>Executor 持有 metrics</h3>
+<div class="code" data-lang="diff" data-title="executor.zig · Executor 结构体字段" data-kind="修改"><script type="text/plain">
+     prng: std.Random.DefaultPrng,
+
+     profiler: OpProfiler,
++    metrics: GenMetrics,
+
+     const Self = @This();
+</script></div>
+<div class="code" data-lang="diff" data-title="executor.zig · init() 里构造 self 的地方" data-kind="修改"><script type="text/plain">
+             .prng = std.Random.DefaultPrng.init(graph_scheduler.config.seed),
+-            .profiler = OpProfiler.initFromEnv(),
++            .profiler = OpProfiler.init(),
++            .metrics = GenMetrics.init(),
+         };
+         errdefer self.deinit();
+</script></div>
+
+<h3><span class="step">5</span>在 generate() 里打三个点</h3>
+<p>复用已有的 <code>total_timer</code>，只用 <code>read()</code>，不重置它。顺便删掉 prefill 前后两行调试打印，它们会混在报告中间，干扰阅读。</p>
+<div class="code" data-lang="diff" data-title="executor.zig · generate() 开头到 prefill" data-kind="修改"><script type="text/plain">
+         self.memory_manager.resetKVCache();
+         self.seq_pos = 0;
+
+-        self.profiler.reset();
+         var total_timer = try std.time.Timer.start();
++
++        // op profiler
++        self.profiler.reset();
+         defer if (self.profiler.enabled) self.profiler.print(total_timer.read()); // generate 完成后统计
+
+-        std.debug.print("before prefill\n", .{});
++        // metrics
++        self.metrics.reset();
++        self.metrics.prompt_tokens_len = prompt.len;
++
+         try self.prefill(prompt);
+-        std.debug.print("prefill ok\n", .{});
++        self.metrics.prefill_ns = total_timer.read(); // ① prefill 结束
+</script></div>
+<div class="code" data-lang="diff" data-title="executor.zig · generate() 循环" data-kind="修改"><script type="text/plain">
+         while (idx < max_tokens) : (idx += 1) {
+             const next = try self.sample();
++            if (idx == 0) self.metrics.ttft_ns = total_timer.read(); // ② 首 token(第 2 章会换成 onGenToken)
++
+             if (next == eos) break;
+
+             try output.append(self.allocator, next);
++            self.metrics.gen_tokens_len += 1;
++
+             if (tokenizer) |tk| {
+</script></div>
+<div class="code" data-lang="diff" data-title="executor.zig · generate() 结尾" data-kind="修改"><script type="text/plain">
+             }
+         }
+
++        self.metrics.e2e_ns = total_timer.read(); // ③ 结束
++        if (self.metrics.enabled) {
++            self.metrics.print();
++        }
++
+         return self.allocator.dupe(i32, output.items[prompt.len..]);
+     }
+</script></div>
+
+<div class="callout tip"><b>为什么 E2E 不写在 defer 里</b><code>defer</code> 在 <code>return</code> 表达式求值<b>之后</b>才执行，<code>dupe</code> 的耗时会被算进去；而且某个 <code>try</code> 出错时，也会打印一份不完整的报告。显式写在 return 前面更清楚。</div>
+
+<h3>运行与预期输出</h3>
+<div class="code" data-lang="text" data-title="LLMGEN_METRICS=1 zig build run 的 stderr（示意）"><script type="text/plain">
+=== 生成指标 ===
+prompt tokens len : 17
+gen tokens len    : 7
+prefill           : 406.96 ms
+TTFT              : 411.22 ms
+E2E               : 838.08 ms
+</script></div>
+
+<div class="callout err"><b>常见编译错误</b>
+<ul>
+  <li><code>unable to load 'src/profiler/types.zig'</code>：<code>profiler/profiler.zig</code> 里的 import 没改成 <code>../types.zig</code>。</li>
+  <li><code>no field or member function named 'initFromEnv'</code>：<code>executor.zig</code> 的 <code>init()</code> 里还在调用旧名字。</li>
+  <li><code>use of undeclared identifier 'nsToMs'</code>：<code>print()</code> 里还有没改成 <code>common.nsToMs</code> 的调用。</li>
+  <li><code>zig build test</code> 找不到 profiler：<code>llmgen.zig</code> 的 test 块路径没改。</li>
+</ul></div>
+
+<div class="callout check"><b>检查点</b>
+<ul>
+  <li>设了 <code>LLMGEN_METRICS=1</code> 才打印报告，不设时没有多余输出。</li>
+  <li>TTFT ≥ prefill，两者只差一次 <code>sample()</code>（对 15 万词表做 softmax + top-p，通常是几毫秒）。</li>
+  <li>换一个更长的 prompt，prefill 明显变长。</li>
+</ul></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="ch2">
+<h2><span class="chap">02</span>TPOT / ITL 与分位数<span class="level">入门</span></h2>
+<dl class="goal">
+  <dt>目标</dt><dd>记录每两个相邻 token 之间的间隔（ITL），算出 TPOT 和 P50/P90/P99；同时去掉生成结束时一次多余的 forward。</dd>
+</dl>
+
+<h3>改动清单</h3>
+<div class="tbl"><table>
+  <thead><tr><th>文件</th><th>位置</th><th>类型</th><th>内容</th></tr></thead>
+  <tbody>
+    <tr><td><code>profiler/common.zig</code></td><td>文件末尾</td><td><span class="kind new">新增</span></td><td><code>percentile</code>、<code>mean</code></td></tr>
+    <tr><td><code>profiler/metrics.zig</code></td><td>字段、<code>deinit</code>、<code>reset</code>、<code>onGenToken</code>、<code>tpotNs</code>、<code>decodeNs</code>、<code>print</code></td><td><span class="kind mod">修改</span></td><td>记录和输出 ITL</td></tr>
+    <tr><td><code>executor.zig</code></td><td><code>deinit()</code></td><td><span class="kind mod">修改</span></td><td>释放 <code>itl_ns</code></td></tr>
+    <tr><td><code>executor.zig</code></td><td><code>generate()</code> 循环</td><td><span class="kind mod">修改</span></td><td><code>idx == 0</code> 换成 <code>onGenToken</code>；最后一个 token 后直接退出</td></tr>
+  </tbody>
+</table></div>
+
+<h3>原理</h3>
+<div class="formula">ITL[i] = t(第 i 个 token 产出) − t(第 i−1 个 token 产出)       i ≥ 1
+TPOT   = (t_last − TTFT) / len(ITL)                      = mean(ITL)
+         t_last = 最后一个 token(含 eos)的产出时刻</div>
+<p>TPOT 是均值，ITL 是分布。均值会掩盖抖动：99 步各 20 ms，偶尔一步 500 ms，均值只变成 24.8 ms，但 P99 和 max 会把它暴露出来。另外，decode 的 ITL 会<b>随上下文变长而缓慢增加</b>，因为注意力要读的 KV 越来越多，所以"前 10% 均值 vs 后 10% 均值"也很有参考价值。</p>
+
+<div class="callout warn"><b>为什么 TPOT 不用 (E2E − TTFT) / (gen_tokens − 1)</b>E2E 的尾部可能包含不产出 token 的工作：
+<ul>
+  <li><b>以 eos 结束</b>：eos 那一步的采样时间算进了分子，但 eos 不计入 <code>gen_tokens_len</code>，分母少 1。</li>
+  <li><b>以 max_tokens 结束</b>：最后一个 token 产出后，循环还会再调一次 <code>decodeStep</code>，这次 forward 的结果没人用（步骤 6 会把它去掉）。</li>
+</ul>
+用最后一次产出的时刻 <code>last_emit_ns</code> 做终点，TPOT 就严格等于 ITL 的均值。</div>
+
+<h3><span class="step">1</span>common.zig 加两个统计函数</h3>
+<div class="code" data-lang="zig" data-title="profiler/common.zig · 追加到文件末尾" data-kind="新增"><script type="text/plain">
+/// 最近秩法求分位数, sorted 必须已升序, p 取 0~100
+pub fn percentile(sorted: []const u64, p: f64) u64 {
+    if (sorted.len == 0) return 0;
+    const rank = p / 100.0 * @as(f64, @floatFromInt(sorted.len - 1));
+    return sorted[@intFromFloat(@round(rank))];
+}
+
+pub fn mean(xs: []const u64) u64 {
+    if (xs.len == 0) return 0;
+    var sum: u64 = 0;
+    for (xs) |x| sum += x;
+    return sum / xs.len;
+}
+</script></div>
+
+<h3><span class="step">2</span>metrics.zig：字段、deinit、reset</h3>
+<div class="code" data-lang="diff" data-title="profiler/metrics.zig · GenMetrics 字段" data-kind="修改"><script type="text/plain">
+     prefill_ns: u64 = 0, // prefill 耗时
+     ttft_ns: u64 = 0, // 首 token 延迟
+     e2e_ns: u64 = 0, // 端到端耗时
++
++    last_emit_ns: u64 = 0, // 上一个 token 的产出时刻
++    itl_ns: std.ArrayList(u64) = .empty, // 每两个相邻 token 的间隔
+</script></div>
+<div class="code" data-lang="diff" data-title="profiler/metrics.zig · 新增 deinit，reset 补两行" data-kind="修改"><script type="text/plain">
+     pub fn init() Self {
+         return .{
+             .enabled = (std.posix.getenv("LLMGEN_METRICS") != null),
+         };
+     }
++
++    pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
++        self.itl_ns.deinit(allocator);
++    }
+
+     pub fn reset(self: *Self) void {
+         self.prompt_tokens_len = 0;
+         self.gen_tokens_len = 0;
+
+         self.prefill_ns = 0;
+         self.ttft_ns = 0;
+         self.e2e_ns = 0;
++
++        self.last_emit_ns = 0;
++        self.itl_ns.clearRetainingCapacity(); // 保留容量, 下次 generate 不用重新分配
+     }
+</script></div>
+
+<h3><span class="step">3</span>metrics.zig：onGenToken、tpotNs、decodeNs</h3>
+<p>把这三个函数放在 <code>reset()</code> 和 <code>print()</code> 之间。<code>onGenToken</code> 在第一个 token 时记 TTFT，之后每个 token 记一次 ITL，所以 executor 里<b>不用再单独写 TTFT</b>。</p>
+<div class="code" data-lang="zig" data-title="profiler/metrics.zig · 新增三个方法" data-kind="新增"><script type="text/plain">
+    /// 每产出一个 token(含 eos)调用一次, now_ns 是从 generate 开始到现在的时间
+    pub fn onGenToken(self: *Self, allocator: std.mem.Allocator, now_ns: u64) !void {
+        if (self.ttft_ns == 0) {
+            self.ttft_ns = now_ns; // 第一个 token: TTFT
+        } else {
+            try self.itl_ns.append(allocator, now_ns - self.last_emit_ns);
+        }
+        self.last_emit_ns = now_ns;
+    }
+
+    /// 首 token 到最后一个 token 的平均间隔 = mean(ITL)
+    pub fn tpotNs(self: *const Self) u64 {
+        const n = self.itl_ns.items.len;
+        if (n == 0) return 0;
+        return self.decodeNs() / n;
+    }
+
+    /// decode 阶段耗时: 首 token 到最后一个 token
+    pub fn decodeNs(self: *const Self) u64 {
+        return self.last_emit_ns - self.ttft_ns;
+    }
+</script></div>
+
+<h3><span class="step">4</span>metrics.zig：print 输出 ITL</h3>
+<p>排序会打乱原始顺序，所以<b>先</b>算前段和后段的均值，<b>再</b>排序求分位数。ITL 为空（只生成了 0~1 个 token）时跳过这一段。</p>
+<div class="code" data-lang="diff" data-title="profiler/metrics.zig · print() 末尾" data-kind="修改"><script type="text/plain">
+         std.debug.print("E2E               : {d:.2} ms\n", .{common.nsToMs(self.e2e_ns)});
++
++        const itl = self.itl_ns.items;
++        if (itl.len > 0) {
++            const k = @max(itl.len / 10, 1);
++            std.debug.print("TPOT              : {d:.2} ms\n", .{common.nsToMs(self.tpotNs())});
++            std.debug.print("ITL 前10%均值     : {d:.2} ms\n", .{common.nsToMs(common.mean(itl[0..k]))});
++            std.debug.print("ITL 后10%均值     : {d:.2} ms\n", .{common.nsToMs(common.mean(itl[itl.len - k ..]))});
++
++            std.mem.sort(u64, itl, {}, std.sort.asc(u64)); // 先排序再求分位数
++            std.debug.print("ITL P50/P90/P99/max : {d:.2} / {d:.2} / {d:.2} / {d:.2} ms\n", .{
++                common.nsToMs(common.percentile(itl, 50)),
++                common.nsToMs(common.percentile(itl, 90)),
++                common.nsToMs(common.percentile(itl, 99)),
++                common.nsToMs(itl[itl.len - 1]),
++            });
++        }
+     }
+</script></div>
+
+<h3><span class="step">5</span>executor.zig：释放内存</h3>
+<div class="code" data-lang="diff" data-title="executor.zig · deinit()" data-kind="修改"><script type="text/plain">
+         self.persistent_cursor.deinit(self.allocator);
+         self.apply_rope_tensors.deinit(self.allocator);
++        self.metrics.deinit(self.allocator);
+     }
+</script></div>
+
+<h3><span class="step">6</span>executor.zig：循环里换成 onGenToken，并去掉多余的 forward</h3>
+<div class="code" data-lang="diff" data-title="executor.zig · generate() 循环" data-kind="修改"><script type="text/plain">
+         while (idx < max_tokens) : (idx += 1) {
+             const next = try self.sample();
+-            if (idx == 0) self.metrics.ttft_ns = total_timer.read(); // ② 首 token(第 2 章会换成 onGenToken)
++
++            // 第一个 token 时顺带记下 TTFT, 之后每个 token 记一次 ITL
++            if (self.metrics.enabled) {
++                try self.metrics.onGenToken(self.allocator, total_timer.read());
++            }
+
+             if (next == eos) break;
+
+             try output.append(self.allocator, next);
+             self.metrics.gen_tokens_len += 1;
+
+             if (tokenizer) |tk| {
+                 const s = try tk.decode(&[_]i32{next});
+                 defer self.allocator.free(s);
+                 std.debug.print("{s}", .{s});
+             }
+
+             if (output.items.len >= self.max_seq) {
+                 break;
+             }
+
++            // 最后一个 token 已产出, 再 forward 一次也不会被 sample, 直接结束
++            if (idx + 1 == max_tokens) {
++                break;
++            }
++
+             if (self.use_kv_cache) {
+                 try self.decodeStep(next);
+             } else {
+                 try self.decodeStepTokens(output.items);
+             }
+         }
+</script></div>
+<div class="callout warn"><b>不要两处都写 TTFT</b>如果保留 <code>if (idx == 0) ttft_ns = ...</code>，它会用一个稍晚的时间覆盖 <code>onGenToken</code> 记下的值，导致 <code>ttft_ns</code> 和 <code>last_emit_ns</code> 对不上，第一个 ITL 也会偏一点。</div>
+
+<h3>运行与预期输出</h3>
+<div class="code" data-lang="text" data-title="stderr（示意）"><script type="text/plain">
+=== 生成指标 ===
+prompt tokens len : 21
+gen tokens len    : 455
+prefill           : 420.69 ms
+TTFT              : 426.08 ms
+E2E               : 31784.59 ms
+TPOT              : 68.91 ms
+ITL 前10%均值     : 64.41 ms
+ITL 后10%均值     : 74.72 ms
+ITL P50/P90/P99/max : 68.55 / 74.21 / 76.07 / 83.57 ms
+</script></div>
+
+<div class="callout err"><b>常见编译错误 / 运行问题</b>
+<ul>
+  <li>程序退出时 <code>DebugAllocator</code> 报 leak：<code>Executor.deinit()</code> 没调用 <code>metrics.deinit</code>，或者 <code>reset()</code> 用了整体赋值。</li>
+  <li><code>expected type '*GenMetrics', found '*const GenMetrics'</code>：<code>print</code> 的接收者写成了 <code>*const Self</code>，又在里面排序。</li>
+  <li>TPOT 打印不出来：<code>LLMGEN_METRICS</code> 没设，<code>onGenToken</code> 没被调用，<code>itl_ns</code> 是空的。</li>
+</ul></div>
+
+<div class="callout check"><b>检查点</b>
+<ul>
+  <li><code>itl_ns.items.len</code> = sample 次数 − 1。以 eos 结束时等于 <code>gen_tokens_len</code>，以 max_tokens 结束时等于 <code>gen_tokens_len − 1</code>。</li>
+  <li>TPOT 和 ITL 均值完全相等（只差整数除法的舍入）。</li>
+  <li>生成上千个 token 时，"后 10% 均值"明显大于"前 10% 均值"，这就是 KV 变长的代价。</li>
+</ul></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="ch3">
+<h2><span class="chap">03</span>吞吐 tokens/s<span class="level">入门</span></h2>
+<dl class="goal">
+  <dt>目标</dt><dd>输出 prefill 吞吐、decode 吞吐和总吞吐，并理解为什么这两个阶段的吞吐会差几十倍。</dd>
+</dl>
+
+<h3>改动清单</h3>
+<div class="tbl"><table>
+  <thead><tr><th>文件</th><th>位置</th><th>类型</th><th>内容</th></tr></thead>
+  <tbody>
+    <tr><td><code>profiler/common.zig</code></td><td>文件末尾</td><td><span class="kind new">新增</span></td><td><code>perSec</code></td></tr>
+    <tr><td><code>profiler/metrics.zig</code></td><td><code>print()</code> 末尾</td><td><span class="kind mod">修改</span></td><td>三行吞吐</td></tr>
+  </tbody>
+</table></div>
+<p class="note">不需要新的打点，全部用前两章已经记下的数据计算。</p>
+
+<h3>原理</h3>
+<div class="formula">prefill 吞吐 = prompt_tokens / prefill_s
+decode  吞吐 = len(ITL) / (t_last − TTFT)_s        = 1 / TPOT
+总吞吐       = (prompt_tokens + gen_tokens) / E2E_s</div>
+<p>prefill 一次 forward 处理 P 个 token，权重只读一遍，能把算力用满（<b>计算密集</b>）。decode 每次 forward 只处理 1 个 token，却仍要把约 1.2 GB 的权重整个读一遍（<b>访存密集</b>）。所以单序列下，prefill 吞吐通常是 decode 的几十倍。如果你测出来只差几倍，说明 prefill 的矩阵乘没有发挥批量计算的优势，第 6 章可以确认这一点。</p>
+
+<h3><span class="step">1</span>common.zig 加 perSec</h3>
+<div class="code" data-lang="zig" data-title="profiler/common.zig · 追加到文件末尾" data-kind="新增"><script type="text/plain">
+/// count 个事件用了 ns 纳秒, 换算成每秒多少个
+pub fn perSec(count: usize, ns: u64) f64 {
+    if (ns == 0) return 0;
+    return @as(f64, @floatFromInt(count)) / (@as(f64, @floatFromInt(ns)) / 1e9);
+}
+</script></div>
+
+<h3><span class="step">2</span>print 末尾输出三种吞吐</h3>
+<p>注意吞吐要写在 <code>if (itl.len &gt; 0) { ... }</code> 块的<b>外面</b>，否则只生成一个 token 时连 prefill 吞吐也看不到。</p>
+<div class="code" data-lang="diff" data-title="profiler/metrics.zig · print() 末尾" data-kind="修改"><script type="text/plain">
+                 common.nsToMs(itl[itl.len - 1]),
+             });
+         }
++
++        std.debug.print("prefill 吞吐      : {d:.1} tok/s\n", .{common.perSec(self.prompt_tokens_len, self.prefill_ns)});
++        if (itl.len > 0) {
++            std.debug.print("decode  吞吐      : {d:.1} tok/s\n", .{common.perSec(itl.len, self.decodeNs())});
++        }
++        std.debug.print("总吞吐            : {d:.1} tok/s\n", .{common.perSec(self.prompt_tokens_len + self.gen_tokens_len, self.e2e_ns)});
+     }
+</script></div>
+
+<details class="full"><summary>第 3 章结束时 profiler/metrics.zig 的完整代码</summary><div class="inner">
+<div class="code" data-lang="zig" data-title="src/profiler/metrics.zig（第 1–3 章）"><script type="text/plain">
+const std = @import("std");
+
+const common = @import("common.zig");
+
+// TTFT = t(第一次 sample 返回) − t(generate 开始)
+// E2E  = t(generate 返回) − t(generate 开始)
+// ITL[i] = t(第 i 个 token 产出) − t(第 i−1 个 token 产出)       i ≥ 1
+// TPOT   = (t_last − TTFT) / len(ITL) = mean(ITL)
+// prefill 吞吐 = prompt_tokens / prefill_s
+// decode  吞吐 = len(ITL) / (t_last − TTFT)_s = 1 / TPOT
+// 总吞吐       = (prompt_tokens + gen_tokens) / E2E_s
+
+pub const GenMetrics = struct {
+    enabled: bool = false,
+    prompt_tokens_len: usize = 0, // prefill 的 token 数
+    gen_tokens_len: usize = 0, // 生成的 token 数(不含 eos)
+
+    prefill_ns: u64 = 0, // prefill 耗时
+    ttft_ns: u64 = 0, // 首 token 延迟
+    e2e_ns: u64 = 0, // 端到端耗时
+
+    last_emit_ns: u64 = 0, // 上一个 token 的产出时刻
+    itl_ns: std.ArrayList(u64) = .empty, // 每两个相邻 token 的间隔
+
+    const Self = @This();
+
+    pub fn init() Self {
+        return .{
+            .enabled = (std.posix.getenv("LLMGEN_METRICS") != null),
+        };
+    }
+
+    pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+        self.itl_ns.deinit(allocator);
+    }
+
+    pub fn reset(self: *Self) void {
+        self.prompt_tokens_len = 0;
+        self.gen_tokens_len = 0;
+
+        self.prefill_ns = 0;
+        self.ttft_ns = 0;
+        self.e2e_ns = 0;
+
+        self.last_emit_ns = 0;
+        self.itl_ns.clearRetainingCapacity();
+    }
+
+    pub fn onGenToken(self: *Self, allocator: std.mem.Allocator, now_ns: u64) !void {
+        if (self.ttft_ns == 0) {
+            self.ttft_ns = now_ns;
+        } else {
+            try self.itl_ns.append(allocator, now_ns - self.last_emit_ns);
+        }
+        self.last_emit_ns = now_ns;
+    }
+
+    pub fn tpotNs(self: *const Self) u64 {
+        const n = self.itl_ns.items.len;
+        if (n == 0) return 0;
+        return self.decodeNs() / n;
+    }
+
+    pub fn decodeNs(self: *const Self) u64 {
+        return self.last_emit_ns - self.ttft_ns;
+    }
+
+    pub fn print(self: *Self) void {
+        std.debug.print("\n=== 生成指标 ===\n", .{});
+        std.debug.print("prompt tokens len : {d}\n", .{self.prompt_tokens_len});
+        std.debug.print("gen tokens len    : {d}\n", .{self.gen_tokens_len});
+        std.debug.print("prefill           : {d:.2} ms\n", .{common.nsToMs(self.prefill_ns)});
+        std.debug.print("TTFT              : {d:.2} ms\n", .{common.nsToMs(self.ttft_ns)});
+        std.debug.print("E2E               : {d:.2} ms\n", .{common.nsToMs(self.e2e_ns)});
+
+        const itl = self.itl_ns.items;
+        if (itl.len > 0) {
+            const k = @max(itl.len / 10, 1);
+            std.debug.print("TPOT              : {d:.2} ms\n", .{common.nsToMs(self.tpotNs())});
+            std.debug.print("ITL 前10%均值     : {d:.2} ms\n", .{common.nsToMs(common.mean(itl[0..k]))});
+            std.debug.print("ITL 后10%均值     : {d:.2} ms\n", .{common.nsToMs(common.mean(itl[itl.len - k ..]))});
+
+            std.mem.sort(u64, itl, {}, std.sort.asc(u64));
+            std.debug.print("ITL P50/P90/P99/max : {d:.2} / {d:.2} / {d:.2} / {d:.2} ms\n", .{
+                common.nsToMs(common.percentile(itl, 50)),
+                common.nsToMs(common.percentile(itl, 90)),
+                common.nsToMs(common.percentile(itl, 99)),
+                common.nsToMs(itl[itl.len - 1]),
+            });
+        }
+
+        std.debug.print("prefill 吞吐      : {d:.1} tok/s\n", .{common.perSec(self.prompt_tokens_len, self.prefill_ns)});
+        if (itl.len > 0) {
+            std.debug.print("decode  吞吐      : {d:.1} tok/s\n", .{common.perSec(itl.len, self.decodeNs())});
+        }
+        std.debug.print("总吞吐            : {d:.1} tok/s\n", .{common.perSec(self.prompt_tokens_len + self.gen_tokens_len, self.e2e_ns)});
+    }
+};
+</script></div>
+</div></details>
+
+<div class="callout warn"><b>小心短 prompt</b>默认 prompt 套上 chat template 后只有二十几个 token，prefill 吞吐会被固定开销（持久节点首次计算、embedding、lm_head）拉低。测 prefill 吞吐时，准备 256 / 512 / 1024 token 的 prompt 各测一次，画出"prompt 长度 → prefill tok/s"曲线。</div>
+<div class="callout tip"><b>报吞吐时只开 LLMGEN_METRICS</b><code>LLMGEN_PROFILE</code> 会为每个算子多启动一次 Timer，本身就有开销。找瓶颈时再打开它。</div>
+
+<div class="callout check"><b>检查点</b>
+<ul>
+  <li>decode 吞吐 × TPOT（秒）≈ 1。</li>
+  <li>prompt 越长，prefill 吞吐越高，直到某个长度后趋于平稳，或者因为 attention 的 O(P²) 开始下降。</li>
+</ul></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="ch4">
+<h2><span class="chap">04</span>按阶段统计算子，拆解时间账本<span class="level">进阶</span></h2>
+<dl class="goal">
+  <dt>目标</dt><dd>(1) 让 <code>OpProfiler</code> 分开统计 prefill 和 decode；(2) 把 E2E 拆成 forward、采样、反分词+打印、其它四部分；(3) 两个开关都开时，算出 decode 阶段的框架开销。</dd>
+</dl>
+
+<h3>改动清单</h3>
+<div class="tbl"><table>
+  <thead><tr><th>文件</th><th>位置</th><th>类型</th><th>内容</th></tr></thead>
+  <tbody>
+    <tr><td><code>profiler/profiler.zig</code></td><td>类型定义、<code>OpProfiler</code> 字段、<code>reset</code>、<code>record</code></td><td><span class="kind mod">修改</span></td><td>加 <code>Phase</code> 维度</td></tr>
+    <tr><td><code>profiler/profiler.zig</code></td><td><code>print</code> → <code>printPhase</code></td><td><span class="kind mod">修改</span></td><td>按阶段打印，标题带阶段名</td></tr>
+    <tr><td><code>profiler/profiler.zig</code></td><td>新方法 <code>opNs</code></td><td><span class="kind new">新增</span></td><td>某阶段所有算子的总耗时</td></tr>
+    <tr><td><code>profiler/profiler.zig</code></td><td>test 块</td><td><span class="kind mod">修改</span></td><td>多一层 <code>.prefill</code> 索引</td></tr>
+    <tr><td><code>profiler/metrics.zig</code></td><td>字段、<code>reset</code>、<code>printBreakdown</code>、<code>printShare</code>、<code>printOverhead</code></td><td><span class="kind mod">修改</span></td><td>三个累加器和两段输出</td></tr>
+    <tr><td><code>executor.zig</code></td><td><code>generate()</code></td><td><span class="kind mod">修改</span></td><td>切换阶段；循环里计 sample / detok；结尾按阶段打印</td></tr>
+    <tr><td><code>executor.zig</code></td><td><code>forward()</code></td><td><span class="kind mod">修改</span></td><td>累加 <code>forward_ns</code></td></tr>
+  </tbody>
+</table></div>
+
+<h3>为什么要按阶段拆</h3>
+<p>原来的算子表把 prefill 和 decode 混在一起。prefill 只跑 1 次但很重，decode 跑上千次但每次很轻，混在一起之后，"LINEAR 占 80%"到底是哪个阶段的就说不清了。而且两个阶段的优化方向完全不同：prefill 要优化矩阵乘（GEMM），decode 要优化矩阵向量乘（GEMV）和访存。</p>
+
+<h3>时间账本</h3>
+<div class="formula">E2E        = forward_ns + sample_ns + detok_ns + 其它
+forward_ns = Σ 算子 ns(OpProfiler) + 框架开销
+
+框架开销 = resolveDims + allocateOutput + resetStepActivations
+         + executeView + Timer 本身 + CUDA sync 等待</div>
+<p>四段时间互不重叠，所以加起来不会超过 E2E。"其它"是 <code>onGenToken</code>、<code>append</code>、循环控制等零碎开销，通常很小。</p>
+
+<h3><span class="step">1</span>profiler.zig：加 Phase 维度</h3>
+<p>原来的统计表是 <code>op × device</code>，现在外面再套一层 <code>phase</code>。<code>Stat / PerDevice / Table</code> 挪到结构体外面作为文件级类型，后面的 <code>printPhase</code> 和测试都会用到。</p>
+<div class="code" data-lang="diff" data-title="profiler/profiler.zig · 类型定义" data-kind="修改"><script type="text/plain">
+ const OperationType = types.OperationType;
+ const DeviceType = types.DeviceType;
+
++pub const Phase = enum {
++    prefill,
++    decode,
++};
++
+-pub const OpProfiler = struct {
+-    const Stat = struct {
+-        calls: u64 = 0, // 调用次数
+-        ns: u64 = 0, // 消耗时间
+-    };
+-
+-    const PerDevice = std.EnumArray(DeviceType, Stat);
+-
+-    const Table = std.EnumArray(OperationType, PerDevice);
+-
++const Stat = struct {
++    calls: u64 = 0, // 调用次数
++    ns: u64 = 0, // 消耗时间
++};
++
++const PerDevice = std.EnumArray(DeviceType, Stat);
++const Table = std.EnumArray(OperationType, PerDevice);
++const PhaseTable = std.EnumArray(Phase, Table);
++
++pub const OpProfiler = struct {
+     enabled: bool = false,
+-    stats: Table = Table.initFill(PerDevice.initFill(.{})),
++    phase: Phase = .prefill, // 当前阶段, 由 executor 切换
++    stats: PhaseTable = PhaseTable.initFill(Table.initFill(PerDevice.initFill(.{}))),
+</script></div>
+<div class="code" data-lang="diff" data-title="profiler/profiler.zig · reset 与 record" data-kind="修改"><script type="text/plain">
+     pub fn reset(self: *Self) void {
+-        self.stats = Table.initFill(PerDevice.initFill(.{}));
++        self.stats = PhaseTable.initFill(Table.initFill(PerDevice.initFill(.{})));
++        self.phase = .prefill;
+     }
+
+     pub fn record(self: *Self, op: OperationType, device: DeviceType, ns: u64) void {
+-        const stat = self.stats.getPtr(op).getPtr(device);
++        const stat = self.stats.getPtr(self.phase).getPtr(op).getPtr(device);
+         stat.calls += 1;
+         stat.ns += ns;
+     }
+</script></div>
+
+<h3><span class="step">2</span>profiler.zig：print 改成 printPhase，新增 opNs</h3>
+<p>改动有三处：取哪个阶段的表、标题带阶段名、总耗时换成"这个阶段的耗时"。</p>
+<div class="callout err"><b>坑：*const Self 上不能调用 getPtr</b><code>std.EnumArray.getPtr</code> 的签名是 <code>fn getPtr(self: *Self, key) *Value</code>，要求可变指针。<code>printPhase</code> 的接收者是 <code>*const Self</code>，所以要用 <b><code>getPtrConst</code></b>，否则会报 <code>expected type '*EnumArray(...)', found '*const EnumArray(...)'</code>。注意：<code>printPhase</code> 还没被调用时，Zig 的惰性分析不会报这个错，等你把调用处接上才会冒出来。</div>
+<div class="code" data-lang="diff" data-title="profiler/profiler.zig · printPhase（原 print）" data-kind="修改"><script type="text/plain">
+-    /// total_ns: 整个 generate 的耗时, 用来算各算子占比和"算子以外"的时间
+-    pub fn print(self: *const Self, total_ns: u64) void {
++    /// phase_ns: 这个阶段的总耗时, 用来算各算子占比和"算子以外"的时间
++    pub fn printPhase(self: *const Self, phase: Phase, phase_ns: u64) void {
++        const table = self.stats.getPtrConst(phase);
+         const Row = struct {
+             op: OperationType,
+             device: DeviceType,
+             stat: Stat,
+         };
+
+         var rows: [Table.len * PerDevice.len]Row = undefined;
+         var n: usize = 0;
+         var op_ns: u64 = 0;
+
+         for (std.enums.values(OperationType)) |op| {
+             for (std.enums.values(DeviceType)) |device| {
+-                const stat = self.stats.get(op).get(device);
++                const stat = table.get(op).get(device);
+                 if (stat.calls == 0) continue;
+                 // ... 不变 ...
+             }
+         }
+
+         // ... 排序不变 ...
+
+-        const total_ms = common.nsToMs(total_ns);
++        const total_ms = common.nsToMs(phase_ns);
+
+-        std.debug.print("\n=== 算子耗时 (generate 共 {d:.1} ms) ===\n", .{total_ms});
++        std.debug.print("\n=== 算子耗时 [{s}] (共 {d:.1} ms) ===\n", .{ @tagName(phase), total_ms });
+
+         // ... 打印每行不变 ...
+
+         // 采样 / tokenizer decode / 打印 / 激活池分配 等不在算子里的时间
+-        const other_ns = total_ns -| op_ns;
++        const other_ns = phase_ns -| op_ns;
+</script></div>
+<div class="code" data-lang="zig" data-title="profiler/profiler.zig · 新增 opNs（放在 printPhase 前面）" data-kind="新增"><script type="text/plain">
+    /// 某个阶段所有算子的耗时之和, 用于算框架开销
+    pub fn opNs(self: *const Self, phase: Phase) u64 {
+        const table = self.stats.getPtrConst(phase);
+        var sum: u64 = 0;
+        for (std.enums.values(OperationType)) |op| {
+            for (std.enums.values(DeviceType)) |device| {
+                sum += table.get(op).get(device).ns;
+            }
+        }
+        return sum;
+    }
+</script></div>
+
+<h3><span class="step">3</span>profiler.zig：更新测试</h3>
+<div class="code" data-lang="diff" data-title="profiler/profiler.zig · test" data-kind="修改"><script type="text/plain">
+-    const s = p.stats.get(.OP_TYPE_LINEAR).get(.CUDA);
++    const s = p.stats.get(.prefill).get(.OP_TYPE_LINEAR).get(.CUDA);
+
+     try std.testing.expectEqual(@as(u64, 2), s.calls);
+     try std.testing.expectEqual(@as(u64, 150), s.ns);
+-    try std.testing.expectEqual(@as(u64, 7), p.stats.get(.OP_TYPE_LINEAR).get(.CPU).ns);
++    try std.testing.expectEqual(@as(u64, 7), p.stats.get(.prefill).get(.OP_TYPE_LINEAR).get(.CPU).ns);
++    try std.testing.expectEqual(@as(u64, 157), p.opNs(.prefill));
++    try std.testing.expectEqual(@as(u64, 0), p.opNs(.decode));
+
+     p.reset();
+-    try std.testing.expectEqual(@as(u64, 0), p.stats.get(.OP_TYPE_LINEAR).get(.CUDA).calls);
++    try std.testing.expectEqual(@as(u64, 0), p.stats.get(.prefill).get(.OP_TYPE_LINEAR).get(.CUDA).calls);
+</script></div>
+
+<h3><span class="step">4</span>metrics.zig：三个累加器</h3>
+<div class="code" data-lang="diff" data-title="profiler/metrics.zig · 字段" data-kind="修改"><script type="text/plain">
+     last_emit_ns: u64 = 0, // 上一个 token 的产出时刻
+     itl_ns: std.ArrayList(u64) = .empty, // 每两个相邻 token 的间隔
++
++    sample_ns: u64 = 0, //  sample(): lastLogits + softmax + top-p
++    detok_ns: u64 = 0, //   tokenizer.decode + std.debug.print
++    forward_ns: u64 = 0, // 所有 forward() 之和(prefill + decode, 含算子和框架开销)
+</script></div>
+<div class="code" data-lang="diff" data-title="profiler/metrics.zig · reset() 补三行" data-kind="修改"><script type="text/plain">
+         self.last_emit_ns = 0;
+         self.itl_ns.clearRetainingCapacity();
++
++        self.sample_ns = 0;
++        self.detok_ns = 0;
++        self.forward_ns = 0;
+     }
+</script></div>
+<div class="callout warn"><b>别忘了 reset</b>现在每次运行只调用一次 <code>generate</code>，忘了清零也看不出问题。但以后做基准测试，同一个 Executor 先预热一轮再正式测时，这三个数会一直累加下去。</div>
+
+<h3><span class="step">5</span>metrics.zig：时间账本和框架开销的输出</h3>
+<p>三个新方法放在 <code>print()</code> 后面。<code>printBreakdown</code> 由 <code>print()</code> 末尾调用；<code>printOverhead</code> 需要 profiler 的数据，由 executor 在两个开关都开时调用。</p>
+<div class="code" data-lang="zig" data-title="profiler/metrics.zig · 新增三个方法" data-kind="新增"><script type="text/plain">
+    /// 时间账本: E2E = forward + sample + detok + 其它
+    fn printBreakdown(self: *const Self) void {
+        const accounted = self.forward_ns + self.sample_ns + self.detok_ns;
+        const other = self.e2e_ns -| accounted; // 饱和减法, 防止计时误差导致下溢
+
+        std.debug.print("\n=== 时间拆解 ===\n", .{});
+        self.printShare("forward", self.forward_ns);
+        self.printShare("sample", self.sample_ns);
+        self.printShare("detok+print", self.detok_ns);
+        self.printShare("其它", other);
+
+        const samples = self.itl_ns.items.len + 1; // sample 调用次数(含 eos)
+        std.debug.print("sample 平均       : {d:.3} ms/次\n", .{
+            common.nsToMs(self.sample_ns) / @as(f64, @floatFromInt(samples)),
+        });
+    }
+
+    fn printShare(self: *const Self, name: []const u8, ns: u64) void {
+        const pct: f64 = if (self.e2e_ns == 0) 0 else @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(self.e2e_ns)) * 100;
+        std.debug.print("{s:<17} : {d:>10.2} ms ({d:>5.1}%)\n", .{ name, common.nsToMs(ns), pct });
+    }
+
+    /// decode 阶段框架开销, decode_op_ns 来自 OpProfiler.opNs(.decode)
+    /// prefill() 只做 setRopeStart + forward, 所以 forward_ns − prefill_ns ≈ decode 阶段的 forward 总耗时
+    pub fn printOverhead(self: *const Self, decode_op_ns: u64) void {
+        const decode_fwd = self.forward_ns -| self.prefill_ns;
+        const overhead = decode_fwd -| decode_op_ns;
+        const pct: f64 = if (decode_fwd == 0) 0 else @as(f64, @floatFromInt(overhead)) / @as(f64, @floatFromInt(decode_fwd)) * 100;
+        std.debug.print("\n=== decode 框架开销 ===\n", .{});
+        std.debug.print("decode forward    : {d:.2} ms\n", .{common.nsToMs(decode_fwd)});
+        std.debug.print("  其中算子        : {d:.2} ms\n", .{common.nsToMs(decode_op_ns)});
+        std.debug.print("  框架开销        : {d:.2} ms ({d:.1}%)\n", .{ common.nsToMs(overhead), pct });
+    }
+</script></div>
+<div class="code" data-lang="diff" data-title="profiler/metrics.zig · print() 最后一行之后" data-kind="修改"><script type="text/plain">
+         std.debug.print("总吞吐            : {d:.1} tok/s\n", .{common.perSec(self.prompt_tokens_len + self.gen_tokens_len, self.e2e_ns)});
++
++        self.printBreakdown();
+     }
+</script></div>
+<p class="note"><code>printShare</code> 里的 <code>{s:&lt;17}</code> 按字节对齐，中文名字（"其它"）会和英文名字差几列，不影响阅读。</p>
+
+<h3><span class="step">6</span>executor.zig：generate() 的四处改动</h3>
+<p>(a) prefill 结束后切换阶段；(b) 用一个 <code>step_timer</code> 依次切出 sample 和 detok 的时间；(c) 删掉原来的 <code>defer ... profiler.print(...)</code>；(d) 在结尾按阶段打印，两个开关都开时再打印框架开销。</p>
+<div class="code" data-lang="diff" data-title="executor.zig · generate() 开头" data-kind="修改"><script type="text/plain">
+         var total_timer = try std.time.Timer.start();
+
+         // op profiler
+         self.profiler.reset();
+-        defer if (self.profiler.enabled) self.profiler.print(total_timer.read()); // generate 完成后统计
+
+         // metrics
+         self.metrics.reset();
+         self.metrics.prompt_tokens_len = prompt.len;
+
+         try self.prefill(prompt);
+         self.metrics.prefill_ns = total_timer.read(); // ① prefill 结束
++
++        self.profiler.phase = .decode; // 之后的算子都记到 decode 阶段
+</script></div>
+<div class="code" data-lang="diff" data-title="executor.zig · generate() 循环" data-kind="修改"><script type="text/plain">
+         var idx: usize = 0;
+
++        var step_timer = try std.time.Timer.start();
+         while (idx < max_tokens) : (idx += 1) {
++            step_timer.reset(); // 起点 = 本轮开始, 上一轮的 decodeStep 不算进 sample
++
+             const next = try self.sample();
++            self.metrics.sample_ns += step_timer.lap();
+
+             // 第一个 token 时顺带记下 TTFT, 之后每个 token 记一次 ITL
+             if (self.metrics.enabled) {
+                 try self.metrics.onGenToken(self.allocator, total_timer.read());
+             }
+
+             if (next == eos) break;
+
+             try output.append(self.allocator, next);
+             self.metrics.gen_tokens_len += 1;
+
+             if (tokenizer) |tk| {
+                 const s = try tk.decode(&[_]i32{next});
+                 defer self.allocator.free(s);
+                 std.debug.print("{s}", .{s});
+             }
++            self.metrics.detok_ns += step_timer.lap();
+
+             // ... max_seq / max_tokens 判断、decodeStep 不变 ...
+         }
+</script></div>
+<div class="code" data-lang="diff" data-title="executor.zig · generate() 结尾" data-kind="修改"><script type="text/plain">
+         self.metrics.e2e_ns = total_timer.read(); // ③ 结束
+         if (self.metrics.enabled) {
+             self.metrics.print();
+         }
++
++        // prefill_ns / e2e_ns 不论 metrics 是否开启都会记录, 单开 LLMGEN_PROFILE 也能用
++        if (self.profiler.enabled) {
++            self.profiler.printPhase(.prefill, self.metrics.prefill_ns);
++            self.profiler.printPhase(.decode, self.metrics.e2e_ns - self.metrics.prefill_ns);
++            if (self.metrics.enabled) {
++                self.metrics.printOverhead(self.profiler.opNs(.decode));
++            }
++        }
+
+         return self.allocator.dupe(i32, output.items[prompt.len..]);
+</script></div>
+<div class="callout tip"><b>step_timer 为什么每轮要 reset</b>循环体的末尾是 <code>decodeStep</code>（一次 forward），它的时间已经由 <code>forward_ns</code> 统计。每轮开头 <code>reset()</code>，保证第一次 <code>lap()</code> 只量到 <code>sample()</code>，不会把上一轮的 forward 也算进来。</div>
+<div class="callout tip"><b>为什么去掉 defer</b>原来的 <code>defer</code> 会在 <code>return</code> 之后才打印，而且现在要打印两个阶段、还要用到 <code>metrics</code> 里的数据，写在 <code>e2e_ns</code> 之后更直接。代价是 <code>generate()</code> 中途出错时不再打印算子表，这对排查性能问题没有影响。</div>
+
+<h3><span class="step">7</span>executor.zig：forward() 累加耗时</h3>
+<div class="code" data-lang="diff" data-title="executor.zig · forward()" data-kind="修改"><script type="text/plain">
+     fn forward(self: *Self, tokens: []const i32) !void {
++        var t = try std.time.Timer.start();
++        defer self.metrics.forward_ns += t.read(); // prefill 和 decode 都会进来
++
+         ops.setGlobalAllocator(self.allocator);
+</script></div>
+
+<details class="full"><summary>第 4 章结束时 executor.zig 中 generate() 的完整代码</summary><div class="inner">
+<div class="code" data-lang="zig" data-title="executor.zig · generate()（第 1–4 章）"><script type="text/plain">
+    pub fn generate(self: *Self, prompt: []const i32, max_tokens: usize, eos: i32, tokenizer: ?*Tokenizer) ![]i32 {
+        if (prompt.len == 0) return error.EmptyPrompt;
+        if (max_tokens == 0) return error.BadMaxTokens;
+
+        self.memory_manager.resetKVCache();
+        self.seq_pos = 0;
+
+        var total_timer = try std.time.Timer.start();
+
+        // op profiler
+        self.profiler.reset();
+
+        // metrics
+        self.metrics.reset();
+        self.metrics.prompt_tokens_len = prompt.len;
+
+        try self.prefill(prompt);
+        self.metrics.prefill_ns = total_timer.read(); // ① prefill 结束
+
+        self.profiler.phase = .decode; // 之后的算子都记到 decode 阶段
+
+        // output = prompt + 已生成(不用 KV cache 时整段喂回去)
+        var output: std.ArrayList(i32) = .empty;
+        defer output.deinit(self.allocator);
+        try output.appendSlice(self.allocator, prompt);
+
+        var idx: usize = 0;
+
+        var step_timer = try std.time.Timer.start();
+        while (idx < max_tokens) : (idx += 1) {
+            step_timer.reset();
+
+            const next = try self.sample();
+            self.metrics.sample_ns += step_timer.lap();
+
+            // 第一个 token 时顺带记下 TTFT, 之后每个 token 记一次 ITL
+            if (self.metrics.enabled) {
+                try self.metrics.onGenToken(self.allocator, total_timer.read());
+            }
+
+            if (next == eos) break;
+
+            try output.append(self.allocator, next);
+            self.metrics.gen_tokens_len += 1;
+
+            if (tokenizer) |tk| {
+                const s = try tk.decode(&[_]i32{next});
+                defer self.allocator.free(s);
+                std.debug.print("{s}", .{s});
+            }
+            self.metrics.detok_ns += step_timer.lap();
+
+            if (output.items.len >= self.max_seq) {
+                break;
+            }
+
+            // 最后一个 token 已产出, 再 forward 一次也不会被 sample, 直接结束
+            if (idx + 1 == max_tokens) {
+                break;
+            }
+
+            if (self.use_kv_cache) {
+                try self.decodeStep(next);
+            } else {
+                try self.decodeStepTokens(output.items);
+            }
+        }
+
+        self.metrics.e2e_ns = total_timer.read(); // ③ 结束
+        if (self.metrics.enabled) {
+            self.metrics.print();
+        }
+
+        if (self.profiler.enabled) {
+            self.profiler.printPhase(.prefill, self.metrics.prefill_ns);
+            self.profiler.printPhase(.decode, self.metrics.e2e_ns - self.metrics.prefill_ns);
+            if (self.metrics.enabled) {
+                self.metrics.printOverhead(self.profiler.opNs(.decode));
+            }
+        }
+
+        return self.allocator.dupe(i32, output.items[prompt.len..]);
+    }
+</script></div>
+</div></details>
+
+<h3>运行与预期输出</h3>
+<div class="code" data-lang="text" data-title="LLMGEN_METRICS=1 LLMGEN_PROFILE=1 的 stderr（示意，节选）"><script type="text/plain">
+=== 时间拆解 ===
+forward           :   29300.41 ms ( 92.2%)
+sample            :    2410.55 ms (  7.6%)
+detok+print       :      61.30 ms (  0.2%)
+其它            :      12.33 ms (  0.0%)
+sample 平均       : 5.287 ms/次
+
+=== 算子耗时 [prefill] (共 420.7 ms) ===
+op             device    calls     total_ms    avg_us    pct
+LINEAR         CPU         197        351.2    1782.7  83.5%
+...
+=== 算子耗时 [decode] (共 31363.9 ms) ===
+op             device    calls     total_ms    avg_us    pct
+LINEAR         CPU       89180      24120.4     270.5  76.9%
+...
+(其它)                               3269.8            10.4%
+
+=== decode 框架开销 ===
+decode forward    : 28879.72 ms
+  其中算子        : 28094.10 ms
+  框架开销        : 785.62 ms (2.7%)
+</script></div>
+<p class="note">decode 表里的"(其它)" = decode 阶段总耗时 − 算子耗时，包含 sample、detok 和框架开销三部分；最后一段把框架开销单独算了出来。</p>
+
+<div class="callout warn"><b>第一次 forward 的特殊情况</b>prefill 的 <code>forward()</code> 还包含持久节点（rope 表）的计算。这些节点也走 <code>executorTensor</code>，会记到 prefill 阶段的 <code>ROPE_CACHE</code> 一行。分析 prefill 时记得把它扣掉。</div>
+
+<div class="callout err"><b>常见编译错误</b>
+<ul>
+  <li><code>no field or member function named 'print' in 'OpProfiler'</code>：<code>generate()</code> 开头那行 <code>defer ... self.profiler.print(...)</code> 没删。</li>
+  <li><code>expected type '*EnumArray(...)', found '*const EnumArray(...)'</code>：<code>printPhase</code> / <code>opNs</code> 里用了 <code>getPtr</code>，要改成 <code>getPtrConst</code>。</li>
+  <li>测试报 <code>expected type 'Phase'</code>：测试里少了 <code>.get(.prefill)</code> 这一层。</li>
+  <li><code>use of undeclared identifier 'step_timer'</code>：<code>step_timer</code> 要在 <code>while</code> <b>外面</b>声明，循环里只调用 <code>reset()</code> 和 <code>lap()</code>。</li>
+</ul></div>
+
+<div class="callout check"><b>检查点</b>
+<ul>
+  <li><code>forward + sample + detok</code> ≤ E2E，"其它"很小。</li>
+  <li>decode 阶段 <code>LINEAR</code> 的 calls ≈ (层数 × 7 + 1) × decode forward 次数：每层 q/k/v/o/gate/up/down 共 7 次，加上 lm_head 1 次。如果图里融合了 qkv 或 gate/up，按实际的线性层数算。</li>
+  <li>把 <code>tokenizer</code> 传 <code>null</code> 再测一次，TPOT 下降的幅度 ≈ <code>detok_ns / 步数</code>。</li>
+  <li>decode 框架开销超过 10% 时，说明每步的固定成本太高，比如 <code>resolveDims</code> 每步都要遍历整个 <code>original_dims</code> 哈希表、每个算子都要分配一次激活内存。</li>
+</ul></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="ch5">
+<h2><span class="chap">05</span>MFU 与 MBU：离硬件上限还有多远<span class="level">进阶</span></h2>
+<dl class="goal">
+  <dt>目标</dt><dd>根据模型结构算出理论 FLOPs 和访存字节，结合实测时间得到 prefill 的 MFU 和 decode 的 MBU。</dd>
+  <dt>开关</dt><dd>新增 <code>LLMGEN_PEAK_TFLOPS</code>、<code>LLMGEN_PEAK_GBPS</code>（不设就只打印实测的 TFLOPS 和 GB/s）。</dd>
+</dl>
+
+<h3>改动清单</h3>
+<div class="tbl"><table>
+  <thead><tr><th>文件</th><th>位置</th><th>类型</th><th>内容</th></tr></thead>
+  <tbody>
+    <tr><td><code>profiler/metrics.zig</code></td><td>文件开头 import、文件末尾</td><td><span class="kind new">新增</span></td><td><code>ModelCost</code>、<code>envF64</code>、<code>printEfficiency</code></td></tr>
+    <tr><td><code>llmgen.zig</code></td><td>import、<code>run()</code> 第 7 步之后</td><td><span class="kind mod">修改</span></td><td>读 Config，调用 <code>printEfficiency</code></td></tr>
+  </tbody>
+</table></div>
+
+<h3>先手算一遍 Qwen3-0.6B</h3>
+<p>超参数在 <code>models/qwen3.zig</code> 的 <code>Config</code> 里，由 <code>Config.fromGGUF(gguf_info)</code> 读出。</p>
+<div class="tbl"><table>
+  <thead><tr><th>符号</th><th>Config 字段 / 方法</th><th class="num">Qwen3-0.6B</th></tr></thead>
+  <tbody>
+    <tr><td>L 层数</td><td><code>block_count</code></td><td class="num">28</td></tr>
+    <tr><td>d 隐藏维</td><td><code>embedding_length</code></td><td class="num">1024</td></tr>
+    <tr><td>q_dim = n_head × head_dim</td><td><code>qHeadsDim()</code></td><td class="num">16 × 128 = 2048</td></tr>
+    <tr><td>kv_dim = n_kv × head_dim</td><td><code>kvHeadsDim()</code></td><td class="num">8 × 128 = 1024</td></tr>
+    <tr><td>f FFN 中间维</td><td><code>feed_forward_length</code></td><td class="num">3072</td></tr>
+    <tr><td>V 词表</td><td><code>vocab_size</code></td><td class="num">151936</td></tr>
+  </tbody>
+</table></div>
+<div class="formula">每层 attn = d·q_dim + 2·d·kv_dim + q_dim·d  = 2.10M + 2.10M + 2.10M     = 6.29M
+每层 mlp  = 3·d·f                          = 3 × 1024 × 3072           = 9.44M
+L 层合计  = 28 × 15.73M                                                = 440.4M
+lm_head  = d·V                            = 1024 × 151936             = 155.6M
+─────────────────────────────────────────────────────────────────────
+N_mm (参与矩阵乘的参数, embedding 只查表不算)                            ≈ 596M</div>
+
+<h3>公式</h3>
+<div class="formula">单 token FLOPs(ctx)   = 2·N_mm + 4·L·q_dim·ctx   ≈ 1.19 GFLOP + 229K·ctx FLOP
+prefill(P) 总 FLOPs  = 2·N_mm·P + 4·L·q_dim · P(P+1)/2          (因果 mask)
+decode 第 c 步 FLOPs = 2·N_mm   + 4·L·q_dim · c                 (c = 当前上下文长度)
+
+KV 每 token 字节     = 2(K,V) · L · kv_dim · kv_elem  = 2 × 28 × 1024 × 2B = 112 KiB (BF16)
+decode 第 c 步字节   ≈ N_mm·w_elem + c·112KiB        ≈ 1.19 GB + c × 0.115 MB
+
+MFU(prefill) = prefill 总 FLOPs / prefill_s / 峰值 FLOPS
+MBU(decode)  = Σ decode 每步字节 / decode_s / 峰值带宽</div>
+<p>c = 1000 时 KV 只有约 115 MB，还不到权重的 10%。所以对 0.6B 模型的单序列 decode 来说，<b>瓶颈几乎全在读权重</b>。</p>
+
+<h3><span class="step">1</span>metrics.zig：ModelCost</h3>
+<div class="code" data-lang="diff" data-title="profiler/metrics.zig · 文件开头 import" data-kind="修改"><script type="text/plain">
+ const std = @import("std");
+
+ const common = @import("common.zig");
++const qwen3 = @import("../models/qwen3.zig");
+</script></div>
+<div class="code" data-lang="zig" data-title="profiler/metrics.zig · 追加到文件末尾（GenMetrics 结构体外面）" data-kind="新增"><script type="text/plain">
+/// 由模型结构推导理论计算量和访存量
+pub const ModelCost = struct {
+    n_layers: f64,
+    q_dim: f64,
+    kv_dim: f64,
+    n_mm: f64, //    参与矩阵乘的参数量
+    w_elem: f64, //  权重每元素字节(BF16 = 2)
+    kv_elem: f64, // KV 每元素字节(以 page_atten 的 data_type 为准)
+
+    pub fn fromConfig(c: qwen3.Config, w_elem: f64, kv_elem: f64) ModelCost {
+        const d: f64 = @floatFromInt(c.embedding_length);
+        const q: f64 = @floatFromInt(c.qHeadsDim());
+        const kv: f64 = @floatFromInt(c.kvHeadsDim());
+        const f: f64 = @floatFromInt(c.feed_forward_length);
+        const v: f64 = @floatFromInt(c.vocab_size);
+        const l: f64 = @floatFromInt(c.block_count);
+        const per_layer = d * q + 2 * d * kv + q * d + 3 * d * f;
+        return .{
+            .n_layers = l,
+            .q_dim = q,
+            .kv_dim = kv,
+            .n_mm = l * per_layer + d * v,
+            .w_elem = w_elem,
+            .kv_elem = kv_elem,
+        };
+    }
+
+    pub fn prefillFlops(self: ModelCost, p: f64) f64 {
+        return 2 * self.n_mm * p + 4 * self.n_layers * self.q_dim * p * (p + 1) / 2;
+    }
+
+    /// decode 从上下文 c0 开始做 n 次 forward: c 依次为 c0, c0+1, ..., c0+n-1
+    pub fn decodeFlops(self: ModelCost, c0: f64, n: f64) f64 {
+        const sum_c = n * c0 + n * (n - 1) / 2;
+        return 2 * self.n_mm * n + 4 * self.n_layers * self.q_dim * sum_c;
+    }
+
+    pub fn decodeBytes(self: ModelCost, c0: f64, n: f64) f64 {
+        const sum_c = n * c0 + n * (n - 1) / 2;
+        const kv_tok = 2 * self.n_layers * self.kv_dim * self.kv_elem;
+        return self.n_mm * self.w_elem * n + kv_tok * sum_c;
+    }
+};
+</script></div>
+
+<h3><span class="step">2</span>metrics.zig：printEfficiency</h3>
+<p>decode 的 forward 次数 = <code>len(ITL)</code>（每次 forward 之后紧跟一次产出 token 的 sample）；decode 耗时用第 2 章的 <code>decodeNs()</code>，保持口径一致。第一次 decode forward 的上下文是 P + 1（prompt 加上第一个生成的 token）。</p>
+<div class="code" data-lang="zig" data-title="profiler/metrics.zig · 继续追加到文件末尾" data-kind="新增"><script type="text/plain">
+fn envF64(name: []const u8) ?f64 {
+    const s = std.posix.getenv(name) orelse return null;
+    return std.fmt.parseFloat(f64, s) catch null;
+}
+
+pub fn printEfficiency(m: *const GenMetrics, cost: ModelCost) void {
+    const p: f64 = @floatFromInt(m.prompt_tokens_len);
+    const n: f64 = @floatFromInt(m.itl_ns.items.len); // decode forward 次数
+    const prefill_s = @as(f64, @floatFromInt(m.prefill_ns)) / 1e9;
+    const decode_s = @as(f64, @floatFromInt(m.decodeNs())) / 1e9;
+
+    const pf = cost.prefillFlops(p);
+    std.debug.print("\n=== 硬件效率 ===\n", .{});
+    std.debug.print("N_mm              : {d:.1} M 参数\n", .{cost.n_mm / 1e6});
+    std.debug.print("prefill           : {d:.1} GFLOP, {d:.3} TFLOPS\n", .{ pf / 1e9, pf / prefill_s / 1e12 });
+    if (envF64("LLMGEN_PEAK_TFLOPS")) |peak| {
+        std.debug.print("MFU(prefill)      : {d:.1}%\n", .{pf / prefill_s / (peak * 1e12) * 100});
+    }
+
+    if (n == 0 or decode_s == 0) return;
+    const df = cost.decodeFlops(p + 1, n);
+    const db = cost.decodeBytes(p + 1, n);
+    std.debug.print("decode            : {d:.3} TFLOPS, {d:.1} GB/s\n", .{ df / decode_s / 1e12, db / decode_s / 1e9 });
+    if (envF64("LLMGEN_PEAK_GBPS")) |peak| {
+        std.debug.print("MBU(decode)       : {d:.1}%\n", .{db / decode_s / (peak * 1e9) * 100});
+    }
+}
+</script></div>
+
+<h3><span class="step">3</span>llmgen.zig：调用</h3>
+<p><code>run()</code> 里的 <code>qwen3_model</code> 是 <code>ModelBase</code>（vtable 接口），<b>拿不到 <code>.config</code></b>。所以直接用 <code>qwen3.Config.fromGGUF(gguf_info)</code> 再读一次，<code>llmgen.zig</code> 已经导入过 <code>qwen3</code>。</p>
+<div class="code" data-lang="diff" data-title="llmgen.zig · import" data-kind="修改"><script type="text/plain">
+ const Engine = @import("runner/engine.zig").Engine;
++
++const metrics = @import("profiler/metrics.zig");
+</script></div>
+<div class="code" data-lang="diff" data-title="llmgen.zig · run() 第 7 步" data-kind="修改"><script type="text/plain">
+     const out_ids = try runtime_executor.generate(prompt_ids, max_new, eos, &tokenizer);
+     defer allocator.free(out_ids);
++
++    if (runtime_executor.metrics.enabled) {
++        const cfg = try qwen3.Config.fromGGUF(gguf_info);
++        // BF16 权重; KV 的类型以 graph/scheduler.zig 里 initLayer 传入的 data_type 为准
++        const cost = metrics.ModelCost.fromConfig(cfg, 2, 2);
++        metrics.printEfficiency(&runtime_executor.metrics, cost);
++    }
+</script></div>
+<div class="callout tip"><b>调用顺序</b><code>printEfficiency</code> 读的是 <code>generate()</code> 结束时留在 <code>runtime_executor.metrics</code> 里的数据。它只用到 ITL 的长度和几个 ns 字段，不依赖 ITL 的顺序，所以放在 <code>print()</code>（会排序）之后调用也没关系。</div>
+
+<div class="callout tip"><b>交叉验证权重字节</b>遍历 <code>memory_manager.devices_map</code>，把每个 <code>pools.weight.?.used()</code> 加起来，和 <code>n_mm × w_elem</code> 对一下。权重池多出来的约 311 MB 是 embedding 表（151936 × 1024 × 2B）。它要占内存，但 decode 每步只读其中一行，所以<b>不计入 MBU 的字节数</b>。</div>
+
+<h3>运行与预期输出</h3>
+<div class="code" data-lang="text" data-title="LLMGEN_METRICS=1 LLMGEN_PEAK_GBPS=200 LLMGEN_PEAK_TFLOPS=13.6（示意）"><script type="text/plain">
+=== 硬件效率 ===
+N_mm              : 596.0 M 参数
+prefill           : 25.1 GFLOP, 0.060 TFLOPS
+MFU(prefill)      : 0.4%
+decode            : 0.017 TFLOPS, 17.9 GB/s
+MBU(decode)       : 9.0%
+</script></div>
+
+<h3>怎么读结果</h3>
+<div class="tbl"><table>
+  <thead><tr><th>现象</th><th>含义</th><th>下一步</th></tr></thead>
+  <tbody>
+    <tr><td>MBU(decode) 只有 10–20%</td><td>带宽没用满，在等别的东西</td><td>看第 4 章的框架开销、逐算子 sync、GEMV 实现</td></tr>
+    <tr><td>MBU(decode) 达到 70% 以上</td><td>单序列 decode 已接近上限</td><td>只能靠 batching（第 8 章）或量化减少权重字节</td></tr>
+    <tr><td>MFU(prefill) 低于 5%</td><td>GEMM 没吃到算力（没分块、没 SIMD、没走 Tensor Core）</td><td>第 6 章，看 LINEAR 的计算强度和实际 GFLOP/s</td></tr>
+    <tr><td>decode TFLOPS 极低、GB/s 较高</td><td>正常，decode 本来就是访存密集</td><td>不要拿 decode 的 MFU 当优化目标</td></tr>
+  </tbody>
+</table></div>
+
+<div class="callout err"><b>常见编译错误</b>
+<ul>
+  <li><code>no field named 'config' in struct 'ModelBase'</code>：用了 <code>qwen3_model.config</code>，改成 <code>qwen3.Config.fromGGUF(gguf_info)</code>。</li>
+  <li><code>unable to load '.../profiler/models/qwen3.zig'</code>：metrics.zig 里的 import 要写 <code>../models/qwen3.zig</code>。</li>
+</ul></div>
+
+<div class="callout check"><b>检查点</b>
+<ul>
+  <li>打印出的 <code>N_mm</code> 约为 596 M。</li>
+  <li>decode GB/s 不可能超过硬件峰值带宽。超了的话，先检查 TPOT 有没有测错，或者 <code>w_elem</code> 填错了。</li>
+</ul></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="ch6">
+<h2><span class="chap">06</span>算子级 Roofline<span class="level">进阶</span></h2>
+<dl class="goal">
+  <dt>目标</dt><dd>给每个算子统计 FLOPs 和访存字节，算出计算强度（AI）和实际达到的 GFLOP/s、GB/s，判断它卡在算力还是带宽。</dd>
+</dl>
+
+<h3>改动清单</h3>
+<div class="tbl"><table>
+  <thead><tr><th>文件</th><th>位置</th><th>类型</th><th>内容</th></tr></thead>
+  <tbody>
+    <tr><td><code>profiler/profiler.zig</code></td><td>import、<code>Stat</code>、<code>record</code>、<code>printPhase</code>、test</td><td><span class="kind mod">修改</span></td><td>统计并打印 flops / bytes</td></tr>
+    <tr><td><code>profiler/profiler.zig</code></td><td><code>Cost</code>、<code>opCost</code></td><td><span class="kind new">新增</span></td><td>估算单个算子的计算量和访存量</td></tr>
+    <tr><td><code>executor.zig</code></td><td>import、<code>Executor</code> 字段、<code>forward()</code>、<code>executorTensor()</code></td><td><span class="kind mod">修改</span></td><td>记录本步 token 数，传入 cost</td></tr>
+  </tbody>
+</table></div>
+
+<h3>Roofline 模型</h3>
+<div class="formula">计算强度 AI = FLOPs / Bytes                   (FLOP/B)
+可达性能     = min(峰值 FLOPS, AI × 峰值带宽)
+拐点 AI*     = 峰值 FLOPS / 峰值带宽
+AI < AI*  → 带宽受限(memory bound)       AI > AI*  → 算力受限(compute bound)</div>
+<p>以 decode 时的 q_proj 为例：输入 [1, 1024]，权重 1024×2048（BF16）。FLOPs = 2 × 1024 × 2048 ≈ 4.2M，Bytes ≈ 4 MB，AI ≈ 1。常见硬件的拐点都在 10~300 之间，所以 decode 时的 LINEAR 一定受带宽限制。prefill 时 seq = 512，AI 在 400 以上，就变成受算力限制了。</p>
+
+<h3><span class="step">1</span>profiler.zig：Stat 加字段，新增 Cost 和 opCost</h3>
+<p>默认的估算方法是：<b>字节 = 所有 src 的大小 + 输出的大小，FLOPs ≈ 输出元素数</b>。这对逐元素算子（ADD、MUL、SILU、RMS_NORM）是对的，但有三类算子必须单独处理，否则 roofline 表会给出离谱的数字：</p>
+<div class="tbl"><table>
+  <thead><tr><th>算子</th><th>src 里有什么</th><th>默认估算的问题</th><th>正确的算法</th></tr></thead>
+  <tbody>
+    <tr><td><code>LINEAR</code></td><td><code>[x, W]</code>（见 <code>module/linear.zig</code>）</td><td>字节没问题，但 FLOPs 远不止输出元素数</td><td>FLOPs = 2 × 输出元素数 × K，K 取 x 的最后一维</td></tr>
+    <tr><td><code>EMBEDDING</code></td><td><code>[input_ids, 整张词表]</code>（见 <code>module/embedding.zig</code>）</td><td>把 311 MB 的整张词表算成读入，实际只读 token 对应的几行 → GB/s 虚高几万倍</td><td>字节 = ids + 读出的行 + 写出（读出的行和输出一样大）</td></tr>
+    <tr><td><code>APPLY_ROPE</code></td><td><code>[x, cos 表, sin 表]</code>（见 <code>module/rope.zig</code>）</td><td>cos/sin 表各 [context_length, rope_dim] × f32，Qwen3 的 context_length 是 40960，每张 21 MB，实际每步只用 seq 行 → GB/s 虚高</td><td>字节 = x + 输出 + 2 × seq × rope_dim × 4B</td></tr>
+    <tr><td><code>PAGED_ATTN</code> / <code>FLASH_ATTN</code></td><td><code>[q, 本步的 k, 本步的 v]</code></td><td>历史 KV 存在分页池里，不在 src 中，读 KV 的字节完全没算 → AI 虚高约 80 倍</td><td>FLOPs = 4 × 输出元素数 × ctx；字节另加 2 × ctx × kv_dim × elem</td></tr>
+  </tbody>
+</table></div>
+<div class="callout tip"><b>怎么发现估算错了</b>任何算子的 GB/s 都不可能超过硬件峰值（RTX 3090 是 936 GB/s）。看到超过的，用 <code>GB/s × avg_us</code> 反推出每次调用算了多少字节，再和张量大小对比，就能定位是哪个 src 被多算了。比如 EMBEDDING 显示 96032 GB/s、平均 3.2 µs，反推出每次 307 MB，正好是整张词表的大小（151936 × 1024 × 2B）。</div>
+<div class="code" data-lang="diff" data-title="profiler/profiler.zig · import" data-kind="修改"><script type="text/plain">
+ const types = @import("../types.zig");
++const Tensor = @import("../Tensor.zig");
+
+ const common = @import("common.zig");
+</script></div>
+<div class="code" data-lang="diff" data-title="profiler/profiler.zig · Stat" data-kind="修改"><script type="text/plain">
+ const Stat = struct {
+     calls: u64 = 0, // 调用次数
+     ns: u64 = 0, // 消耗时间
++    flops: u64 = 0, // 累计浮点运算数
++    bytes: u64 = 0, // 累计访存字节(估算)
+ };
+</script></div>
+<div class="code" data-lang="zig" data-title="profiler/profiler.zig · 新增（放在 OpProfiler 前面）" data-kind="新增"><script type="text/plain">
+pub const Cost = struct {
+    flops: u64 = 0,
+    bytes: u64 = 0,
+};
+
+/// 估算一个算子的 FLOPs 和访存字节
+/// attn_ctx: 注意力看到的上下文长度(executor 传入 seq_pos + 本步 token 数)
+pub fn opCost(tensor: *const Tensor, attn_ctx: u64) Cost {
+    // 默认: 读入所有 src + 写出, FLOPs ≈ 输出元素数(适用于逐元素算子)
+    var cost: Cost = .{ .bytes = tensor.bytes() }; // 写出
+    for (tensor.src) |maybe| {
+        if (maybe) |s| {
+            cost.bytes += s.bytes(); // 读入
+        }
+    }
+
+    switch (tensor.op_type) {
+        .OP_TYPE_LINEAR => {
+            const x = tensor.src[0].?;
+            const k: u64 = @intCast(x.dims[x.rank() - 1]);
+            cost.flops = 2 * tensor.numElements() * k; // 输出每个元素 = K 次乘加
+        },
+        .OP_TYPE_EMBEDDING => {
+            // src = [input_ids, 词表]: 只读 token 对应的行, 不是整张词表
+            cost.bytes = tensor.src[0].?.bytes() + 2 * tensor.bytes(); // ids + 读出的行 + 写出
+            cost.flops = 0; // 纯拷贝
+        },
+        .OP_TYPE_APPLY_ROPE => {
+            // src = [x, cos, sin], x: [B, n_heads, seq, head_dim], cos/sin: [context_length, rope_dim] f32
+            // cos/sin 表只读本步用到的 seq 行
+            const x = tensor.src[0].?;
+            const tokens: u64 = @intCast(x.dims[2]);
+            const rope_dim: u64 = @intCast(tensor.src[1].?.dims[1]);
+            cost.bytes = x.bytes() + tensor.bytes() + 2 * tokens * rope_dim * 4;
+            cost.flops = tensor.numElements();
+        },
+        .OP_TYPE_PAGED_ATTN, .OP_TYPE_FLASH_ATTN => {
+            // 输出 [tokens, q_dim]: QK^T 与 AV 各 2*q_dim*ctx / token
+            cost.flops = 4 * tensor.numElements() * attn_ctx;
+            // 历史 K/V 在分页池里, 不在 src 中, 要单独加上: K 和 V 各 ctx × kv_dim 个元素
+            const k = tensor.src[1].?; // (B, n_kv, seq, head_dim)
+            const kv_dim: u64 = @intCast(k.dims[1] * k.dims[3]);
+            cost.bytes += 2 * attn_ctx * kv_dim * k.data_type.size();
+        },
+        else => cost.flops = tensor.numElements(),
+    }
+    return cost;
+}
+</script></div>
+<p class="note">prefill 时 <code>attn_ctx</code> 传的是 P，而因果注意力平均每个 token 只看 P/2 个位置，所以 prefill 的 ATTN FLOPs 会高估约 2 倍；decode 时是准确的。KV 字节在 prefill 时也按 P 计算，同样是上界。</p>
+
+<details class="full"><summary>已经按上一版教程写完 opCost？只需要改这几处</summary><div class="inner">
+<p>上一版只处理了 LINEAR 和 ATTN 的 FLOPs，没有修正字节数。在上一版的基础上加两个分支，再给 ATTN 分支补上 KV 字节：</p>
+<div class="code" data-lang="diff" data-title="profiler/profiler.zig · opCost 的 switch" data-kind="修改"><script type="text/plain">
+     switch (tensor.op_type) {
+         .OP_TYPE_LINEAR => {
+             const x = tensor.src[0].?;
+             const k: u64 = @intCast(x.dims[x.rank() - 1]);
+             cost.flops = 2 * tensor.numElements() * k; // 输出每个元素 = K 次乘加
+         },
++        .OP_TYPE_EMBEDDING => {
++            // src = [input_ids, 词表]: 只读 token 对应的行, 不是整张词表
++            cost.bytes = tensor.src[0].?.bytes() + 2 * tensor.bytes(); // ids + 读出的行 + 写出
++            cost.flops = 0; // 纯拷贝
++        },
++        .OP_TYPE_APPLY_ROPE => {
++            // src = [x, cos, sin], x: [B, n_heads, seq, head_dim], cos/sin: [context_length, rope_dim] f32
++            // cos/sin 表只读本步用到的 seq 行
++            const x = tensor.src[0].?;
++            const tokens: u64 = @intCast(x.dims[2]);
++            const rope_dim: u64 = @intCast(tensor.src[1].?.dims[1]);
++            cost.bytes = x.bytes() + tensor.bytes() + 2 * tokens * rope_dim * 4;
++            cost.flops = tensor.numElements();
++        },
+         .OP_TYPE_PAGED_ATTN, .OP_TYPE_FLASH_ATTN => {
+             // 输出 [tokens, q_dim]: QK^T 与 AV 各 2*q_dim*ctx / token
+             cost.flops = 4 * tensor.numElements() * attn_ctx;
+-            // KV 在分页池里, 不在 src 中, 所以这里低估了字节; 进阶可再加上 2*ctx*kv_dim*elem
++            // 历史 K/V 在分页池里, 不在 src 中, 要单独加上: K 和 V 各 ctx × kv_dim 个元素
++            const k = tensor.src[1].?; // (B, n_kv, seq, head_dim)
++            const kv_dim: u64 = @intCast(k.dims[1] * k.dims[3]);
++            cost.bytes += 2 * attn_ctx * kv_dim * k.data_type.size();
+         },
+         else => cost.flops = tensor.numElements(),
+     }
+</script></div>
+</div></details>
+
+<div class="callout warn"><b>维度顺序以建图代码为准</b>上面的下标来自当前代码：APPLY_ROPE 的 x 是 <code>[B, n_heads, seq, head_dim]</code>（<code>module/rope.zig</code> 的 <code>applyRope</code>），ATTN 的 k 是 <code>(B, n_kv, seq, head_dim)</code>（<code>graph/scheduler.zig</code> 里 <code>initLayer</code> 也是这样取 <code>n_kv_heads</code> 和 <code>head_dim</code> 的）。以后如果改了张量布局，这里的下标要跟着改。</div>
+
+<h3><span class="step">2</span>profiler.zig：record 接收 cost，测试补参数</h3>
+<div class="code" data-lang="diff" data-title="profiler/profiler.zig · record" data-kind="修改"><script type="text/plain">
+-    pub fn record(self: *Self, op: OperationType, device: DeviceType, ns: u64) void {
++    pub fn record(self: *Self, op: OperationType, device: DeviceType, ns: u64, cost: Cost) void {
+         const stat = self.stats.getPtr(self.phase).getPtr(op).getPtr(device);
+         stat.calls += 1;
+         stat.ns += ns;
++        stat.flops += cost.flops;
++        stat.bytes += cost.bytes;
+     }
+</script></div>
+<div class="code" data-lang="diff" data-title="profiler/profiler.zig · test" data-kind="修改"><script type="text/plain">
+     var p = OpProfiler{ .enabled = true };
+-    p.record(.OP_TYPE_LINEAR, .CUDA, 100);
+-    p.record(.OP_TYPE_LINEAR, .CUDA, 50);
+-    p.record(.OP_TYPE_LINEAR, .CPU, 7);
++    p.record(.OP_TYPE_LINEAR, .CUDA, 100, .{ .flops = 10, .bytes = 4 });
++    p.record(.OP_TYPE_LINEAR, .CUDA, 50, .{});
++    p.record(.OP_TYPE_LINEAR, .CPU, 7, .{});
++
++    try std.testing.expectEqual(@as(u64, 10), p.stats.get(.prefill).get(.OP_TYPE_LINEAR).get(.CUDA).flops);
+</script></div>
+
+<h3><span class="step">3</span>profiler.zig：printPhase 加三列</h3>
+<div class="code" data-lang="diff" data-title="profiler/profiler.zig · printPhase 表头与每行" data-kind="修改"><script type="text/plain">
+-        std.debug.print("{s:<14} {s:<6} {s:>8} {s:>12} {s:>9} {s:>6}\n", .{ "op", "device", "calls", "total_ms", "avg_us", "pct" });
++        std.debug.print("{s:<14} {s:<6} {s:>8} {s:>12} {s:>9} {s:>6} {s:>9} {s:>8} {s:>7}\n", .{ "op", "device", "calls", "total_ms", "avg_us", "pct", "GFLOP/s", "GB/s", "AI" });
+         for (rows[0..n]) |row| {
+             const ms = common.nsToMs(row.stat.ns);
+             const avg_us = @as(f64, @floatFromInt(row.stat.ns)) / @as(f64, @floatFromInt(row.stat.calls)) / 1e3;
++            const ns_f: f64 = @floatFromInt(@max(row.stat.ns, 1));
++            const flops_f: f64 = @floatFromInt(row.stat.flops);
++            const bytes_f: f64 = @floatFromInt(@max(row.stat.bytes, 1));
+
+-            std.debug.print("{s:<14} {s:<6} {d:>8} {d:>12.1} {d:>9.1} {d:>5.1}%\n", .{
++            std.debug.print("{s:<14} {s:<6} {d:>8} {d:>12.1} {d:>9.1} {d:>5.1}% {d:>9.1} {d:>8.1} {d:>7.2}\n", .{
+                 @tagName(row.op)["OP_TYPE_".len..],
+                 @tagName(row.device),
+                 row.stat.calls,
+                 ms,
+                 avg_us,
+                 ms / total_ms * 100,
++                flops_f / ns_f, // FLOP/ns = GFLOP/s
++                bytes_f / ns_f, // B/ns    = GB/s
++                flops_f / bytes_f, // AI
+             });
+         }
+</script></div>
+
+<h3><span class="step">4</span>executor.zig：记录本步 token 数，传入 cost</h3>
+<div class="code" data-lang="diff" data-title="executor.zig · import（opCost 是文件级函数）" data-kind="修改"><script type="text/plain">
+-const OpProfiler = @import("profiler/profiler.zig").OpProfiler;
++const profiler_mod = @import("profiler/profiler.zig");
++const OpProfiler = profiler_mod.OpProfiler;
+</script></div>
+<div class="code" data-lang="diff" data-title="executor.zig · Executor 字段" data-kind="修改"><script type="text/plain">
+     max_seq: usize,
+     seq_pos: usize = 0, // has processed token pos
++    cur_tokens: usize = 0, // 本次 forward 的 token 数, 给 opCost 算注意力上下文
+</script></div>
+<div class="code" data-lang="diff" data-title="executor.zig · forward()" data-kind="修改"><script type="text/plain">
+     fn forward(self: *Self, tokens: []const i32) !void {
+         var t = try std.time.Timer.start();
+         defer self.metrics.forward_ns += t.read();
++        self.cur_tokens = tokens.len;
+
+         ops.setGlobalAllocator(self.allocator);
+</script></div>
+<div class="code" data-lang="diff" data-title="executor.zig · executorTensor() 的 profile 分支" data-kind="修改"><script type="text/plain">
+         if (self.profiler.enabled) {
+             var timer = try std.time.Timer.start();
+             try dispatchKernel(tensor, @intCast(device_id));
+             if (opts.have_cuda and tensor.device_type != .CPU) {
+                 cuda.CudaContext.instance().sync(); // 必须在计时区间内
+             }
+-            self.profiler.record(tensor.op_type, tensor.device_type, timer.read());
++            const ns = timer.read();
++            const ctx: u64 = @intCast(self.seq_pos + self.cur_tokens); // forward 期间 seq_pos 还没更新
++            self.profiler.record(tensor.op_type, tensor.device_type, ns, profiler_mod.opCost(tensor, ctx));
+         } else {
+</script></div>
+<div class="callout tip"><b>注意计时顺序</b><code>opCost</code> 在 <code>timer.read()</code> <b>之后</b>调用，它本身的开销（遍历 src、做乘法）不会算进算子耗时。</div>
+
+<h3>预期输出</h3>
+<p>下面是 RTX 3090、P = 21、生成 455 个 token 时的结果（节选）。LINEAR、PERMUTE 等行是实测值；EMBEDDING、APPLY_ROPE、PAGED_ATTN 三行是用修正后的公式，按同一次运行的耗时换算出来的。</p>
+<div class="code" data-lang="text" data-title="decode 阶段算子表（RTX 3090，节选）"><script type="text/plain">
+=== 算子耗时 [decode] (共 30865.7 ms) ===
+op             device    calls     total_ms    avg_us    pct   GFLOP/s     GB/s      AI
+PERMUTE        CUDA      50960      20871.9     409.6  67.6%       0.0      0.0    0.25
+PAGED_ATTN     CUDA      12740       4620.5     362.7  15.0%       5.6      2.8    1.98
+LINEAR         CUDA      89635       2169.6      24.2   7.0%     250.0    250.3    1.00
+RMS_NORM       CUDA      51415        502.8       9.8   1.6%       0.1      0.8    0.17
+APPLY_ROPE     CUDA      25480        195.4       7.7   0.6%       0.2      0.9    0.21
+EMBEDDING      CPU         455          1.5       3.2   0.0%       0.0      1.3    0.00
+</script></div>
+<div class="code" data-lang="text" data-title="修正前后对比（同一次运行）"><script type="text/plain">
+算子                  修正前 GB/s / AI        修正后 GB/s / AI
+EMBEDDING   decode    96032.2 / 0.00          1.3 / 0.00     ← 不再把整张词表算成读入
+APPLY_ROPE  decode     5469.8 / 0.00          0.9 / 0.21     ← 不再把 2 × 21 MB 的 cos/sin 表算成读入
+PAGED_ATTN  decode        0.0 / 166.00        2.8 / 1.98     ← 补上每次约 1 MB 的历史 KV
+PAGED_ATTN  prefill       0.2 / 14.00         0.3 / 10.50
+</script></div>
+
+<h3>怎么读这张表</h3>
+<p>RTX 3090 的拐点是 71 TFLOPS / 936 GB/s ≈ <b>76 FLOP/B</b>。按 AI 和 GB/s 可以把算子分成三类：</p>
+<div class="tbl"><table>
+  <thead><tr><th>类别</th><th>特征</th><th>例子</th><th>优化方向</th></tr></thead>
+  <tbody>
+    <tr><td>受带宽限制，且跑得不错</td><td>AI 远小于拐点，GB/s 达到峰值的几十 %</td><td>decode LINEAR：AI 1.00，250 GB/s（峰值的 27%）</td><td>换专门的 GEMV kernel、量化减少字节</td></tr>
+    <tr><td>受带宽限制，但跑得很差</td><td>AI 小，GB/s 也只有个位数</td><td>PAGED_ATTN：AI 1.98，只有 2.8 GB/s</td><td>kernel 本身或调用方式有问题，优先排查</td></tr>
+    <tr><td>固定开销占主导</td><td>不管数据量多大，耗时都差不多，GB/s 接近 0</td><td>PERMUTE：decode 410 µs，prefill 数据量是它的 21 倍，也只有 425 µs；RMS_NORM 等小 kernel 每次 7–10 µs</td><td>去掉每次调用的分配和同步；小 kernel 做算子融合</td></tr>
+  </tbody>
+</table></div>
+
+<div class="callout err"><b>常见编译错误</b>
+<ul>
+  <li><code>expected 5 argument(s), found 4</code>：测试或其它地方的 <code>record</code> 调用没补 <code>cost</code> 参数。</li>
+  <li><code>unable to load '.../profiler/Tensor.zig'</code>：import 要写 <code>../Tensor.zig</code>。</li>
+  <li><code>OpProfiler has no member 'opCost'</code>：<code>opCost</code> 是文件级函数，要通过 <code>profiler_mod.opCost</code> 调用。</li>
+  <li><code>expected type 'u64', found 'i64'</code>：<code>dims</code> 是 <code>i64</code>，参与 u64 运算前要用 <code>@intCast</code> 转换，比如 <code>kv_dim</code>、<code>tokens</code>、<code>rope_dim</code> 这几处。</li>
+  <li>运行时 panic <code>attempt to use null value</code>：某个 ATTN 节点的 <code>src[1]</code> 是 null。当前建图里 k 一定在 <code>src[1]</code>；如果你改过建图，先确认 src 的顺序。</li>
+</ul></div>
+
+<div class="callout check"><b>检查点</b>
+<ul>
+  <li><b>所有算子的 GB/s 都不超过硬件峰值</b>（RTX 3090 为 936 GB/s）。超过了说明某个 src 被多算了，用 <code>GB/s × avg_us</code> 反推每次调用的字节数来定位。</li>
+  <li>decode 阶段 PAGED_ATTN 的 AI ≈ 2：每次读约 1 MB 的 KV，做约 2 MFLOP 的计算。</li>
+  <li>decode 阶段 LINEAR 的 AI ≈ 1；prefill 阶段的 AI 随 prompt 长度线性增大。</li>
+  <li>decode 阶段 LINEAR 的 GB/s 应该和第 5 章的 decode GB/s 接近，因为绝大部分字节都是 LINEAR 读的。</li>
+  <li>某个算子 AI 很低、GB/s 也远低于峰值：说明 kernel 本身写得不好（访存不连续、没向量化），是优化的首选目标。</li>
+</ul></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="ch7">
+<h2><span class="chap">07</span>内存与 KV Cache 指标<span class="level">进阶</span></h2>
+<dl class="goal">
+  <dt>目标</dt><dd>报告每个设备上权重池、激活池、KV 池的容量、峰值和利用率，以及分页 KV 的块利用率和块内碎片。</dd>
+</dl>
+
+<h3>改动清单</h3>
+<div class="tbl"><table>
+  <thead><tr><th>文件</th><th>位置</th><th>类型</th><th>内容</th></tr></thead>
+  <tbody>
+    <tr><td><code>profiler/metrics.zig</code></td><td>import、文件末尾</td><td><span class="kind new">新增</span></td><td><code>printMemory</code></td></tr>
+    <tr><td><code>executor.zig</code></td><td>import、<code>generate()</code> 结尾</td><td><span class="kind mod">修改</span></td><td>调用 <code>printMemory</code></td></tr>
+  </tbody>
+</table></div>
+
+<h3>可以直接复用的数据结构</h3>
+<ul>
+  <li><code>memory/pools.zig</code> 的 <code>MemoryPool</code>：<code>used_</code>、<code>peak_</code>、<code>buffer.len</code>，以及现成的 <code>formatUsage(buf)</code>。</li>
+  <li><code>MemoryManager.devices_map</code>：<code>DeviceKey → *DeviceSlot</code>，<code>slot.pools</code> 下有 <code>weight / activation / kv_cache</code> 三个可选池。</li>
+  <li><code>MemoryManager.paged_atten_managers_map</code> → <code>PagedAttentionManager.layers</code> → <code>*LayerState</code>：<code>k_pool / v_pool</code> 是 <code>BlockPool</code>（有 <code>num_blocks</code>、<code>block_capacity</code>、<code>freeNum()</code>、<code>empty()</code>），<code>num_cached</code> 是该层已缓存的 token 数。</li>
+</ul>
+<div class="callout warn"><b>没有 reserve 的层</b><code>initLayer</code> 建出来的 <code>LayerState</code>，在 <code>reserveLayer</code> 之前 <code>k_pool.num_blocks == 0</code>。遍历时要用 <code>k_pool.empty()</code> 跳过，否则统计会出错，甚至除零。</div>
+
+<h3>指标定义</h3>
+<div class="formula">池利用率     = peak_ / capacity            (看峰值; 激活池每层都会回卷, 当前值没意义)
+KV 块利用率   = Σ(num_blocks − freeNum) / Σ num_blocks          (按层求和)
+块内碎片率   = 1 − Σ num_cached / (Σ 已用块数 × block_capacity)
+单层最大 token ≈ num_blocks × block_capacity</div>
+
+<h3><span class="step">1</span>metrics.zig：printMemory</h3>
+<div class="code" data-lang="diff" data-title="profiler/metrics.zig · import" data-kind="修改"><script type="text/plain">
+ const common = @import("common.zig");
+ const qwen3 = @import("../models/qwen3.zig");
++const MemoryManager = @import("../memory/manager.zig").MemoryManager;
+</script></div>
+<div class="code" data-lang="zig" data-title="profiler/metrics.zig · 追加到文件末尾" data-kind="新增"><script type="text/plain">
+/// 打印各设备内存池和分页 KV 的使用情况, 要在 resetKVCache 之前调用
+pub fn printMemory(mm: *MemoryManager) void {
+    std.debug.print("\n=== 内存 ===\n", .{});
+    var buf: [256]u8 = undefined;
+
+    var it = mm.devices_map.iterator();
+    while (it.next()) |e| {
+        const key = e.key_ptr.*;
+        const pools = &e.value_ptr.*.pools;
+        std.debug.print("[{s}#{d}]\n", .{ @tagName(key.device_type), key.device_id });
+        if (pools.weight) |*p| std.debug.print("  {s}\n", .{p.formatUsage(&buf)});
+        if (pools.activation) |*p| std.debug.print("  {s}\n", .{p.formatUsage(&buf)});
+        if (pools.kv_cache) |*p| std.debug.print("  {s}\n", .{p.formatUsage(&buf)});
+    }
+
+    var pit = mm.paged_atten_managers_map.valueIterator();
+    while (pit.next()) |pam| {
+        var used: i64 = 0;
+        var total: i64 = 0;
+        var cached: i64 = 0;
+        var cap: i64 = 0;
+
+        var lit = pam.*.layers.valueIterator();
+        while (lit.next()) |ls| {
+            const k = &ls.*.k_pool;
+            if (k.empty()) continue; // 还没 reserveLayer 的层
+            used += k.num_blocks - k.freeNum();
+            total += k.num_blocks;
+            cached += ls.*.num_cached;
+            cap = k.block_capacity;
+        }
+        if (total == 0 or used == 0) continue;
+
+        const used_f: f64 = @floatFromInt(used);
+        std.debug.print("  KV 块利用率 {d}/{d} ({d:.1}%), 块内碎片 {d:.1}%\n", .{
+            used,
+            total,
+            used_f / @as(f64, @floatFromInt(total)) * 100,
+            (1 - @as(f64, @floatFromInt(cached)) / (used_f * @as(f64, @floatFromInt(cap)))) * 100,
+        });
+    }
+}
+</script></div>
+
+<h3><span class="step">2</span>executor.zig：在 generate() 结尾调用</h3>
+<p>必须在 <code>generate()</code> 结束前调用：下一次 <code>generate()</code> 一开始就会 <code>resetKVCache()</code>，到那时看到的就是空池了。</p>
+<div class="code" data-lang="diff" data-title="executor.zig · import" data-kind="修改"><script type="text/plain">
+ const GenMetrics = @import("profiler/metrics.zig").GenMetrics;
++const printMemory = @import("profiler/metrics.zig").printMemory;
+</script></div>
+<div class="code" data-lang="diff" data-title="executor.zig · generate() 结尾" data-kind="修改"><script type="text/plain">
+         self.metrics.e2e_ns = total_timer.read(); // ③ 结束
+         if (self.metrics.enabled) {
+             self.metrics.print();
++            printMemory(self.memory_manager);
+         }
+</script></div>
+<p class="note"><code>MemoryPool.formatUsage</code> 里用到的 <code>utilization()</code> 是私有函数，但 <code>formatUsage</code> 本身是 <code>pub</code> 的，可以直接调用。</p>
+
+<h3>预期输出</h3>
+<p>下面是 RTX 3090 上的实测输出（Qwen3-0.6B BF16，<code>max_seq_len = 1024</code>，P = 21，生成 455 个 token）。embedding 在 CPU 上，其余各层在 GPU 上，所以有两个设备：</p>
+<div class="code" data-lang="text" data-title="stderr（RTX 3090 实测）"><script type="text/plain">
+=== 内存 ===
+[CPU#0]
+  weight: used=311164928/311164928,peak=311164928 (100.0%)
+  activation: used=42246912/355205120,peak=48324352 (11.9%)
+[CUDA#0]
+  weight: used=1192230912/1192230912,peak=1192230912 (100.0%)
+  activation: used=42248960/357302272,peak=48367360 (11.8%)
+  kv_cache: used=117440512/117444096,peak=117440512 (100.0%)
+  KV 块利用率 840/1792 (46.9%), 块内碎片 0.8%
+</script></div>
+<p class="note">括号里的百分比是 <code>formatUsage</code> 按 <b>used / capacity</b> 算的（见 <code>MemoryPool.utilization</code>），不是 peak / capacity。看激活池时要自己用 peak 去除：48324352 / 355205120 ≈ 13.6%。</p>
+
+<h3>逐项解读</h3>
+<p>每个数字都能从模型结构精确推算出来。推算对不上，就说明内存布局和你以为的不一样：</p>
+<div class="tbl"><table>
+  <thead><tr><th>行</th><th>数值</th><th>推算</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td>CPU weight</td><td class="num">311,164,928</td><td>151936 × 1024 × 2B</td><td>正好是整张 embedding 表，EMBEDDING 算子跑在 CPU 上</td></tr>
+    <tr><td>CUDA weight</td><td class="num">1,192,230,912</td><td>N_mm × 2B = 1,191,968,768<br>+ RMSNorm 权重 65536 × 4B = 262,144</td><td>和第 5 章 MBU 用的权重字节一致；norm 权重是 F32（每层 4 个 + 最后 1 个）</td></tr>
+    <tr><td>activation used</td><td class="num">≈ 42.2 MB</td><td>rope cos/sin 表：2 × 40960 × 128 × 4B = 41,943,040</td><td><b>不是 0</b>，见下面的说明</td></tr>
+    <tr><td>activation peak</td><td class="num">≈ 48.3 MB</td><td>42 MB 持久区 + 约 6 MB 中间结果</td><td>每一步真正的中间结果只有约 6 MB</td></tr>
+    <tr><td>kv_cache used</td><td class="num">117,440,512</td><td>28 层 × 64 块 × 32 KB × 2(K, V)</td><td><code>reserveLayer</code> 一次性预留，所以总是接近 100%，真正的使用率看下一行</td></tr>
+    <tr><td>KV 总块数</td><td class="num">1792</td><td>28 层 × 64 块；64 × 16 = 1024 = <code>max_seq_len</code></td><td>每块 16 token × 8 头 × 128 × 2B = 32 KB</td></tr>
+    <tr><td>KV 已用块数</td><td class="num">840</td><td>缓存 21 + 455 = 476 个 token，每层 ⌈476 / 16⌉ = 30 块，× 28 层</td><td>476 = prefill 的 21 个 + 455 次 decode forward</td></tr>
+    <tr><td>块内碎片</td><td class="num">0.8%</td><td>1 − 476 / (30 × 16) = 0.83%</td><td>每层只浪费最后一块里的 4 个槽位</td></tr>
+  </tbody>
+</table></div>
+
+<div class="callout warn"><b>为什么 activation 的 used 不是 0</b><code>forward()</code> 第一次运行时先算持久节点（rope 表），然后调用 <code>markPersistentCursor()</code> 记下每个激活池的水位。之后每层结束时 <code>resetStepActivations()</code> 只回卷到这个水位，不会回到 0。所以 <b>used 停在持久区的大小</b>，peak 才是"持久区 + 单层最大中间结果"。持久区的大小可以直接从 used 读出来，这里是 42 MB。</div>
+
+<div class="callout tip"><b>这份输出暴露的问题：rope 表大了 40 倍</b>rope 表的行数取自 <code>context_length</code>（Qwen3 的 GGUF 里是 40960），见 <code>module/rope.zig</code>。但推理时最多只用到 <code>max_seq_len = 1024</code> 行。结果是：
+<ul>
+  <li>CPU 和 GPU 的激活池里各存了一份 42 MB 的表，占激活峰值的 87%；</li>
+  <li>prefill 时在 CPU 上算这张表要 140 ms（第 4、6 章算子表里的 ROPE_CACHE），再拷到 GPU 又要约 5.6 ms（prefill 的 MEMCPY）。</li>
+</ul>
+行数改成 <code>min(context_length, max_seq_len)</code> 后，每份表只有 1 MB，激活峰值约 7 MB，TTFT 约减少 145 ms。</div>
+
+<div class="callout tip"><b>延伸：KV 占用的时间序列</b>想看 KV 占用随步数怎么增长，可以每 N 步把"已用块数"追加到一个 <code>ArrayList</code>，最后打印或写进 JSON。这和第 8 章的"每步快照"是同一种做法。</div>
+
+<div class="callout check"><b>检查点</b>
+<ul>
+  <li>GPU 权重池的 used = N_mm × 权重字节 + norm 权重字节，精确到字节。对不上就说明有权重放在了别的设备上，或者数据类型和你以为的不一样。</li>
+  <li>activation 的 used = 持久区大小（rope 表），peak − used ≈ 单层中间结果的最大值。</li>
+  <li>KV 已用块数 = 层数 × ⌈缓存 token 数 / block_capacity⌉。</li>
+  <li>单序列时每层最多只浪费最后一块里没填满的槽位，所以块内碎片率 ≤ (block_capacity − 1) / (已用块数 × block_capacity)，上下文越长越接近 0。</li>
+  <li>激活池的 peak 出现在 prefill，并随 prompt 长度增长（prompt 越长，单层中间结果越大）。</li>
+</ul></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="ch8">
+<h2><span class="chap">08</span>批处理与调度指标（前瞻）<span class="level">高级</span></h2>
+<dl class="goal">
+  <dt>目标</dt><dd>为 <code>runner/</code> 下的连续批处理路径设计请求级和步级指标：每个请求的 TTFT 和排队时间、平均 batch、prefill/decode 混合比例、抢占次数、块利用率、Goodput。</dd>
+  <dt>前提</dt><dd><code>runner/engine.zig</code> 还在开发中：<code>Executor.execute(entries)</code> 未实现，<code>radix.zig</code> 是空文件，<code>Engine.init</code> 调用 <code>BlockManager.init</code> 的参数也和签名不符。本章是"边写边埋点"的设计稿，等这条路径跑通后再接入。</dd>
+</dl>
+
+<h3>改动清单</h3>
+<div class="tbl"><table>
+  <thead><tr><th>文件</th><th>位置</th><th>类型</th><th>内容</th></tr></thead>
+  <tbody>
+    <tr><td><code>runner/batching.zig</code></td><td><code>Sequence</code> 字段</td><td><span class="kind mod">修改</span></td><td>四个时间戳</td></tr>
+    <tr><td><code>runner/stats.zig</code></td><td>新文件</td><td><span class="kind new">新增</span></td><td><code>EngineStats</code>：步级累加和最终报告</td></tr>
+    <tr><td><code>runner/engine.zig</code></td><td>import、字段、<code>init</code>、<code>addRequest</code>、<code>runStep</code></td><td><span class="kind mod">修改</span></td><td>打点和汇总</td></tr>
+  </tbody>
+</table></div>
+
+<h3>为什么单序列指标不够</h3>
+<p>到第 7 章为止，测的都是"一个请求独占引擎"。连续批处理之后，同一个 step 里同时有 prefill 块和多个 decode 序列，单个请求的 TTFT 里多了<b>排队时间</b>和<b>被别人的 prefill 拖慢的时间</b>。所以指标必须挂在 <code>Sequence</code> 上，按请求统计，再聚合成分布。</p>
+
+<h3><span class="step">1</span>batching.zig：Sequence 加时间戳</h3>
+<div class="code" data-lang="diff" data-title="runner/batching.zig · Sequence 字段" data-kind="修改"><script type="text/plain">
+     block_table: std.ArrayList(i32) = .empty,
+
+     params: SamplingParams,
++
++    // 时间戳都取自 Engine.clock.read(), 0 表示尚未发生
++    arrival_ns: u64 = 0, //     addRequest 时
++    scheduled_ns: u64 = 0, //   第一次被 schedule 选中
++    first_token_ns: u64 = 0, // 第一次 emits() 产出 token
++    finish_ns: u64 = 0, //      status 变成 finished
+</script></div>
+<div class="formula">queue_time = scheduled_ns   − arrival_ns
+TTFT       = first_token_ns − arrival_ns          (包含排队)
+TPOT       = (finish_ns − first_token_ns) / (completion_tokens − 1)
+E2E        = finish_ns − arrival_ns</div>
+
+<h3><span class="step">2</span>新建 runner/stats.zig</h3>
+<div class="code" data-lang="zig" data-title="src/runner/stats.zig" data-kind="新增"><script type="text/plain">
+const std = @import("std");
+
+const batching = @import("batching.zig");
+const Sequence = batching.Sequence;
+const Entry = batching.Entry;
+const BlockManager = @import("block.zig").BlockManager;
+
+const common = @import("../profiler/common.zig");
+
+pub const EngineStats = struct {
+    steps: u64 = 0,
+    prefill_steps: u64 = 0, //  含至少一个 prefill 块的 step
+    decode_steps: u64 = 0, //   全是 decode 的 step
+    sum_seqs: u64 = 0, //       Σ 每步序列数 → 平均 batch
+    sum_tokens: u64 = 0, //     Σ 每步 token 数
+    sched_ns: u64 = 0, //       schedule() 累计耗时
+    exec_ns: u64 = 0, //        execute() 累计耗时
+    sum_block_used: u64 = 0, // Σ 每步已用块 → 平均块利用率
+    peak_block_used: u64 = 0,
+
+    pub fn onStep(self: *EngineStats, entries: []const Entry, sched_ns: u64, exec_ns: u64, bm: *const BlockManager) void {
+        self.steps += 1;
+        self.sched_ns += sched_ns;
+        self.exec_ns += exec_ns;
+        self.sum_seqs += entries.len;
+
+        var has_prefill = false;
+        for (entries) |e| {
+            self.sum_tokens += e.q_len;
+            if (e.q_start < e.seq.num_prompt_tokens) has_prefill = true;
+        }
+        if (has_prefill) self.prefill_steps += 1 else self.decode_steps += 1;
+
+        const used = bm.num_blocks - bm.freeBlocksNum();
+        self.sum_block_used += used;
+        self.peak_block_used = @max(self.peak_block_used, used);
+    }
+
+    /// seqs: 所有序列(只统计已结束的); duration_ns: 从 Engine 启动到现在
+    pub fn print(
+        self: *const EngineStats,
+        allocator: std.mem.Allocator,
+        seqs: []const *Sequence,
+        num_blocks: usize,
+        num_preemptions: usize,
+        duration_ns: u64,
+    ) !void {
+        const steps_f: f64 = @floatFromInt(@max(self.steps, 1));
+        const blocks_f: f64 = @floatFromInt(@max(num_blocks, 1));
+        std.debug.print("\n=== 引擎指标 ===\n", .{});
+        std.debug.print("steps             : {d} (prefill {d} / decode {d})\n", .{ self.steps, self.prefill_steps, self.decode_steps });
+        std.debug.print("平均 batch        : {d:.2} seqs, {d:.1} tokens\n", .{
+            @as(f64, @floatFromInt(self.sum_seqs)) / steps_f,
+            @as(f64, @floatFromInt(self.sum_tokens)) / steps_f,
+        });
+        std.debug.print("调度开销          : {d:.2}%\n", .{
+            @as(f64, @floatFromInt(self.sched_ns)) / @as(f64, @floatFromInt(@max(self.sched_ns + self.exec_ns, 1))) * 100,
+        });
+        std.debug.print("块利用率 均值/峰值 : {d:.1}% / {d:.1}%\n", .{
+            @as(f64, @floatFromInt(self.sum_block_used)) / steps_f / blocks_f * 100,
+            @as(f64, @floatFromInt(self.peak_block_used)) / blocks_f * 100,
+        });
+        std.debug.print("抢占次数          : {d}\n", .{num_preemptions});
+
+        // 请求级分布
+        var ttft: std.ArrayList(u64) = .empty;
+        defer ttft.deinit(allocator);
+        var queue: std.ArrayList(u64) = .empty;
+        defer queue.deinit(allocator);
+        var good: usize = 0;
+        const slo_ttft: u64 = 500 * std.time.ns_per_ms;
+        const slo_tpot: u64 = 50 * std.time.ns_per_ms;
+
+        for (seqs) |s| {
+            if (s.finish_ns == 0) continue;
+            const t = s.first_token_ns - s.arrival_ns;
+            try ttft.append(allocator, t);
+            try queue.append(allocator, s.scheduled_ns - s.arrival_ns);
+            const n = s.numCompletionTokens();
+            const tpot: u64 = if (n > 1) (s.finish_ns - s.first_token_ns) / @as(u64, @intCast(n - 1)) else 0;
+            if (t <= slo_ttft and tpot <= slo_tpot) good += 1;
+        }
+        std.mem.sort(u64, ttft.items, {}, std.sort.asc(u64));
+        std.mem.sort(u64, queue.items, {}, std.sort.asc(u64));
+        std.debug.print("TTFT P50/P99      : {d:.1} / {d:.1} ms\n", .{
+            common.nsToMs(common.percentile(ttft.items, 50)),
+            common.nsToMs(common.percentile(ttft.items, 99)),
+        });
+        std.debug.print("排队 P50/P99      : {d:.1} / {d:.1} ms\n", .{
+            common.nsToMs(common.percentile(queue.items, 50)),
+            common.nsToMs(common.percentile(queue.items, 99)),
+        });
+        std.debug.print("Goodput           : {d:.2} req/s ({d}/{d} 满足 SLO)\n", .{
+            common.perSec(good, duration_ns), good, ttft.items.len,
+        });
+    }
+};
+</script></div>
+
+<h3><span class="step">3</span>engine.zig：import、字段、init、addRequest</h3>
+<div class="code" data-lang="diff" data-title="runner/engine.zig · import" data-kind="修改"><script type="text/plain">
+ const Executor = @import("../executor.zig").Executor;
++const EngineStats = @import("stats.zig").EngineStats;
+</script></div>
+<div class="code" data-lang="diff" data-title="runner/engine.zig · Engine 字段" data-kind="修改"><script type="text/plain">
+     batch_scheduler: BatchScheduler,
+     block_manager: BlockManager,
+     executor: *Executor,
++
++    clock: std.time.Timer, // 所有 Sequence 时间戳的共同起点
++    stats: EngineStats = .{},
+</script></div>
+<div class="code" data-lang="diff" data-title="runner/engine.zig · init()" data-kind="修改"><script type="text/plain">
+             .executor = executor,
+             .eos = cfg.eos,
++            .clock = try std.time.Timer.start(),
+         };
+</script></div>
+<div class="code" data-lang="diff" data-title="runner/engine.zig · addRequest()" data-kind="修改"><script type="text/plain">
+         self.next_id += 1;
++        s.arrival_ns = self.clock.read();
+
+         try self.seqs.append(self.allocator, s);
+</script></div>
+
+<h3><span class="step">4</span>engine.zig：runStep 打点</h3>
+<p>和原来的 <code>runStep</code> 相比，多了五处：调度计时、首次调度时间、执行计时、首 token 时间、结束时间，最后调用 <code>stats.onStep</code>。下面是改完后的完整函数。</p>
+<div class="code" data-lang="zig" data-title="runner/engine.zig · runStep()（改完后的完整版）" data-kind="修改"><script type="text/plain">
+    pub fn runStep(self: *Self) !usize {
+        var t = try std.time.Timer.start();
+        const entries = try self.batch_scheduler.schedule();
+        const sched_ns = t.lap(); // 调度开销
+
+        self.last = entries;
+        if (entries.len == 0) {
+            return error.SchedulerStuck;
+        }
+
+        const now0 = self.clock.read();
+        for (entries) |e| {
+            if (e.seq.scheduled_ns == 0) e.seq.scheduled_ns = now0;
+        }
+
+        const out_token_ids = try self.executor.execute(entries);
+        const exec_ns = t.lap(); // forward + sample
+
+        self.emitted.clearRetainingCapacity();
+        var buf: std.ArrayList(i32) = .empty;
+        defer buf.deinit(self.allocator);
+
+        const now = self.clock.read();
+        for (entries, 0..) |e, idx| {
+            if (e.emits()) {
+                if (e.seq.first_token_ns == 0) e.seq.first_token_ns = now;
+                try buf.append(self.allocator, out_token_ids[idx]);
+                try self.emitted.append(self.allocator, .{
+                    .seq = e.seq,
+                    .token_id = out_token_ids[idx],
+                });
+            }
+        }
+
+        const n = try self.batch_scheduler.postprocess(entries, buf.items);
+        for (entries) |e| {
+            if (e.seq.status == .finished and e.seq.finish_ns == 0) e.seq.finish_ns = now;
+        }
+
+        self.stats.onStep(entries, sched_ns, exec_ns, &self.block_manager);
+        return n;
+    }
+</script></div>
+<div class="callout warn"><b>在 releaseFinishedSeqs 之前汇总</b><code>releaseFinishedSeqs()</code> 会销毁已结束的 <code>Sequence</code>。请求级统计要在它之前调用：
+<div class="code" data-lang="zig" data-title="调用方（例如 chat 循环结束后）"><script type="text/plain">
+try engine.stats.print(
+    allocator,
+    engine.seqs.items,
+    engine.block_manager.num_blocks,
+    engine.batch_scheduler.num_preemtions, // 注意原字段的拼写
+    engine.clock.read(),
+);
+engine.releaseFinishedSeqs();
+</script></div></div>
+
+<h3>聚合指标一览</h3>
+<div class="tbl"><table>
+  <thead><tr><th>指标</th><th>计算</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td>平均 batch（序列）</td><td><code>sum_seqs / steps</code></td><td>越接近 <code>max_num_seqs</code>，权重读取越能被分摊</td></tr>
+    <tr><td>平均 batch（token）</td><td><code>sum_tokens / steps</code></td><td>和 <code>max_num_batched_tokens</code> 比较</td></tr>
+    <tr><td>prefill 步占比</td><td><code>prefill_steps / steps</code></td><td>占比高说明 decode 序列经常被 prefill 打断</td></tr>
+    <tr><td>调度开销占比</td><td><code>sched_ns / (sched_ns + exec_ns)</code></td><td>超过 5% 就要看 <code>schedule()</code> 是否有 O(n²) 遍历</td></tr>
+    <tr><td>抢占次数</td><td><code>batch_scheduler.num_preemtions</code></td><td>已有字段，非 0 说明 KV 块不够用</td></tr>
+    <tr><td>块利用率</td><td><code>sum_block_used / steps / num_blocks</code></td><td>峰值接近 100% 时就要开始抢占了</td></tr>
+    <tr><td>Prefix 命中率</td><td><code>Σ 复用 token / Σ prompt token</code></td><td>等 <code>radix.zig</code> 实现后，在 <code>Sequence</code> 上加 <code>num_cached_prefix</code></td></tr>
+    <tr><td>Goodput</td><td>满足 SLO 的请求数 / 总时长</td><td>示例 SLO：TTFT ≤ 500 ms 且 TPOT ≤ 50 ms</td></tr>
+  </tbody>
+</table></div>
+
+<div class="callout tip"><b>怎么验证批处理的收益</b>固定一组请求（例如 32 条，prompt 各 128 token，各生成 128 token），把 <code>max_num_seqs</code> 依次设为 1、2、4、8、16、32，记录总吞吐和 P99 TPOT。理想情况下吞吐几乎线性增长，TPOT 只缓慢上升，直到某个点变成受算力限制。这个拐点就是你的硬件和实现的"最佳并发"。</div>
+
+<div class="callout check"><b>检查点</b>
+<ul>
+  <li>所有请求结束后，<code>Σ completion_tokens</code> = 各步 <code>emits()</code> 的总次数。</li>
+  <li>只有一个请求时，Engine 路径的 TTFT/TPOT 和第 1–2 章 Executor 路径的结果接近。</li>
+  <li><code>chunked</code> 策略下 prefill 步占比上升，但有长 prompt 请求到来时，其它请求的 P99 TPOT 下降。</li>
+</ul></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="ch9">
+<h2><span class="chap">09</span>报告输出与基准方法<span class="level">高级</span></h2>
+<dl class="goal">
+  <dt>目标</dt><dd>除了人读的表格，再输出一份机器可读的 JSON；建立一套可重复的基准流程，用来比较不同后端和不同提交。</dd>
+  <dt>开关</dt><dd>新增 <code>LLMGEN_METRICS_JSON=路径</code>。</dd>
+</dl>
+
+<h3>改动清单</h3>
+<div class="tbl"><table>
+  <thead><tr><th>文件</th><th>位置</th><th>类型</th><th>内容</th></tr></thead>
+  <tbody>
+    <tr><td><code>profiler/metrics.zig</code></td><td>文件末尾、<code>GenMetrics</code> 内</td><td><span class="kind new">新增</span></td><td><code>Report</code>、<code>writeJson</code>、<code>GenMetrics.toReport</code></td></tr>
+    <tr><td><code>executor.zig</code></td><td>import、<code>generate()</code> 结尾</td><td><span class="kind mod">修改</span></td><td>print 之后写 JSON</td></tr>
+    <tr><td><code>tmp/bench.sh</code></td><td>新文件</td><td><span class="kind new">新增</span></td><td>多次运行，取中位数</td></tr>
+  </tbody>
+</table></div>
+
+<h3><span class="step">1</span>metrics.zig：Report 与 writeJson</h3>
+<p><code>Report</code> 里只放数值和短字符串，方便 <code>std.json</code> 直接序列化。</p>
+<div class="code" data-lang="zig" data-title="profiler/metrics.zig · 追加到文件末尾" data-kind="新增"><script type="text/plain">
+pub const Report = struct {
+    backend: []const u8,
+    prompt_tokens: usize,
+    gen_tokens: usize,
+    prefill_ms: f64,
+    ttft_ms: f64,
+    tpot_ms: f64,
+    itl_p50_ms: f64,
+    itl_p99_ms: f64,
+    prefill_tps: f64,
+    decode_tps: f64,
+    e2e_ms: f64,
+};
+
+/// 路径来自 LLMGEN_METRICS_JSON, 没设就什么都不做
+pub fn writeJson(report: Report) !void {
+    const path = std.posix.getenv("LLMGEN_METRICS_JSON") orelse return;
+    var file = try std.fs.cwd().createFile(path, .{});
+    defer file.close();
+
+    var buf: [4096]u8 = undefined;
+    var w = file.writer(&buf);
+    try w.interface.print("{f}\n", .{std.json.fmt(report, .{ .whitespace = .indent_2 })});
+    try w.interface.flush();
+}
+</script></div>
+
+<h3><span class="step">2</span>metrics.zig：GenMetrics.toReport</h3>
+<p><code>toReport</code> 用到分位数，而分位数要求 <code>itl_ns</code> 有序，这一步是在 <code>print()</code> 里完成的，所以<b>必须在 <code>print()</code> 之后调用</b>。</p>
+<div class="code" data-lang="zig" data-title="profiler/metrics.zig · GenMetrics 内新增方法（放在 print 后面）" data-kind="新增"><script type="text/plain">
+    /// 必须在 print() 之后调用: print 会把 itl_ns 排序, 分位数依赖有序
+    pub fn toReport(self: *const Self, backend: []const u8) Report {
+        const itl = self.itl_ns.items;
+        return .{
+            .backend = backend,
+            .prompt_tokens = self.prompt_tokens_len,
+            .gen_tokens = self.gen_tokens_len,
+            .prefill_ms = common.nsToMs(self.prefill_ns),
+            .ttft_ms = common.nsToMs(self.ttft_ns),
+            .tpot_ms = common.nsToMs(self.tpotNs()),
+            .itl_p50_ms = common.nsToMs(common.percentile(itl, 50)),
+            .itl_p99_ms = common.nsToMs(common.percentile(itl, 99)),
+            .prefill_tps = common.perSec(self.prompt_tokens_len, self.prefill_ns),
+            .decode_tps = common.perSec(itl.len, self.decodeNs()),
+            .e2e_ms = common.nsToMs(self.e2e_ns),
+        };
+    }
+</script></div>
+
+<h3><span class="step">3</span>executor.zig：print 之后写 JSON</h3>
+<div class="code" data-lang="diff" data-title="executor.zig · import" data-kind="修改"><script type="text/plain">
+ const GenMetrics = @import("profiler/metrics.zig").GenMetrics;
+ const printMemory = @import("profiler/metrics.zig").printMemory;
++const writeJson = @import("profiler/metrics.zig").writeJson;
+</script></div>
+<div class="code" data-lang="diff" data-title="executor.zig · generate() 结尾" data-kind="修改"><script type="text/plain">
+         if (self.metrics.enabled) {
+             self.metrics.print();
+             printMemory(self.memory_manager);
++            const backend = if (opts.have_cuda) "cuda" else "cpu";
++            writeJson(self.metrics.toReport(backend)) catch |err| {
++                std.debug.print("写 metrics json 失败: {s}\n", .{@errorName(err)});
++            };
+         }
+</script></div>
+<p class="note">写文件失败不应该让推理失败，所以这里用 <code>catch</code> 打印错误，不往上抛。<code>backend</code> 的写法按你的构建选项调整，比如加上 metal。</p>
+
+<h3><span class="step">4</span>基准脚本</h3>
+<ol>
+  <li><b>固定输入</b>：prompt 文本、<code>max_new</code>、<code>seed</code>（<code>GraphScheduler</code> 的 config 里已有 <code>seed = 42</code>）。比较性能时可以临时换成 <code>sampleArgmax</code>，保证每次生成的长度一致。</li>
+  <li><b>固定构建</b>：<code>-Doptimize=ReleaseFast</code>，记录 git commit 和后端。</li>
+  <li><b>重复取中位数</b>：同一配置至少跑 5 次，报中位数，同时看最小值和最大值的差距来判断噪声。</li>
+  <li><b>扫参数</b>：prompt 长度（64/256/1024）× 生成长度（128/1024）× 后端。</li>
+  <li><b>排除干扰</b>：关掉 <code>LLMGEN_PROFILE</code>；生成时不打印 token（tokenizer 传 null）；笔记本插上电源。</li>
+</ol>
+<div class="code" data-lang="sh" data-title="tmp/bench.sh（放在项目的 tmp/ 目录下）" data-kind="新增"><script type="text/plain">
+#!/usr/bin/env bash
+set -euo pipefail
+zig build -Doptimize=ReleaseFast
+commit=$(git rev-parse --short HEAD)
+out="tmp/bench/${commit}"
+mkdir -p "$out"
+for i in 1 2 3 4 5; do
+  LLMGEN_METRICS=1 \
+  LLMGEN_METRICS_JSON="${out}/run${i}.json" \
+  ./zig-out/bin/llminfer > /dev/null 2>&1
+done
+# 汇总: 取各指标中位数
+python3 - "$out" <<'EOF'
+import json, glob, sys, statistics as st
+runs = [json.load(open(f)) for f in sorted(glob.glob(sys.argv[1] + "/*.json"))]
+for k in ["ttft_ms", "tpot_ms", "itl_p99_ms", "prefill_tps", "decode_tps"]:
+    xs = [r[k] for r in runs]
+    print(f"{k:12s} median={st.median(xs):9.2f}  min={min(xs):9.2f}  max={max(xs):9.2f}")
+EOF
+</script></div>
+
+<div class="callout tip"><b>跨后端对比的口径</b>报告里写明：后端、设备型号、构建模式、权重和 KV 的数据类型、prompt 和生成长度、是否逐算子 sync。只要有一项不同，数字就不能直接比较。</div>
+
+<div class="callout err"><b>常见编译错误</b>
+<ul>
+  <li>format 相关报错：Zig 0.15 里 <code>std.json.fmt</code> 返回的 Formatter 要配合 <code>{f}</code> 使用，不能用 <code>{}</code> 或 <code>{any}</code>。</li>
+  <li><code>no field named 'interface'</code>：<code>file.writer(&amp;buf)</code> 返回的是 <code>File.Writer</code>，打印要通过 <code>w.interface.print(...)</code>，最后别忘了 <code>flush()</code>，否则文件是空的。</li>
+</ul></div>
+
+<div class="callout check"><b>检查点</b>
+<ul>
+  <li>同一配置 5 次运行的 TPOT 波动在 ±3% 以内。超出的话，先排查后台负载和温控降频。</li>
+  <li>改了一个算子之后，能用两个 commit 的 JSON 中位数说明"快了多少、快在哪个阶段"。</li>
+</ul></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="appx">
+<h2><span class="chap">附</span>速查表与常见坑</h2>
+
+<h3>指标速查表</h3>
+<div class="tbl"><table>
+  <thead><tr><th>指标</th><th>公式</th><th>代码位置</th><th>章</th></tr></thead>
+  <tbody>
+    <tr><td>TTFT</td><td>首次 sample 返回 − 开始</td><td><code>GenMetrics.onGenToken</code></td><td>1–2</td></tr>
+    <tr><td>E2E</td><td>generate 准备 return − 开始</td><td><code>Executor.generate</code></td><td>1</td></tr>
+    <tr><td>TPOT</td><td>(t_last − TTFT) / len(ITL)</td><td><code>GenMetrics.tpotNs</code></td><td>2</td></tr>
+    <tr><td>ITL P50/P90/P99</td><td>相邻 token 间隔的分位数</td><td><code>GenMetrics.print</code></td><td>2</td></tr>
+    <tr><td>prefill / decode tok/s</td><td>P / prefill_s，len(ITL) / (t_last − TTFT)</td><td><code>GenMetrics.print</code></td><td>3</td></tr>
+    <tr><td>算子耗时（按阶段）</td><td>Σ ns per phase × op × device</td><td><code>OpProfiler.record / printPhase</code></td><td>4</td></tr>
+    <tr><td>时间账本</td><td>forward + sample + detok + 其它</td><td><code>GenMetrics.printBreakdown</code></td><td>4</td></tr>
+    <tr><td>decode 框架开销</td><td>(forward_ns − prefill_ns) − opNs(.decode)</td><td><code>GenMetrics.printOverhead</code></td><td>4</td></tr>
+    <tr><td>MFU (prefill)</td><td>FLOPs / s / 峰值 FLOPS</td><td><code>printEfficiency</code></td><td>5</td></tr>
+    <tr><td>MBU (decode)</td><td>Bytes / s / 峰值带宽</td><td><code>printEfficiency</code></td><td>5</td></tr>
+    <tr><td>算子 AI / GFLOP/s / GB/s</td><td>flops/bytes，flops/ns，bytes/ns</td><td><code>opCost</code> + <code>printPhase</code></td><td>6</td></tr>
+    <tr><td>池峰值 / 利用率</td><td>peak_ / capacity</td><td><code>printMemory</code></td><td>7</td></tr>
+    <tr><td>KV 块利用率 / 碎片</td><td>已用块 / 总块，1 − cached / (块 × 容量)</td><td><code>printMemory</code></td><td>7</td></tr>
+    <tr><td>排队时间、请求级 TTFT</td><td>scheduled − arrival，first_token − arrival</td><td><code>Engine.runStep</code></td><td>8</td></tr>
+    <tr><td>平均 batch / 调度开销</td><td>Σ seqs / steps，sched / (sched + exec)</td><td><code>EngineStats.onStep</code></td><td>8</td></tr>
+    <tr><td>Goodput</td><td>满足 SLO 的请求 / 时长</td><td><code>EngineStats.print</code></td><td>8</td></tr>
+  </tbody>
+</table></div>
+
+<h3>环境变量</h3>
+<div class="tbl"><table>
+  <thead><tr><th>变量</th><th>作用</th><th>状态</th></tr></thead>
+  <tbody>
+    <tr><td><code>LLMGEN_PROFILE</code></td><td>算子级耗时统计</td><td>已有</td></tr>
+    <tr><td><code>LLMGEN_NO_KV_CACHE</code></td><td>关闭 KV Cache，整段重跑（用来对比 KV Cache 的收益）</td><td>已有</td></tr>
+    <tr><td><code>LLMGEN_FLASH</code></td><td>注意力改用 FLASH_ATTN</td><td>已有</td></tr>
+    <tr><td><code>LLMGEN_METRICS</code></td><td>生成指标（TTFT / TPOT / 吞吐 / 时间账本 / 内存）</td><td>第 1 章新增</td></tr>
+    <tr><td><code>LLMGEN_PEAK_TFLOPS</code> / <code>LLMGEN_PEAK_GBPS</code></td><td>硬件峰值，用于 MFU / MBU</td><td>第 5 章新增</td></tr>
+    <tr><td><code>LLMGEN_METRICS_JSON</code></td><td>JSON 报告的输出路径</td><td>第 9 章新增</td></tr>
+  </tbody>
+</table></div>
+
+<h3>常见坑</h3>
+<div class="tbl"><table>
+  <thead><tr><th>坑</th><th>症状</th><th>对策</th></tr></thead>
+  <tbody>
+    <tr><td>用 Debug 构建测性能</td><td>慢 10 倍以上，各算子比例也失真</td><td>只用 ReleaseFast 报数</td></tr>
+    <tr><td>TTFT 写了两处</td><td>第一个 ITL 偏小，TTFT 偏大一点</td><td>只在 <code>onGenToken</code> 里写</td></tr>
+    <tr><td>TPOT 用 E2E 计算</td><td>TPOT 偏大，和 ITL 均值对不上</td><td>用 <code>last_emit_ns</code> 做终点</td></tr>
+    <tr><td>最后一个 token 后还在 forward</td><td>以 max_tokens 结束时白跑一次 forward</td><td><code>idx + 1 == max_tokens</code> 时 break</td></tr>
+    <tr><td>打印算进了 TPOT</td><td>TPOT 比算子总和明显大</td><td>第 4 章拆出 <code>detok_ns</code>；测量时 tokenizer 传 null</td></tr>
+    <tr><td>CUDA 计时没包含 sync</td><td>算子耗时偏小，"(其它)"偏大</td><td>sync 放进计时区间</td></tr>
+    <tr><td>冷启动算进 prefill</td><td>第一次运行的 TTFT 远大于后续</td><td>预热一轮，或者单独报告首轮</td></tr>
+    <tr><td>短 prompt 测 prefill 吞吐</td><td>prefill tok/s 低得离谱</td><td>用 256+ token 的 prompt 画曲线</td></tr>
+    <tr><td>MBU 算进了 embedding 表</td><td>MBU 偏高，甚至超过 100%</td><td>只计矩阵乘权重 + KV</td></tr>
+    <tr><td>reset 时整体赋值结构体</td><td><code>DebugAllocator</code> 报泄漏</td><td>逐字段清零，ArrayList 用 <code>clearRetainingCapacity</code></td></tr>
+    <tr><td>新加的累加器没 reset</td><td>多次 generate 后数字越来越大</td><td>每加一个字段，<code>reset()</code> 里同步加一行</td></tr>
+    <tr><td><code>*const Self</code> 上调用 <code>EnumArray.getPtr</code></td><td>接上调用后才报类型错误</td><td>改用 <code>getPtrConst</code></td></tr>
+    <tr><td>executor 里导入 <code>common</code> 重名</td><td>两个 <code>common</code> 冲突</td><td>统计逻辑放在 <code>profiler/</code> 里，executor 只调用</td></tr>
+    <tr><td>只看均值</td><td>偶尔卡顿，但均值正常</td><td>看 P99 ITL 和 max</td></tr>
+  </tbody>
+</table></div>
+
+<h3>建议的落地顺序</h3>
+<ol>
+  <li>第 1–3 章：拿到 TTFT / TPOT / 吞吐，作为之后所有对比的基线。</li>
+  <li>第 4 章：把时间账本拆清楚，往往能直接发现最便宜的优化点（比如每个 token 5 ms 的 top-p 全量排序）。</li>
+  <li>第 5–6 章：知道离上限有多远，再决定优化哪个算子。</li>
+  <li>第 7 章：调大 <code>max_seq_len</code> 或接入批处理之前必须做。</li>
+  <li>第 8–9 章：等 <code>runner/</code> 路径跑通后接入，同时建立基准脚本，防止性能回退。</li>
+</ol>
+</section>
+</main>
+</div>
+
+<script>
+(function () {
+  var KW = /^(const|var|fn|pub|return|if|else|while|for|switch|try|defer|errdefer|struct|enum|orelse|catch|break|continue|null|true|false|undefined|and|or|set|do|done|in|import|mkdir|git|zig|python3)$/;
+  function esc(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+  function highlight(src, lang) {
+    if (lang === "text") return esc(src);
+    var re = lang === "sh"
+      ? /(#[^\n]*)|("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*')|\b([A-Za-z_][A-Za-z0-9_]*)\b|\b(\d[\d_.]*)\b/g
+      : /(\/\/[^\n]*)|("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*')|\b([A-Za-z_][A-Za-z0-9_]*)\b|\b(\d[\d_.]*)\b/g;
+    var out = "", last = 0, m;
+    while ((m = re.exec(src))) {
+      out += esc(src.slice(last, m.index));
+      if (m[1]) out += '<span class="tk-com">' + esc(m[1]) + "</span>";
+      else if (m[2]) out += '<span class="tk-str">' + esc(m[2]) + "</span>";
+      else if (m[3]) out += KW.test(m[3]) ? '<span class="tk-kw">' + m[3] + "</span>" : esc(m[3]);
+      else if (m[4]) out += '<span class="tk-num">' + esc(m[4]) + "</span>";
+      last = re.lastIndex;
+    }
+    return out + esc(src.slice(last));
+  }
+
+  document.querySelectorAll(".code").forEach(function (box) {
+    var s = box.querySelector(':scope > script[type="text/plain"]');
+    if (!s) return;
+    var raw = s.textContent.replace(/^\n/, "").replace(/\s+$/, "");
+    var lang = box.getAttribute("data-lang") || "zig";
+    var title = box.getAttribute("data-title") || "";
+    var kind = box.getAttribute("data-kind");
+    var html = "", copyText;
+
+    if (lang === "diff") {
+      var keep = [];
+      raw.split("\n").forEach(function (line) {
+        var mark = line.charAt(0), body = line.slice(1), cls = "ctx";
+        if (mark === "+") cls = "add";
+        else if (mark === "-") cls = "del";
+        else if (mark !== " ") body = line; // 容错: 没写前导空格的上下文行
+        if (cls !== "del") keep.push(body);
+        html += '<span class="ln ' + cls + '">' + (highlight(body, "zig") || " ") + "</span>";
+      });
+      copyText = keep.join("\n");
+    } else {
+      raw.split("\n").forEach(function (line) {
+        html += '<span class="ln">' + (highlight(line, lang) || " ") + "</span>";
+      });
+      copyText = raw;
+    }
+
+    var bar = document.createElement("div");
+    bar.className = "bar";
+    var label = document.createElement("span");
+    label.textContent = title;
+    if (kind) {
+      var tag = document.createElement("span");
+      tag.className = "tag";
+      tag.textContent = kind;
+      label.appendChild(tag);
+    }
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = "复制";
+    btn.addEventListener("click", function () {
+      try {
+        navigator.clipboard.writeText(copyText).then(function () {
+          btn.textContent = "已复制";
+          setTimeout(function () { btn.textContent = "复制"; }, 1200);
+        });
+      } catch (e) {}
+    });
+    bar.appendChild(label);
+    bar.appendChild(btn);
+    var pre = document.createElement("pre");
+    var code = document.createElement("code");
+    code.innerHTML = html;
+    pre.appendChild(code);
+    s.replaceWith(bar, pre);
+  });
+
+  // 目录高亮
+  var links = Array.prototype.slice.call(document.querySelectorAll("nav.toc a"));
+  var map = {};
+  links.forEach(function (a) { map[a.getAttribute("href").slice(1)] = a; });
+  if ("IntersectionObserver" in window) {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) {
+          links.forEach(function (a) { a.classList.remove("active"); });
+          var a = map[e.target.id];
+          if (a) a.classList.add("active");
+        }
+      });
+    }, { rootMargin: "-20% 0px -70% 0px" });
+    document.querySelectorAll("main section").forEach(function (s) { io.observe(s); });
+  }
+
+  // 深浅色切换
+  var root = document.documentElement;
+  try {
+    var saved = localStorage.getItem("llmgen-perf-theme");
+    if (saved) root.setAttribute("data-theme", saved);
+  } catch (e) {}
+  document.getElementById("themeBtn").addEventListener("click", function () {
+    var dark = root.getAttribute("data-theme")
+      ? root.getAttribute("data-theme") === "dark"
+      : window.matchMedia("(prefers-color-scheme: dark)").matches;
+    var next = dark ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    try { localStorage.setItem("llmgen-perf-theme", next); } catch (e) {}
+  });
+})();
+</script>
+</body>
+</html>

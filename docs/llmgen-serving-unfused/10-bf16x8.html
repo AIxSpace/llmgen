@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bf16x8 向量化 · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html" class="active"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">阶段 3 · kernel</div>
+<h1>bf16x8 向量化</h1>
+<p class="lead">逐元素 kernel 一个线程搬 16 字节。</p>
+<div class="callout goal"><span class="t">本步目标</span>add / mul / silu 三个逐元素 kernel 从“一个线程搬一个 bf16（2 字节）”改成“一个线程搬 8 个 bf16（16 字节）”。</div>
+<h2>原理</h2>
+<h3>逐元素 kernel 是带宽受限的</h3>
+<p>add、mul、silu 每个元素只做一两次浮点运算，时间全花在读写显存上。这类 kernel 快不快，看的是每秒能搬多少字节，上限是显存带宽（3090 约 936 GB/s）。</p>
+<p>起点的写法是最直接的：</p>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cuda/arithmetic.cu（add 部分）</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">template&lt;typename T&gt;
+__global__ void add_kernel(const T* __restrict__ input1,const T* __restrict__ input2,T* __restrict__ output, size_t size) {
+    size_t glob_id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (glob_id &lt; size) {
+        output[glob_id] = input1[glob_id] + input2[glob_id];
+    }
+}
+
+// 对照 AddImpl&lt;Device::CUDA&gt;::execute(Tensor* t, int32_t dev_id)
+extern &quot;C&quot; void cuda_add(void *out, const void *in1, const void *in2, int dtype, size_t numel, int dev_id) {
+    cudaSetDevice(dev_id);
+
+    constexpr int threads = 256;
+    int blocks = (numel + threads - 1) / threads;
+
+    switch (dtype) {
+        case GT_F16:
+            add_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(static_cast&lt;const __half*&gt;(in1), static_cast&lt;const __half*&gt;(in2), static_cast&lt;__half*&gt;(out), numel);
+            break;
+        case GT_BF16:
+            add_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(static_cast&lt;const __nv_bfloat16*&gt;(in1), static_cast&lt;const __nv_bfloat16*&gt;(in2), static_cast&lt;__nv_bfloat16*&gt;(out), numel);
+            break;
+        case GT_F32:
+            add_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(static_cast&lt;const float*&gt;(in1), static_cast&lt;const float*&gt;(in2), static_cast&lt;float*&gt;(out), numel);
+            break;
+        default:
+            fprintf(stderr, &quot;cuda::add not implemented\n&quot;);
+    }
+}</code></pre></div>
+<p>一个线程读两个 bf16、写一个 bf16，每次访存 2 字节。问题不在“算得慢”，而在<b>同样的数据量要发起 8 倍的访存指令</b>。GPU 的访存指令有固定开销，单次搬得太少，带宽就喂不满。</p>
+
+<h3>实测：每线程搬多宽合适</h3>
+<div class="codeblock"><div class="cap"><span><b>cuda-course/results.txt · 第 01 课（256 MB 数据）</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="nohighlight">[B-D] 合并访问, 每线程搬运宽度不同
+  bf16   (2B/线程)                   691.866 us    776.0 GB/s  ( 82.9% of peak)
+  float  (4B/线程)                   620.424 us    865.3 GB/s  ( 92.4% of peak)
+  float4 (16B/线程)                  622.179 us    862.9 GB/s  ( 92.2% of peak)
+  cudaMemcpy D2D (参考上限)        623.872 us    860.5 GB/s  ( 91.9% of peak)
+
+[E] 带计算的 bf16 逐元素 kernel(y = x * 0.5)
+  bf16 标量, 一线程一元素      695.386 us    772.0 GB/s  ( 82.5% of peak)
+  bf16x8, 一线程 8 元素           622.232 us    862.8 GB/s  ( 92.2% of peak)
+  bf16x8 + grid-stride(SM×8 块)      641.587 us    836.8 GB/s  ( 89.4% of peak)</code></pre></div>
+<p>每线程 2 字节只能到峰值的 83%，4 字节以上就到 92% 了，和 <code>cudaMemcpy</code> 持平。带计算的逐元素 kernel 同样：标量 772 GB/s，<code>bf16x8</code> 862.8 GB/s <span class="src lab">lab 实测</span>。</p>
+
+<h3>bf16x8</h3>
+<div class="codeblock"><div class="cap"><span><b>backend/cuda/cuda_common.cuh（第 03 步已经加进 llmgen）</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">// 8 个 bf16 = 16 字节的向量化读写
+struct __align__(16) bf16x8 { __nv_bfloat162 h[4]; };
+
+__device__ __forceinline__ void unpack8(const bf16x8 &amp;v, float *f) {
+#pragma unroll
+    for (int i = 0; i &lt; 4; ++i) {
+        float2 t = __bfloat1622float2(v.h[i]);
+        f[2 * i] = t.x;
+        f[2 * i + 1] = t.y;
+    }
+}
+__device__ __forceinline__ bf16x8 pack8(const float *f) {
+    bf16x8 v;
+#pragma unroll
+    for (int i = 0; i &lt; 4; ++i) v.h[i] = __floats2bfloat162_rn(f[2 * i], f[2 * i + 1]);
+    return v;
+}</code></pre></div>
+<p>一个 16 字节对齐的结构体，编译器会生成一条 128 位的 load / store。<code>unpack8</code> 把它解成 8 个 float，在 f32 里算，<code>pack8</code> 就近舍入回 bf16。</p>
+<p>前提有两个：元素数是 8 的倍数（hidden 1024、ffn 3072 都是）；地址 16 字节对齐（激活池按 64 对齐分配，满足）。</p>
+
+<h3>grid-stride 循环</h3>
+<p>lab 的 kernel 还有一处不同：线程不是“一人一个元素然后退出”，而是循环处理 <code>i, i + 总线程数, i + 2×总线程数, …</code>。配合 <code>grid_for</code> 给 grid 设上限（65535 × 8 个 block），大批时不会因为 block 数超限而发射失败，同一份 kernel 从 1024 个元素到几亿个元素都能用。</p>
+
+<h2>改动</h2>
+<h3><span class="stepno">1</span>换掉两个 .cu</h3>
+<p>用 lab 的 <code>arithmetic.cu</code> 和 <code>activation.cu</code> 覆盖 llmgen 的同名文件：</p>
+<div class="codeblock"><div class="cap"><span><b>backend/cuda/arithmetic.cu</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">#include &quot;cuda_common.cuh&quot;
+
+// ------------------------------------------------------------------
+// add / mul: out = a ∘ b, n 个元素(n 为 8 的倍数)
+// ------------------------------------------------------------------
+__global__ void add_kernel(bf16x8 *out, const bf16x8 *a, const bf16x8 *b, long n8) {
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i &lt; n8; i += (long)gridDim.x * blockDim.x) {
+        float x[8], y[8];
+        unpack8(a[i], x);
+        unpack8(b[i], y);
+#pragma unroll
+        for (int k = 0; k &lt; 8; ++k) x[k] += y[k];
+        out[i] = pack8(x);
+    }
+}
+__global__ void mul_kernel(bf16x8 *out, const bf16x8 *a, const bf16x8 *b, long n8) {
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i &lt; n8; i += (long)gridDim.x * blockDim.x) {
+        float x[8], y[8];
+        unpack8(a[i], x);
+        unpack8(b[i], y);
+#pragma unroll
+        for (int k = 0; k &lt; 8; ++k) x[k] *= y[k];
+        out[i] = pack8(x);
+    }
+}
+
+extern &quot;C&quot; void cuda_add(cuda_bf16_t *out, const cuda_bf16_t *a, const cuda_bf16_t *b, long n) {
+    const long n8 = n / 8;
+    if (n8 &lt;= 0) return;
+    add_kernel&lt;&lt;&lt;grid_for(n8, 256), 256, 0, g_cuda_stream&gt;&gt;&gt;((bf16x8 *)out, (const bf16x8 *)a, (const bf16x8 *)b, n8);
+}
+extern &quot;C&quot; void cuda_mul(cuda_bf16_t *out, const cuda_bf16_t *a, const cuda_bf16_t *b, long n) {
+    const long n8 = n / 8;
+    if (n8 &lt;= 0) return;
+    mul_kernel&lt;&lt;&lt;grid_for(n8, 256), 256, 0, g_cuda_stream&gt;&gt;&gt;((bf16x8 *)out, (const bf16x8 *)a, (const bf16x8 *)b, n8);
+}</code></pre></div>
+<div class="codeblock"><div class="cap"><span><b>backend/cuda/activation.cu</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">#include &quot;cuda_common.cuh&quot;
+
+// ------------------------------------------------------------------
+// silu: out = x / (1 + e^-x), n 个元素(n 为 8 的倍数)
+// ------------------------------------------------------------------
+__global__ void silu_kernel(bf16x8 *out, const bf16x8 *a, long n8) {
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i &lt; n8; i += (long)gridDim.x * blockDim.x) {
+        float x[8];
+        unpack8(a[i], x);
+#pragma unroll
+        for (int k = 0; k &lt; 8; ++k) x[k] = x[k] / (1.f + __expf(-x[k]));
+        out[i] = pack8(x);
+    }
+}
+
+extern &quot;C&quot; void cuda_silu(cuda_bf16_t *out, const cuda_bf16_t *x, long n) {
+    const long n8 = n / 8;
+    if (n8 &lt;= 0) return;
+    silu_kernel&lt;&lt;&lt;grid_for(n8, 256), 256, 0, g_cuda_stream&gt;&gt;&gt;((bf16x8 *)out, (const bf16x8 *)x, n8);
+}</code></pre></div>
+
+<h3><span class="stepno">2</span>Impl 和声明</h3>
+<p>新接口只收 bf16，不再有 dtype 和 dev_id 参数：</p>
+<div class="codeblock"><div class="cap"><span><b>arithmetic.zig / activation.zig</b> <span class="tag edit">修改</span></span><button type="button">复制</button></div><pre><code class="language-zig">// ---- src/backend/cuda/arithmetic.zig ----
+pub const AddImpl = struct {
+    pub fn execute(device_id: i32, out_tensor: *Tensor) !void {
+        _ = device_id;
+        const x = out_tensor.src[0].?;
+        const y = out_tensor.src[1].?;
+        const numel = out_tensor.numElements();
+        if (y.numElements() != numel) return error.UnsupportedBroadcast;
+        if (out_tensor.data_type != .GGML_TYPE_BF16 or numel % 8 != 0) return error.ElementwiseNeedsBf16x8;
+        cu.cuda_add(out_tensor.data, x.data, y.data, @intCast(numel));
+    }
+};
+// MulImpl 同理, 调 cu.cuda_mul
+
+// ---- src/backend/cuda/activation.zig ----
+pub const SiluImpl = struct {
+    pub fn execute(device_id: i32, out_tensor: *Tensor) !void {
+        _ = device_id;
+        const numel = out_tensor.numElements();
+        if (out_tensor.data_type != .GGML_TYPE_BF16 or numel % 8 != 0) return error.ElementwiseNeedsBf16x8;
+        cu.cuda_silu(out_tensor.data, out_tensor.src[0].?.data, @intCast(numel));
+    }
+};</code></pre></div>
+<div class="codeblock diff"><div class="cap"><span><b>声明</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">// ---- cuda_shim.h ----</span><span class="ln del">void cuda_add(void *out, const void *in1, const void *in2, int dtype, size_t numel, int dev_id);</span><span class="ln del">void cuda_mul(void *out, const void *in1, const void *in2, int dtype, size_t numel, int dev_id);</span><span class="ln del">void cuda_silu(void *out, const void *in, int dtype, size_t numel, int dev_id);</span><span class="ln add">void cuda_add(cuda_bf16_t *out, const cuda_bf16_t *a, const cuda_bf16_t *b, long n);</span><span class="ln add">void cuda_mul(cuda_bf16_t *out, const cuda_bf16_t *a, const cuda_bf16_t *b, long n);</span><span class="ln add">void cuda_silu(cuda_bf16_t *out, const cuda_bf16_t *x, long n);</span><span class="ln ctx"> </span><span class="ln ctx">// ---- cuda.zig ----</span><span class="ln del">pub extern fn cuda_add(out: ?*anyopaque, in1: ?*const anyopaque, in2: ?*const anyopaque, dtype: c_int, numel: usize, dev_id: c_int) void;</span><span class="ln del">pub extern fn cuda_mul(...) void;</span><span class="ln del">pub extern fn cuda_silu(...) void;</span><span class="ln add">pub extern fn cuda_add(out: ?*anyopaque, a: ?*const anyopaque, b: ?*const anyopaque, n: c_long) void;</span><span class="ln add">pub extern fn cuda_mul(out: ?*anyopaque, a: ?*const anyopaque, b: ?*const anyopaque, n: c_long) void;</span><span class="ln add">pub extern fn cuda_silu(out: ?*anyopaque, x: ?*const anyopaque, n: c_long) void;</span></code></pre></div>
+
+<h2>对拍验证</h2>
+<p>add 和 mul 的数值不变：都是在 f32 里算、就近舍入到 bf16，和原来 <code>__nv_bfloat16</code> 的运算符语义相同。silu 把 <code>expf</code> 换成了 <code>__expf</code>（快速版），个别元素可能差 1 个 bf16 ulp。</p>
+<div class="callout tip"><span class="t">舍入点为什么重要</span>unfused 的图里 silu 和 mul 是两个节点，silu 的结果先舍入成 bf16 写回显存，mul 再读。如果把两者合成一个 kernel、中间不舍入，26.8% 的元素结果会不同（差 1 ulp）<span class="src lab">lab 实测</span>。28 层累积之后足以让 argmax 翻转。所以“和参考实现逐 token 一致”要求舍入点一一对应。现在 llmgen 的节点粒度和 lab 相同，舍入点自然对齐。</div>
+<p>验收：greedy 输出前 20 个 token 不变，全文通顺。单算子对拍见第 15 步。</p>
+<h2>CPU 同步</h2>
+<div class="callout cpu"><span class="t">这一步 CPU 后端要做的事</span><b>建议同步改。</b>CPU 的 add / mul / silu 换成 bf16 直读直写 + 大张量并行。数值和 <code>.cu</code> 逐点相同。 <a href="cpu-4-kernels-math.html#elementwise">去看 →</a></div>
+<h2>性能收益</h2>
+<h3>依据</h3>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th class="num">改前</th><th class="num">改后</th><th>来源</th></tr></thead><tbody><tr><td>带计算的 bf16 逐元素 kernel（GB/s）</td><td class="num">772</td><td class="num">862.8</td><td><span class="src lab">lab 实测</span></td></tr><tr><td>module-style add_kernel（decode，1024 元素）</td><td class="num">1.5 µs / 次</td><td class="num">—</td><td><span class="src lab">nsys 实测</span></td></tr></tbody></table></div>
+<h3>对 llmgen 的预期</h3>
+<p>大数据量下快 1.12 倍。但要说清楚这一步在各场景的实际影响：</p>
+<ul>
+  <li><b>S1 的 decode</b>：几乎没有影响。一次 add 只有 1024 个元素（2 KB），kernel 本身 1–2 µs，时间花在 launch 上，不在访存上。</li>
+  <li><b>prefill 和大批</b>：有影响。512 token 的 prefill，一次 silu 是 512 × 3072 × 2 = 3 MB，每层 add ×2、mul ×1、silu ×1 共约 8 MB 读写，28 层 220 MB。S3 一步 8192 token 时是它的 16 倍。</li>
+</ul>
+<p>预期 S1 的 ITL 不变，TTFT 降不到 1 ms <span class="src est">推算</span>。这一步主要为第 19 步之后的大批场景铺路。</p>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>S1 TTFT mean (ms)</td><td class="num fill" contenteditable="true" data-key="10-bf16x8.html|S1 TTFT mean (ms)|before"></td><td class="num fill" contenteditable="true" data-key="10-bf16x8.html|S1 TTFT mean (ms)|after"></td><td class="num gain"></td></tr><tr><td>ADD 平均耗时 · prefill (µs)</td><td class="num fill" contenteditable="true" data-key="10-bf16x8.html|ADD 平均耗时 · prefill (µs)|before"></td><td class="num fill" contenteditable="true" data-key="10-bf16x8.html|ADD 平均耗时 · prefill (µs)|after"></td><td class="num gain"></td></tr><tr><td>SILU 平均耗时 · prefill (µs)</td><td class="num fill" contenteditable="true" data-key="10-bf16x8.html|SILU 平均耗时 · prefill (µs)|before"></td><td class="num fill" contenteditable="true" data-key="10-bf16x8.html|SILU 平均耗时 · prefill (µs)|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td><code>error.ElementwiseNeedsBf16x8</code></td><td>张量不是 bf16，或元素数不是 8 的倍数。Qwen3-0.6B 的各个宽度（1024 / 2048 / 3072）都满足。</td></tr><tr><td>输出乱码</td><td>多半是声明没改全：Zig 侧还按旧签名传了 dtype 和 dev_id，C 侧把 dtype 当成了元素数。<code>cuda.zig</code> 的 extern 和 <code>cuda_shim.h</code> 要同时改。</td></tr><tr><td><code>misaligned address</code></td><td><code>bf16x8</code> 要求 16 字节对齐。检查激活的分配对齐（<code>allocateOutput</code> 里是 32，没问题）。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li>greedy 输出前 20 个 token 不变</li><li><code>arithmetic.cu</code> / <code>activation.cu</code> 里没有模板和 dtype 分支了</li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="09-gpu-sampling.html"><small>← 上一步</small>GPU 采样</a><a class="next" href="11-norm-rope.html"><small>下一步 →</small>RMSNorm 与 RoPE</a></div>
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,520 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>decode 注意力：split-K · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html" class="active"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">阶段 3 · kernel</div>
+<h1>decode 注意力：split-K</h1>
+<p class="lead">把上下文切成段，喂满显存带宽。</p>
+<div class="callout goal"><span class="t">本步目标</span>读懂第 06 步换上的 decode 注意力 kernel：为什么要把上下文切成段（split-K），GQA 组为什么共享一次 KV 读取。这一步不改代码，用回退开关量出它的贡献。</div>
+<h2>原理</h2>
+<h3>decode 注意力也是带宽问题</h3>
+<p>decode 时每条序列只有 1 个 query，要和上下文里所有 token 的 K 做点积、再对 V 加权求和。每层要读的 KV：<code>ctx × 8 头 × 128 × 2 B × (K + V)</code>。上下文 768 时每层 3 MB，28 层 88 MB；上下文 4096 时是 470 MB，已经是权重的四成。上下文越长，注意力在 ITL 里占得越多。</p>
+
+<h3>起点：一个 warp 扛一整个头</h3>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cuda/attention.cu（起点，第 06 步已替换）</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">template &lt;typename T&gt;
+__global__ void paged_attention_kernel(
+    T* __restrict__ out,
+    const T* __restrict__ Q,
+    int32_t head_dim, int32_t num_q_heads, int32_t seq_len,
+    int32_t num_kv_heads, int32_t total_cached,
+    float scale_val, int causal, int num_kv_groups,
+    const int32_t* __restrict__ page_k_ids,
+    const int32_t* __restrict__ page_v_ids,
+    int32_t num_blocks,
+    const T* __restrict__ k_pool_base,
+    const T* __restrict__ v_pool_base,
+    int32_t block_stride_elems,
+    int32_t q_start
+) {
+    constexpr int32_t MAX_HEAD_DIM = 256;
+    constexpr int32_t MAX_HEAD_DIM_REGS = MAX_HEAD_DIM / 32;
+    int32_t head_dim_regs = head_dim / 32;
+
+    int32_t bh = blockIdx.x;
+    if (bh &gt;= num_q_heads) return;
+    int32_t head_idx  = bh % num_q_heads;
+    int32_t batch_idx = bh / num_q_heads;
+    int32_t kv_head_idx = head_idx / num_kv_groups;
+
+    int32_t warp_id = threadIdx.x / 32;
+    int32_t lane_id = threadIdx.x % 32;
+    int32_t q_pos = warp_id + blockIdx.y * (blockDim.x / 32);
+    if (q_pos &gt;= seq_len) return;
+
+    int64_t q_base = (int64_t(batch_idx) * num_q_heads + head_idx) * seq_len * head_dim;
+
+    float q_reg[MAX_HEAD_DIM_REGS];
+    for (int i = 0; i &lt; head_dim_regs; ++i) {
+        int d = lane_id + i * 32;
+        q_reg[i] = float(Q[q_base + q_pos * head_dim + d]);
+    }
+
+    float m_i = -INFINITY;
+    float l_i = 0.f;
+    float o_reg[MAX_HEAD_DIM_REGS] = {0};
+
+    constexpr int32_t BLOCK_SIZE = PAGE_BLOCK_SIZE;
+
+    for (int32_t blk = 0; blk &lt; num_blocks; ++blk) {
+        int32_t k_blk_id = page_k_ids[blk];
+        int32_t v_blk_id = page_v_ids[blk];
+        if (k_blk_id &lt; 0 || v_blk_id &lt; 0) break;
+
+        const T* k_blk_ptr = k_pool_base + int64_t(k_blk_id) * block_stride_elems;
+        const T* v_blk_ptr = v_pool_base + int64_t(v_blk_id) * block_stride_elems;
+
+        int32_t blk_start = blk * BLOCK_SIZE;
+        int32_t blk_end = min(blk_start + BLOCK_SIZE, total_cached);
+
+        for (int32_t p = 0; p &lt; blk_end - blk_start; ++p) {
+            int32_t kv_pos = blk_start + p;
+            if (causal &amp;&amp; kv_pos &gt; q_start + q_pos) continue;
+
+            int64_t kv_off = (int64_t(p) * num_kv_heads + kv_head_idx) * head_dim;
+
+            float score_partial = 0.f;
+            for (int i = 0; i &lt; head_dim_regs; ++i) {
+                int d = lane_id + i * 32;
+                score_partial += q_reg[i] * float(k_blk_ptr[kv_off + d]);
+            }
+            #pragma unroll
+            for (int offset = 16; offset &gt; 0; offset /= 2)
+                score_partial += __shfl_down_sync(0xffffffff, score_partial, offset);
+            float score = __shfl_sync(0xffffffff, score_partial, 0) * scale_val;
+
+            float m_prev = m_i;
+            m_i = fmaxf(m_i, score);
+            float exp_score = __expf(score - m_i);
+            float exp_prev  = __expf(m_prev - m_i);
+            for (int i = 0; i &lt; head_dim_regs; ++i) {
+                int d = lane_id + i * 32;
+                o_reg[i] = o_reg[i] * exp_prev + exp_score * float(v_blk_ptr[kv_off + d]);
+            }
+            l_i = l_i * exp_prev + exp_score;
+        }
+    }
+
+    float inv_l = 1.f / l_i;
+    for (int i = 0; i &lt; head_dim_regs; ++i) {
+        int d = lane_id + i * 32;
+        out[q_base + q_pos * head_dim + d] = T(o_reg[i] * inv_l);
+    }
+}
+
+template &lt;typename T, int HEAD_DIM=128&gt;
+__global__ void flash_attention_warp_kernel(
+    T* __restrict__ out,
+    const T* __restrict__ Q,
+    int64_t B, int64_t num_q_heads, int64_t seq_len, int64_t num_kv_heads,
+    float scale_val, int causal, int num_kv_groups,
+    const int32_t* __restrict__ page_k_ids,
+    const int32_t* __restrict__ page_v_ids,
+    const T* __restrict__ k_pool_base,
+    const T* __restrict__ v_pool_base,
+    int32_t block_stride_elems,
+    int32_t total_cached, int32_t q_start
+) {
+    const int bh = blockIdx.x;
+    if (bh &gt;= B * num_q_heads) return;
+    const int head_idx  = bh % num_q_heads;
+    const int batch_idx = bh / num_q_heads;
+    const int kv_head_idx = head_idx / num_kv_groups;
+
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+    const int q_pos = warp_id + blockIdx.y * static_cast&lt;int&gt;(blockDim.x / 32);
+    const bool active = q_pos &lt; seq_len; // C++ 在这里 return; 本 lab 的越界 warp 仍要参与搬 tile 与 __syncthreads
+
+    const int64_t q_base  = (batch_idx * num_q_heads + head_idx) * seq_len * HEAD_DIM;
+    const int64_t out_base = q_base;
+
+    constexpr int KV_TILE = 32;
+    extern __shared__ char smem_[];
+    T* shared_K = reinterpret_cast&lt;T*&gt;(smem_);
+    T* shared_V = reinterpret_cast&lt;T*&gt;(smem_ + KV_TILE * HEAD_DIM * sizeof(T));
+
+    constexpr int VEC = HEAD_DIM / 32;
+    float q_reg[VEC];
+    #pragma unroll
+    for (int i = 0; i &lt; VEC; ++i) {
+        int d_idx = lane_id + i * 32;
+        q_reg[i] = active ? float(Q[q_base + q_pos * HEAD_DIM + d_idx]) : 0.f;
+    }
+    float m_i = -INFINITY;
+    float l_i = 0.f;
+    float o_reg[VEC] = {0};
+
+    for (int kv_tile = 0; kv_tile &lt; total_cached; kv_tile += KV_TILE) {
+        int tile_size = KV_TILE &lt; static_cast&lt;int&gt;(total_cached - kv_tile) ? KV_TILE : static_cast&lt;int&gt;(total_cached - kv_tile);
+
+        // C++: shared_K[i] = K[kv_base + (kv_tile + k) * HEAD_DIM + d]; 这里按逻辑位置查页表取块内 token-major 行
+        for (int i = threadIdx.x; i &lt; tile_size * HEAD_DIM; i += blockDim.x) {
+            int k = i / HEAD_DIM;
+            int d = i % HEAD_DIM;
+            int kv_pos = kv_tile + k;
+            int blk = kv_pos / PAGE_BLOCK_SIZE;
+            int p = kv_pos % PAGE_BLOCK_SIZE;
+            int64_t kv_off = (int64_t(p) * num_kv_heads + kv_head_idx) * HEAD_DIM + d;
+            shared_K[i] = k_pool_base[int64_t(page_k_ids[blk]) * block_stride_elems + kv_off];
+            shared_V[i] = v_pool_base[int64_t(page_v_ids[blk]) * block_stride_elems + kv_off];
+        }
+        __syncthreads();
+
+        if (active) {
+            for (int k = 0; k &lt; tile_size; ++k) {
+                int kv_pos = kv_tile + k;
+                if (causal &amp;&amp; kv_pos &gt; q_start + q_pos) continue;
+
+                float score_partial = 0.f;
+                #pragma unroll
+                for (int i = 0; i &lt; VEC; ++i) {
+                    int d_idx = lane_id + i * 32;
+                    score_partial += q_reg[i] * float(shared_K[k * HEAD_DIM + d_idx]);
+                }
+                #pragma unroll
+                for (int offset = 16; offset &gt; 0; offset /= 2) {
+                    score_partial += __shfl_down_sync(0xffffffff, score_partial, offset);
+                }
+                float score = __shfl_sync(0xffffffff, score_partial, 0);
+                score *= scale_val;
+
+                float m_prev = m_i;
+                m_i = fmaxf(m_i, score);
+                float exp_score = __expf(score - m_i);
+                float exp_prev  = __expf(m_prev - m_i);
+                #pragma unroll
+                for (int i = 0; i &lt; VEC; ++i) {
+                    int d_idx = lane_id + i * 32;
+                    float v = float(shared_V[k * HEAD_DIM + d_idx]);
+                    o_reg[i] = o_reg[i] * exp_prev + exp_score * v;
+                }
+                l_i = l_i * exp_prev + exp_score;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (!active) return;
+    float inv_l = 1.f / l_i;
+    #pragma unroll
+    for (int i = 0; i &lt; VEC; ++i) {
+        int d_idx = lane_id + i * 32;
+        out[out_base + q_pos * HEAD_DIM + d_idx] = T(o_reg[i] * inv_l);
+    }
+}
+
+// 页表上传(对照 C++ PagedAttentionImpl 里 h_page_k_ids → cudaMalloc + cudaMemcpy 那段)
+static void upload_page_table(const int32_t* h_page_k_ids, const int32_t* h_page_v_ids, int32_t num_blocks,
+                              int32_t** d_page_k_ids, int32_t** d_page_v_ids) {
+    cudaMalloc(d_page_k_ids, num_blocks * sizeof(int32_t));
+    cudaMalloc(d_page_v_ids, num_blocks * sizeof(int32_t));
+    cudaMemcpy(*d_page_k_ids, h_page_k_ids, num_blocks * sizeof(int32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(*d_page_v_ids, h_page_v_ids, num_blocks * sizeof(int32_t), cudaMemcpyHostToDevice);
+}
+
+// 对照 PagedAttentionImpl&lt;Device::CUDA&gt;::execute(Tensor* out, int32_t dev_id) 的 kernel 发射段
+extern &quot;C&quot; void cuda_paged_attention(void *out, const void *Q, int dtype,
+                                     int32_t head_dim, int32_t num_q_heads, int32_t seq_len, int32_t num_kv_heads,
+                                     int32_t total_cached, float scale, int causal, int32_t num_kv_groups,
+                                     const int32_t *h_page_k_ids, const int32_t *h_page_v_ids, int32_t num_blocks,
+                                     const void *k_pool_base, const void *v_pool_base, int32_t block_stride_elems,
+                                     int32_t q_start, int dev_id) {
+    cudaSetDevice(dev_id);
+    if (head_dim % 32 != 0) {
+        fprintf(stderr, &quot;paged_attention requires head_dim to be a multiple of 32\n&quot;);
+        return;
+    }
+
+    int32_t *d_page_k_ids = nullptr, *d_page_v_ids = nullptr;
+    upload_page_table(h_page_k_ids, h_page_v_ids, num_blocks, &amp;d_page_k_ids, &amp;d_page_v_ids);
+
+    constexpr int32_t WARPS_PER_BLOCK = 4;
+    constexpr int32_t THREADS = WARPS_PER_BLOCK * 32;
+    int32_t blocks_x = num_q_heads;
+    int32_t blocks_y = (seq_len + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    dim3 grid_dim(blocks_x, blocks_y);
+
+    switch (dtype) {
+        case GT_F32:
+            paged_attention_kernel&lt;float&gt;&lt;&lt;&lt;grid_dim, THREADS&gt;&gt;&gt;(
+                static_cast&lt;float*&gt;(out), static_cast&lt;const float*&gt;(Q),
+                head_dim, num_q_heads, seq_len, num_kv_heads, total_cached,
+                scale, causal, num_kv_groups,
+                d_page_k_ids, d_page_v_ids, num_blocks,
+                static_cast&lt;const float*&gt;(k_pool_base), static_cast&lt;const float*&gt;(v_pool_base),
+                block_stride_elems, q_start);
+            break;
+        case GT_F16:
+            paged_attention_kernel&lt;__half&gt;&lt;&lt;&lt;grid_dim, THREADS&gt;&gt;&gt;(
+                static_cast&lt;__half*&gt;(out), static_cast&lt;const __half*&gt;(Q),
+                head_dim, num_q_heads, seq_len, num_kv_heads, total_cached,
+                scale, causal, num_kv_groups,
+                d_page_k_ids, d_page_v_ids, num_blocks,
+                static_cast&lt;const __half*&gt;(k_pool_base), static_cast&lt;const __half*&gt;(v_pool_base),
+                block_stride_elems, q_start);
+            break;
+        case GT_BF16:
+            paged_attention_kernel&lt;__nv_bfloat16&gt;&lt;&lt;&lt;grid_dim, THREADS&gt;&gt;&gt;(
+                static_cast&lt;__nv_bfloat16*&gt;(out), static_cast&lt;const __nv_bfloat16*&gt;(Q),
+                head_dim, num_q_heads, seq_len, num_kv_heads, total_cached,
+                scale, causal, num_kv_groups,
+                d_page_k_ids, d_page_v_ids, num_blocks,
+                static_cast&lt;const __nv_bfloat16*&gt;(k_pool_base), static_cast&lt;const __nv_bfloat16*&gt;(v_pool_base),
+                block_stride_elems, q_start);
+            break;
+        default:
+            fprintf(stderr, &quot;paged_attention: unsupported dtype\n&quot;);
+    }
+
+    cudaFree(d_page_k_ids);
+    cudaFree(d_page_v_ids);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, &quot;paged_attention_kernel launch failed: %s\n&quot;, cudaGetErrorString(err));
+    }
+}</code></pre></div>
+<p>grid = (16 个 q 头, 1)，实际干活的是 16 个 warp。每个 warp 串行扫完整个上下文。</p>
+<p>3090 有 82 个 SM，每个 SM 能同时跑很多 block。16 个 warp 只占了其中一小角，<b>显存带宽根本喂不满</b>。这和权重 GEMV 不同：GEMV 的输出行数（N = 1024 起）天然提供了足够多的并行单元；decode 注意力在 batch = 1 时只有 16 个头可以并行。</p>
+
+<h3>split-K：把上下文切成段</h3>
+<div class="diagram">
+<div class="lanes">
+  <div class="lab">不切分</div><div class="lane"><span class="d">一个 block 扫 token 0 … 4095</span></div>
+  <div class="lab">split-K</div><div class="lane"><span class="d">0–63</span><span class="d">64–127</span><span class="d">128–191</span><span class="d">…</span><span class="d">4032–4095</span><span class="h">reduce：合并 64 段</span></div>
+</div>
+<div class="cap2">grid = (kv 头, 序列, 段)。每段一个 block，各算各的局部 softmax，最后一个小 kernel 合并。</div>
+</div>
+<p>能这样切，靠的是 softmax 可以分段合并（online softmax）。每段记下三样东西：段内最大值 <code>m</code>、<code>Σ exp(s - m)</code>、未归一化的加权和 <code>o = Σ exp(s - m)·V</code>。合并时把各段换算到同一个全局最大值 M 下：</p>
+<div class="callout tip"><span class="t">合并公式</span>
+<code>w_p = exp(m_p - M)</code>，<code>输出 = Σ w_p · o_p / Σ w_p · l_p</code></div>
+<div class="codeblock"><div class="cap"><span><b>cuda-course/results.txt · 第 10 课</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="nohighlight">[1] online softmax: 一行 12 个分数拆成 3 段, 逐段合并
+  处理完第 1 段: m = 3, l = 1.58530, o/l = 2.430523
+  处理完第 2 段: m = 7, l = 1.08221, o/l = 5.073051
+  处理完第 3 段: m = 9, l = 1.15019, o/l = 8.507795
+  整行一次算:            o/l = 8.507795
+  [PASS] 分段合并 = 整行 softmax</code></pre></div>
+<div class="codeblock"><div class="cap"><span><b>backend/cuda/attention.cu · attn_decode_reduce_kernel</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">__global__ void attn_decode_reduce_kernel(bf16 *out, const float *part_o, const float *part_ml,
+                                          const int *ctx_lens, int nq, int part_size, int max_parts) {
+    const int h = blockIdx.x, s = blockIdx.y, d = threadIdx.x;
+    const int ctx = ctx_lens[s];
+    bf16 *o = out + (long)s * nq * HD + (long)h * HD;
+    if (ctx &lt;= 0) {
+        o[d] = f2bf(0.f);
+        return;
+    }
+    const int np = (ctx + part_size - 1) / part_size;
+    const float *ml = part_ml + ((long)s * nq + h) * max_parts * 2;
+    const float *po = part_o + ((long)s * nq + h) * max_parts * HD;
+    float M = -INFINITY;
+    for (int p = 0; p &lt; np; ++p) M = fmaxf(M, ml[2 * p]);
+    float num = 0.f, den = 0.f;
+    for (int p = 0; p &lt; np; ++p) {
+        float w = __expf(ml[2 * p] - M);
+        num += w * po[(long)p * HD + d];
+        den += w * ml[2 * p + 1];
+    }
+    o[d] = f2bf(num / den);
+}</code></pre></div>
+
+<h3>GQA：一组 q 头共享一次 KV 读取</h3>
+<p>Qwen3-0.6B 有 16 个 q 头、8 个 kv 头，每 2 个 q 头共用同一份 K/V（G = 2）。起点按 q 头开 block，同一份 KV 被读了两遍。lab 按 <b>kv 头</b>开 block，一个 block 里同时算组内 G 个 q 头：K 读一次，和 G 个 q 各做点积；V 读一次，按 G 组概率各加权一次。KV 的流量减半。</p>
+<div class="codeblock"><div class="cap"><span><b>backend/cuda/attention.cu · attn_decode_kernel</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">template &lt;int G&gt;
+__global__ void __launch_bounds__(128) attn_decode_kernel(
+    float *part_o, float *part_ml, const bf16 *q, const bf16 *kc, const bf16 *vc,
+    const int *block_tables, const int *ctx_lens, int nq, int nkv, int max_blocks, int block_size,
+    float scale, int part_size, int max_parts) {
+    const int kvh = blockIdx.x, s = blockIdx.y, part = blockIdx.z;
+    const int ctx = ctx_lens[s];
+    const int t0 = part * part_size;
+    if (t0 &gt;= ctx) return;
+    const int n = min(ctx - t0, part_size);
+    const int tid = threadIdx.x, lane = tid &amp; 31, wid = tid &gt;&gt; 5;
+
+    extern __shared__ float smem[];
+    float *sc = smem;                  // [G][part_size] 分数 → 概率
+    float *red = smem + G * part_size; // [8][G][HD] PV 部分和
+    __shared__ float q_s[G][HD];
+    __shared__ float wred[4][G];
+    __shared__ float stat_m[G], stat_l[G];
+
+    for (int i = tid; i &lt; G * HD; i += 128) {
+        int g = i / HD, d = i % HD;
+        q_s[g][d] = bf2f(q[(long)s * nq * HD + (long)(kvh * G + g) * HD + d]) * scale;
+    }
+    __syncthreads();
+
+    // ---- phase 1: QK^T. 4 个 lane 一个 token, 每 lane 负责 4 个 16B 分块(32 维) ----
+    const int lg = tid &amp; 3, grp = tid &gt;&gt; 2; // 32 组
+    float qr[G][32];
+#pragma unroll
+    for (int g = 0; g &lt; G; ++g)
+#pragma unroll
+        for (int j = 0; j &lt; 4; ++j)
+#pragma unroll
+            for (int k = 0; k &lt; 8; ++k) qr[g][j * 8 + k] = q_s[g][(lg + 4 * j) * 8 + k];
+
+    const int *bt = block_tables + (long)s * max_blocks;
+    const long head_stride = (long)block_size * HD;
+    // 循环次数必须 warp 内一致(下面有全 mask 的 __shfl_xor_sync), 越界 token 用 valid 屏蔽而不是提前退出
+    for (int base = 0; base &lt; n; base += 32) {
+        const int i = base + grp;
+        const bool valid = i &lt; n;
+        float acc[G];
+#pragma unroll
+        for (int g = 0; g &lt; G; ++g) acc[g] = 0.f;
+        if (valid) {
+            int t = t0 + i;
+            long blk = bt[t / block_size];
+            const bf16x8 *kr = (const bf16x8 *)(kc + (blk * nkv + kvh) * head_stride + (long)(t % block_size) * HD);
+#pragma unroll
+            for (int j = 0; j &lt; 4; ++j) {
+                float f[8];
+                unpack8(kr[lg + 4 * j], f);
+#pragma unroll
+                for (int g = 0; g &lt; G; ++g)
+#pragma unroll
+                    for (int k = 0; k &lt; 8; ++k) acc[g] += qr[g][j * 8 + k] * f[k];
+            }
+        }
+#pragma unroll
+        for (int g = 0; g &lt; G; ++g) {
+            acc[g] += __shfl_xor_sync(0xffffffffu, acc[g], 1);
+            acc[g] += __shfl_xor_sync(0xffffffffu, acc[g], 2);
+        }
+        if (valid &amp;&amp; lg == 0)
+#pragma unroll
+            for (int g = 0; g &lt; G; ++g) sc[g * part_size + i] = acc[g];
+    }
+    __syncthreads();
+
+    // ---- phase 2: 每个头的 max / exp / sum ----
+#pragma unroll
+    for (int g = 0; g &lt; G; ++g) {
+        float m = -INFINITY;
+        for (int i = tid; i &lt; n; i += 128) m = fmaxf(m, sc[g * part_size + i]);
+        m = warp_max(m);
+        if (lane == 0) wred[wid][g] = m;
+    }
+    __syncthreads();
+    if (tid &lt; G) stat_m[tid] = fmaxf(fmaxf(wred[0][tid], wred[1][tid]), fmaxf(wred[2][tid], wred[3][tid]));
+    __syncthreads();
+#pragma unroll
+    for (int g = 0; g &lt; G; ++g) {
+        float m = stat_m[g], l = 0.f;
+        for (int i = tid; i &lt; n; i += 128) {
+            float p = __expf(sc[g * part_size + i] - m);
+            sc[g * part_size + i] = p;
+            l += p;
+        }
+        l = warp_sum(l);
+        if (lane == 0) wred[wid][g] = l;
+    }
+    __syncthreads();
+    if (tid &lt; G) stat_l[tid] = wred[0][tid] + wred[1][tid] + wred[2][tid] + wred[3][tid];
+
+    // ---- phase 3: P·V. 16 线程一行(每线程 8 维), 8 个 token 槽并行 ----
+    const int dl = tid &amp; 15, ts = tid &gt;&gt; 4;
+    float o[G][8];
+#pragma unroll
+    for (int g = 0; g &lt; G; ++g)
+#pragma unroll
+        for (int k = 0; k &lt; 8; ++k) o[g][k] = 0.f;
+    for (int i = ts; i &lt; n; i += 8) {
+        int t = t0 + i;
+        long blk = bt[t / block_size];
+        const bf16x8 *vr = (const bf16x8 *)(vc + (blk * nkv + kvh) * head_stride + (long)(t % block_size) * HD);
+        float f[8];
+        unpack8(vr[dl], f);
+#pragma unroll
+        for (int g = 0; g &lt; G; ++g) {
+            float p = sc[g * part_size + i];
+#pragma unroll
+            for (int k = 0; k &lt; 8; ++k) o[g][k] += p * f[k];
+        }
+    }
+#pragma unroll
+    for (int g = 0; g &lt; G; ++g)
+#pragma unroll
+        for (int k = 0; k &lt; 8; ++k) red[(ts * G + g) * HD + dl * 8 + k] = o[g][k];
+    __syncthreads();
+    for (int idx = tid; idx &lt; G * HD; idx += 128) {
+        int g = idx / HD, d = idx % HD;
+        float acc = 0.f;
+#pragma unroll
+        for (int r = 0; r &lt; 8; ++r) acc += red[(r * G + g) * HD + d];
+        long h = kvh * G + g;
+        part_o[(((long)s * nq + h) * max_parts + part) * HD + d] = acc;
+    }
+    if (tid &lt; G) {
+        long h = kvh * G + tid;
+        float *ml = part_ml + (((long)s * nq + h) * max_parts + part) * 2;
+        ml[0] = stat_m[tid];
+        ml[1] = stat_l[tid];
+    }
+}</code></pre></div>
+<p>kernel 分三个阶段，每个阶段的线程映射都不同：</p>
+<div class="tablewrap"><table><thead><tr><th>阶段</th><th>做什么</th><th>线程怎么排</th></tr></thead><tbody><tr><td>1</td><td><code>Q·Kᵀ</code>：每个 token 一个分数</td><td>4 个 lane 一个 token，每 lane 读 4 个 <code>bf16x8</code>（32 维）。一轮处理 32 个 token</td></tr><tr><td>2</td><td>段内 max、exp、sum</td><td>128 个线程交错扫分数数组，warp 归约</td></tr><tr><td>3</td><td><code>P·V</code>：加权求和</td><td>16 个线程一行 V（每线程 8 维），8 个 token 槽并行</td></tr></tbody></table></div>
+
+<h3>段长怎么定</h3>
+<div class="codeblock"><div class="cap"><span><b>backend/cuda/attention.zig</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">/// decode split-K 的分段长度: 批越小分段越细, 保证 grid = nkv × S × parts 足够铺满 82 个 SM.
+pub fn partSize(s: usize) usize {
+    return if (s &gt;= 64) 512 else if (s &gt;= 16) 256 else if (s &gt;= 4) 128 else 64;
+}
+pub fn maxParts(s: usize, max_model_len: usize) usize {
+    const ps = partSize(s);
+    return (max_model_len + ps - 1) / ps;
+}</code></pre></div>
+<p>批越小，段越细。目标是让 <code>kv 头数 × 序列数 × 段数</code> 这个 block 总数足够铺满 82 个 SM；批大了序列数本身就提供了并行度，段可以长一些，减少 reduce 的开销。</p>
+
+<h2>实测</h2>
+<div class="codeblock"><div class="cap"><span><b>cuda-course/results.txt · 第 11 课</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="nohighlight">[性能] 带宽 = 这一步必须读的 K/V 字节数 / 时间
+  S x ctx                      a) naive          b) GQA 共享            c) +split-K
+  1 x 4096         512.2us   33GB/s   16blk   260.3us   64GB/s    8blk    32.7us  514GB/s  512blk
+  1 x 16384       2043.7us   33GB/s   16blk    (smem 放不下, 跳过)   112.9us  594GB/s 2048blk
+  8 x 4096         717.4us  187GB/s  128blk   282.2us  476GB/s   64blk   165.4us  812GB/s 2048blk
+  32 x 1024        407.7us  329GB/s  512blk   159.7us  840GB/s  256blk   161.3us  832GB/s 1024blk
+  64 x 2048       2428.3us  221GB/s 1024blk   711.7us  754GB/s  512blk   606.9us  885GB/s 2048blk
+  blk = 实际参与计算的 block 数. 3090 有 82 个 SM, 每个 SM 能同时跑多个 block: block 太少时显存带宽根本喂不满</code></pre></div>
+<p>单条序列、上下文 4096：朴素 512 µs → GQA 共享 260 µs → 加 split-K 32.7 µs，<b>快 15.7 倍</b>，带宽从 33 GB/s 到 514 GB/s。批大了之后（32 × 1024）split-K 不再有帮助（161 vs 160 µs），因为 block 数已经够了。</p>
+
+<h2>用回退开关量一遍</h2>
+<p><code>SV_ATTN_PART=n</code> 把段长的下限设成 n。设成一个很大的数，每条序列就只有 1 段，等于关掉 split-K（GQA 共享还在）：</p>
+<div class="codeblock"><div class="cap"><span><b>终端</b> <span class="tag out">命令</span></span><button type="button">复制</button></div><pre><code class="language-bash">LLMGEN_WORKLOAD=…/s1.json make llmgen-cuda                       # 默认: split-K
+SV_ATTN_PART=100000 LLMGEN_WORKLOAD=…/s1.json make llmgen-cuda   # 每条序列只有 1 段 = 不切分</code></pre></div>
+<p>S1 的上下文只有 512–768，差距不会像 4096 那么大。想看长上下文的效果，把 <code>max_seq_len</code> 调到 4096，自己造一个 3584 → 512 的 workload（lab 的 S5）。</p>
+<h2>CPU 同步</h2>
+<div class="callout cpu"><span class="t">这一步 CPU 后端要做的事</span><b>不用动。</b>CPU 上没有 split-K：decode 和 prefill 走同一条朴素路径，每个 (token, q 头) 一个工作单元，按线程并行。KV 在 CPU 缓存里，不存在“block 太少喂不满带宽”的问题。 <a href="cpu-3-kernels-layout.html#attention">去看 →</a></div>
+<h2>性能收益</h2>
+<h3>依据</h3>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th class="num">改前</th><th class="num">改后</th><th>来源</th></tr></thead><tbody><tr><td>融合版 S1（ctx 512–768）：不切分 → split-K（tok/s）</td><td class="num">328.5</td><td class="num">485</td><td><span class="src lab">消融实测</span></td></tr><tr><td>融合版 S5（ctx 3584–4096）：不切分 → split-K（tok/s）</td><td class="num">114.3</td><td class="num">366.8</td><td><span class="src lab">消融实测</span></td></tr><tr><td>融合版 S4（8 并发）：不切分 → split-K（tok/s）</td><td class="num">1659.4</td><td class="num">2129.8</td><td><span class="src lab">消融实测</span></td></tr><tr><td>1 × 4096 的 kernel 耗时：朴素 → GQA 共享 + split-K</td><td class="num">512.2 µs</td><td class="num">32.7 µs</td><td><span class="src lab">lab 实测</span></td></tr><tr><td>融合版 S1 的 attn_decode_kernel 平均耗时</td><td class="num">—</td><td class="num">8 µs</td><td><span class="src lab">nsys 实测</span></td></tr></tbody></table></div>
+<h3>对 llmgen 的预期</h3>
+<p>lab 的消融：关掉 split-K，S1 慢到 68%（ITL 2.03 → 3.01 ms），长上下文的 S5 慢到 31%（ITL 2.56 → 8.60 ms）。上下文越长，split-K 越重要。</p>
+<p>对 llmgen：这部分收益在第 06 步换 kernel 时已经拿到了，混在那一步的数字里。这里用开关把它单独分离出来。预期 <code>SV_ATTN_PART=100000</code> 下 S1 的 ITL 比默认高 1 ms 左右 <span class="src est">推算</span>（和 lab 的 0.98 ms 同量级）。</p>
+<p>和<b>起点</b>的 kernel 比，差距更大：起点不只是没切分，还没有 GQA 共享、没有 16 字节向量化读。</p>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>S1 ITL mean (ms)：SV_ATTN_PART=100000</td><td class="num fill" contenteditable="true" data-key="13-flash-decoding.html|S1 ITL mean (ms)：SV_ATTN_PART=100000|before"></td><td class="num fill" contenteditable="true" data-key="13-flash-decoding.html|S1 ITL mean (ms)：SV_ATTN_PART=100000|after"></td><td class="num gain"></td></tr><tr><td>S1 ITL mean (ms)：默认</td><td class="num fill" contenteditable="true" data-key="13-flash-decoding.html|S1 ITL mean (ms)：默认|before"></td><td class="num fill" contenteditable="true" data-key="13-flash-decoding.html|S1 ITL mean (ms)：默认|after"></td><td class="num gain"></td></tr><tr><td>PAGED_ATTN 平均耗时 · decode (µs)</td><td class="num fill" contenteditable="true" data-key="13-flash-decoding.html|PAGED_ATTN 平均耗时 · decode (µs)|before"></td><td class="num fill" contenteditable="true" data-key="13-flash-decoding.html|PAGED_ATTN 平均耗时 · decode (µs)|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td><code>SV_ATTN_PART</code> 设了没效果</td><td>它只能把段长<b>调大</b>（scratch 是按默认段长分配的）。设成比默认（64）小的值会被忽略。</td></tr><tr><td>长上下文时结果错</td><td>scratch 不够：<code>part_o</code> / <code>part_ml</code> 的容量按 <code>maxParts(s, max_model_len)</code> 算，<code>max_model_len</code> 要等于实际的上下文上限（<code>max_seq</code>）。</td></tr><tr><td><code>attn_decode: 不支持的 GQA 组大小</code></td><td>kernel 只实例化了 G = 1 / 2 / 4 / 8。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li>能说清 split-K 为什么对小批有用、对大批没用</li><li>能说清按 kv 头开 block 为什么能让 KV 流量减半</li><li>量了 <code>SV_ATTN_PART=100000</code> 和默认两种的 ITL</li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="12-linear-gemv.html"><small>← 上一步</small>Linear：GEMV + cuBLAS</a><a class="next" href="14-fa2-prefill.html"><small>下一步 →</small>prefill 注意力：FA2</a></div>
+</main>
+</div>
+</body>
+</html>

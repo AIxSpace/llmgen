@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CUDA Graph · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html" class="active"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">阶段 4 · 执行层</div>
+<h1>CUDA Graph</h1>
+<p class="lead">decode 整步录下来，每步一次 launch。</p>
+<div class="callout goal"><span class="t">本步目标</span>decode 步的五百多个 kernel 录成一张 CUDA Graph，之后每步只调一次 <code>cudaGraphLaunch</code>。host 侧的 launch 开销从每步 2 ms 降到 0.4 ms。</div>
+<h2>原理</h2>
+<h3>launch 本身的开销</h3>
+<p>第 07 步之后 host 不再等 GPU，但发射 kernel 这件事本身还要花时间：每次 <code>cudaLaunchKernel</code> 约 4 µs（参数打包、驱动调用）。Zig 侧每个节点还有派发、读 <code>g_step</code>、算 grid 大小等。</p>
+<p>unfused 的图每层 18 个节点，一步 510 次 launch，纯 launch 开销约 2.0 ms。而此时整步的 ITL 才 3 ms 左右：GPU 干活的速度已经快到 host 发命令跟不上了。</p>
+<div class="codeblock"><div class="cap"><span><b>cuda-course/results-serving.txt（融合版 S1）</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="nohighlight">## nsys-s1-eager_cuda_api_sum
+  47.5%     1519.1 ms  n=  384020  avg=      4.0 us  cudaLaunchKernel
+  45.8%     1466.5 ms  n=    1345  avg=   1090.3 us  cudaStreamSynchronize
+
+## nsys-s1_cuda_api_sum   (CUDA Graph 开)
+  76.4%     2852.1 ms  n=    1365  avg=   2089.4 us  cudaStreamSynchronize
+  14.2%      531.6 ms  n=    1338  avg=    397.3 us  cudaGraphLaunch_v10000
+   1.7%       61.9 ms  n=   12562  avg=      4.9 us  cudaLaunchKernel</code></pre></div>
+<p>融合版 eager 模式下，S1 全程 38 万次 launch 花了 1.5 秒；开 CUDA Graph 后变成 1338 次 <code>cudaGraphLaunch</code>，共 0.53 秒。host 腾出来的时间全在 <code>cudaStreamSynchronize</code> 里等 GPU：GPU 成了瓶颈，这才是对的。</p>
+
+<h3>CUDA Graph 是什么</h3>
+<p>在一条 stream 上“开始录制”之后，发射的 kernel 不执行，而是连同<b>全部参数</b>被记进一张图；“结束录制”得到一个可执行对象。之后 <code>cudaGraphLaunch</code> 一次调用就把整张图排进 stream，驱动内部不再逐个处理 kernel。</p>
+<div class="codeblock"><div class="cap"><span><b>backend/cuda/cuda_context.cu（加到 llmgen 的 cuda_context.cu 末尾，文件头加 static cudaGraph_t g_capture_graph = nullptr;）</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">extern &quot;C&quot; int cuda_graph_begin(void) {
+    return (int)cudaStreamBeginCapture(g_cuda_stream, cudaStreamCaptureModeThreadLocal);
+}
+extern &quot;C&quot; void *cuda_graph_end(void) {
+    CUDA_CHECK(cudaStreamEndCapture(g_cuda_stream, &amp;g_capture_graph));
+    cudaGraphExec_t exec = nullptr;
+    CUDA_CHECK(cudaGraphInstantiate(&amp;exec, g_capture_graph, 0));
+    cudaGraphDestroy(g_capture_graph);
+    g_capture_graph = nullptr;
+    return (void *)exec;
+}
+extern &quot;C&quot; void cuda_graph_launch(void *exec) {
+    CUDA_CHECK(cudaGraphLaunch((cudaGraphExec_t)exec, g_cuda_stream));
+}
+extern &quot;C&quot; void cuda_graph_destroy(void *exec) {
+    if (exec) cudaGraphExecDestroy((cudaGraphExec_t)exec);
+}</code></pre></div>
+
+<h3>参数是录死的</h3>
+<p>回放时每个 kernel 的参数和录制时<b>一字不差</b>：指针、行数、grid 大小都是。所以一步里所有会变的东西必须满足下面两条之一：</p>
+<div class="tablewrap"><table><thead><tr><th>会变的东西</th><th>怎么处理</th><th>哪一步准备的</th></tr></thead><tbody><tr><td>token id、位置、slot、块表、上下文长度、温度、种子</td><td>放在显存的元数据包里。指针不变，每步更新内容</td><td>04</td></tr><tr><td>每个节点的输出地址</td><td>活跃区间规划：同样的 (T, S) 地址恒定</td><td>16</td></tr><tr><td>KV cache 地址</td><td>每层 K / V 一整块，启动时切好不再动</td><td>06</td></tr><tr><td>批大小 S</td><td>参数里有 S，变不了。按 S 分桶，每个桶录一张图</td><td>本步</td></tr><tr><td>上下文长度影响的 grid 大小</td><td>split-K 的 grid 按 <code>max_parts</code> 发满，多出来的 block 读到 <code>t0 ≥ ctx</code> 直接返回</td><td>06（kernel 设计）</td></tr><tr><td>cuBLAS 的临时显存</td><td>固定 workspace，录制期间不许 malloc</td><td>12</td></tr></tbody></table></div>
+<p>回头看，阶段 1 的很多设计（元数据放显存、位置查表而不是算、随机数无状态）都是为了这一步。</p>
+
+<h3>只录 decode</h3>
+<p>decode 步的形状只由批大小 S 决定（T = S），可以穷举。prefill 步的 T 是任意的，没法预先录，也不值得：prefill 一步的 kernel 都很重，launch 开销占比小。</p>
+
+<h3>分桶和 padding</h3>
+<p>桶取 1, 2, 4, 8, 16, 32, 48, …（和 nano-vllm 相同）。实际批大小 5 用桶 8，多出来的 3 行是 padding：</p>
+<div class="codeblock"><div class="cap"><span><b>executor.zig · fillMeta 末尾</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">        // CUDA Graph 桶的 padding 行: ctx=0(注意力输出 0)、slot=-1(不写 KV)
+        var s = entries.len;
+        while (s &lt; Sn) : (s += 1) {
+            ids[t] = 0;
+            pos[t] = 0;
+            slots[t] = -1;
+            t += 1;
+            cu_q[s + 1] = @intCast(t);
+            ctx[s] = 0;
+            last[s] = @intCast(t - 1);
+            temps[s] = 0;
+            @memset((bt + s * mb)[0..mb], 0);
+        }
+    }</code></pre></div>
+<p>padding 行的 <code>slot = -1</code>，<code>store_kv</code> 跳过；<code>ctx = 0</code>，注意力输出 0；采样出来的 token 没人读。它们白算了一遍 Linear，这是分桶的代价，也是第 12 步 GEMV 阈值定在 2 的原因。</p>
+
+<h2>改动</h2>
+<h3><span class="stepno">1</span>C 接口</h3>
+<div class="codeblock"><div class="cap"><span><b>声明</b> <span class="tag new">新增</span></span><button type="button">复制</button></div><pre><code class="language-cpp">// ---- cuda_shim.h ----
+int    cuda_graph_begin(void);          /* cudaStreamBeginCapture */
+void  *cuda_graph_end(void);            /* EndCapture + Instantiate → cudaGraphExec_t */
+void   cuda_graph_launch(void *exec);
+void   cuda_graph_destroy(void *exec);
+
+// ---- cuda.zig ----
+pub extern fn cuda_graph_begin() c_int;
+pub extern fn cuda_graph_end() ?*anyopaque;
+pub extern fn cuda_graph_launch(exec: ?*anyopaque) void;
+pub extern fn cuda_graph_destroy(exec: ?*anyopaque) void;</code></pre></div>
+
+<h3><span class="stepno">2</span>录制</h3>
+<p>lab 的原版：</p>
+<div class="codeblock"><div class="cap"><span><b>executor.zig · captureGraphs</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">    fn captureGraphs(self: *Executor) !void {
+        if (comptime !opts.have_cuda) unreachable;
+        // 桶: 1,2,4,8, 16,32,48,... ≤ max_num_seqs(同 nano-vllm), 再补上 max_num_seqs 本身
+        const max_seq = self.lim.max_seq;
+        var list: std.ArrayListUnmanaged(usize) = .empty;
+        defer list.deinit(self.alloc);
+        for ([_]usize{ 1, 2, 4, 8 }) |b| if (b &lt;= max_seq) try list.append(self.alloc, b);
+        var b: usize = 16;
+        while (b &lt;= max_seq) : (b += 16) try list.append(self.alloc, b);
+        if (list.items[list.items.len - 1] != max_seq) try list.append(self.alloc, max_seq);
+        if (list.items.len &gt; MAX_BUCKETS) return error.TooManyBuckets;
+
+        for (list.items, 0..) |bs_, i| {
+            const lay = Layout.init(bs_, bs_, 0, self.lim.max_blocks);
+            // 预热一次(让 cuBLAS 选好算法、加载 kernel), 内容无关紧要: ctx=0 / slot=-1 不读写 KV
+            self.fillMeta(lay, &amp;.{}, bs_, 0);
+            cu.cuda_h2d_async(self.devAt(0), self.meta_host.?, lay.total);
+            self.bindStep(lay, bs_, bs_, 0, true);
+            try self.runNodes();
+            cu.cuda_sync();
+            try cu.check(&quot;graph warmup&quot;);
+
+            if (cu.cuda_graph_begin() != 0) return error.GraphCaptureFailed;
+            try self.runNodes();
+            const g = cu.cuda_graph_end() orelse return error.GraphCaptureFailed;
+            try cu.check(&quot;graph capture&quot;);
+            self.buckets[i] = bs_;
+            self.graphs[i] = g;
+            self.graph_out[i] = @intFromPtr(self.output_node.data.?);
+            self.n_buckets = i + 1;
+        }
+    }</code></pre></div>
+<p>llmgen 的版本：</p>
+<div class="codeblock"><div class="cap"><span><b>src/executor.zig</b> <span class="tag new">新增</span></span><button type="button">复制</button></div><pre><code class="language-zig">const MAX_BUCKETS = 64;
+
+// ---- 字段 ----
+    enforce_eager: bool = false, // LLMGEN_EAGER=1:不录也不回放, 全部逐 kernel 发射
+    buckets: [MAX_BUCKETS]usize = undefined, //            每个桶的批大小
+    n_buckets: usize = 0,
+    graphs: [MAX_BUCKETS]?*anyopaque = [_]?*anyopaque{null} ** MAX_BUCKETS,
+    graph_out: [MAX_BUCKETS]usize = [_]usize{0} ** MAX_BUCKETS, // 每个桶回放时采样结果所在的显存地址
+    n_graph_steps: usize = 0,
+    n_eager_steps: usize = 0,
+
+    fn bucketFor(self: *const Self, s: usize) ?usize {
+        for (self.buckets[0..self.n_buckets], 0..) |b, i| {
+            if (b &gt;= s) return i;
+        }
+        return null;
+    }
+
+    /// 纯 decode 步按批大小分桶录制。桶:1, 2, 4, 8, 16, 32, 48, ... ≤ MAX_SEQS, 再补上 MAX_SEQS 本身。
+    fn captureGraphs(self: *Self) !void {
+        var list: std.ArrayList(usize) = .empty;
+        defer list.deinit(self.allocator);
+        for ([_]usize{ 1, 2, 4, 8 }) |b| if (b &lt;= MAX_SEQS) try list.append(self.allocator, b);
+        var b: usize = 16;
+        while (b &lt;= MAX_SEQS) : (b += 16) try list.append(self.allocator, b);
+        if (list.items[list.items.len - 1] != MAX_SEQS) try list.append(self.allocator, MAX_SEQS);
+        if (list.items.len &gt; MAX_BUCKETS) return error.TooManyBuckets;
+
+        // RoPE 表等只算一次的节点先算好, 不能录进图里
+        try self.runPersistentOnce();
+
+        for (list.items, 0..) |bs, i| {
+            const lay = Layout.init(bs, bs, 0, self.max_blocks);
+            // 预热一次:让 cuBLAS 选好算法、驱动加载好 kernel。内容无所谓:ctx = 0 / slot = -1, 不读写 KV
+            self.fillMeta(lay, &amp;.{}, bs, 0);
+            self.uploadMeta(lay.total);
+            self.resolveDims(@intCast(bs), @intCast(bs));
+            self.bindStep(lay, bs, bs, 0, true);
+            self.plan.bind(self.tok_arena, self.seq_arena, bs, bs);
+            try self.runNodes();
+            cuda.CudaContext.instance().sync();
+
+            if (cuda.cuda_graph_begin() != 0) return error.GraphCaptureFailed;
+            try self.runNodes(); // 这一遍 kernel 不执行, 只被记下来
+            const g = cuda.cuda_graph_end() orelse return error.GraphCaptureFailed;
+            self.buckets[i] = bs;
+            self.graphs[i] = g;
+            self.graph_out[i] = @intFromPtr(self.output_tensor.data.?);
+            self.n_buckets = i + 1;
+        }
+    }</code></pre></div>
+
+<h3><span class="stepno">3</span>fillMeta 支持 padding 行</h3>
+<div class="codeblock diff"><div class="cap"><span><b>src/executor.zig · fillMeta</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln del">    fn fillMeta(self: *Self, lay: Layout, entries: []const Entry, n_tiles: usize) void {</span><span class="ln add">    /// Sn ≥ entries.len:多出来的是 CUDA Graph 桶的 padding 行</span><span class="ln add">    fn fillMeta(self: *Self, lay: Layout, entries: []const Entry, Sn: usize, n_tiles: usize) void {</span><span class="ln ctx">        ...</span><span class="ln ctx">        for (entries, 0..) |e, s| {</span><span class="ln ctx">            ...</span><span class="ln ctx">        }</span><span class="ln add">        // padding 行:ctx = 0(注意力输出 0)、slot = -1(不写 KV)</span><span class="ln add">        var s = entries.len;</span><span class="ln add">        while (s &lt; Sn) : (s += 1) {</span><span class="ln add">            ids[t] = 0;</span><span class="ln add">            pos[t] = 0;</span><span class="ln add">            slots[t] = -1;</span><span class="ln add">            t += 1;</span><span class="ln add">            cu_q[s + 1] = @intCast(t);</span><span class="ln add">            ctx[s] = 0;</span><span class="ln add">            last[s] = @intCast(t - 1);</span><span class="ln add">            temps[s] = 0;</span><span class="ln add">            @memset((bt + s * mb)[0..mb], 0);</span><span class="ln add">        }</span><span class="ln ctx">    }</span></code></pre></div>
+
+<h3><span class="stepno">4</span>forward：能回放就回放</h3>
+<div class="codeblock diff"><div class="cap"><span><b>src/executor.zig（fetchOut 改成收一个显存地址的 fetchOutAt；“持久节点只算一次”的那段抽成 runPersistentOnce）</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">    fn forward(self: *Self, entries: []const Entry) ![]const i32 {</span><span class="ln ctx">        ...</span><span class="ln ctx">        const n_seq = entries.len;</span><span class="ln add">        // 纯 decode 步找一个装得下的桶;profile / 逐算子同步 / LLMGEN_EAGER 时不用图</span><span class="ln add">        const bi: ?usize = if (decode and !self.enforce_eager) self.bucketFor(n_seq) else null;</span><span class="ln add">        const Sn = if (bi) |b| self.buckets[b] else n_seq;</span><span class="ln add">        const Tn = if (decode) Sn else n_tok;</span><span class="ln ctx">        var n_tiles: usize = 0;</span><span class="ln ctx">        ...</span><span class="ln del">        const lay = Layout.init(n_tok, n_seq, n_tiles, self.max_blocks);</span><span class="ln del">        self.fillMeta(lay, entries, n_tiles);</span><span class="ln add">        const lay = Layout.init(Tn, Sn, n_tiles, self.max_blocks);</span><span class="ln add">        self.fillMeta(lay, entries, Sn, n_tiles);</span><span class="ln ctx">        self.uploadMeta(lay.total);</span><span class="ln del">        self.resolveDims(@intCast(n_seq), @intCast(n_tok));</span><span class="ln del">        self.bindStep(lay, n_tok, n_seq, n_tiles, decode);</span><span class="ln del">        self.plan.bind(self.tok_arena, self.seq_arena, n_tok, n_seq);</span><span class="ln del">        ...</span><span class="ln del">        try self.runNodes();</span><span class="ln del">        return self.fetchOut(n_seq);</span><span class="ln add"> </span><span class="ln add">        if (bi) |b| {</span><span class="ln add">            // 回放:一次调用, 整步的 kernel 全部按录制时的参数排进 stream</span><span class="ln add">            cuda.cuda_graph_launch(self.graphs[b]);</span><span class="ln add">            self.n_graph_steps += 1;</span><span class="ln add">            return self.fetchOutAt(self.graph_out[b], n_seq);</span><span class="ln add">        }</span><span class="ln add">        self.resolveDims(@intCast(Sn), @intCast(Tn));</span><span class="ln add">        self.bindStep(lay, Tn, Sn, n_tiles, decode);</span><span class="ln add">        self.plan.bind(self.tok_arena, self.seq_arena, Tn, Sn);</span><span class="ln add">        try self.runNodes();</span><span class="ln add">        self.n_eager_steps += 1;</span><span class="ln add">        return self.fetchOutAt(@intFromPtr(self.output_tensor.data.?), n_seq);</span><span class="ln ctx">    }</span><span class="ln ctx"> </span><span class="ln ctx">// ---- init() 末尾 ----</span><span class="ln add">        self.enforce_eager = std.posix.getenv(&quot;LLMGEN_EAGER&quot;) != null or self.sync_each or self.profiler.enabled or</span><span class="ln add">            !(opts.have_cuda and self.input_tensor.device_type == .CUDA);</span><span class="ln add">        if (!self.enforce_eager) try self.captureGraphs();</span><span class="ln ctx"> </span><span class="ln ctx">// ---- deinit() ----</span><span class="ln add">        if (opts.have_cuda) for (self.graphs[0..self.n_buckets]) |g| cuda.cuda_graph_destroy(g);</span></code></pre></div>
+<div class="callout warn"><span class="t">回放时 Zig 侧的派发代码完全不执行</span><code>runNodes</code>、<code>dispatchKernel</code>、各个 <code>Impl.execute</code> 在回放时都不会被调用。所以任何“每步要在 host 上做的事”都不能藏在 Impl 里。阶段 1–3 的 Impl 只做“读 g_step、调 C 接口”，没有副作用，满足这个要求。<code>resolveDims</code> 和 <code>bindStep</code> 在回放路径上也不调：dims 和 <code>g_step</code> 只在发射 kernel 时才被读。</div>
+
+<h2>对拍验证</h2>
+<p>回放的就是录下来的那些 kernel，输出必须和 <code>LLMGEN_EAGER=1</code> <b>逐 token 相同</b>（greedy）。这是这一步最重要的检查：</p>
+<div class="codeblock"><div class="cap"><span><b>终端</b> <span class="tag out">命令</span></span><button type="button">复制</button></div><pre><code class="language-bash">LLMGEN_WORKLOAD=…/s1.json make llmgen-cuda                 # 默认: decode 回放 CUDA Graph
+LLMGEN_EAGER=1 LLMGEN_WORKLOAD=…/s1.json make llmgen-cuda  # 逐 kernel 发射</code></pre></div>
+<p>如果两者不同，说明有东西在录制后变了但没放进元数据。最常见的是某个 Impl 把随步变化的标量当参数传给了 kernel。</p>
+<h2>CPU 同步</h2>
+<div class="callout cpu"><span class="t">这一步 CPU 后端要做的事</span><b>不用动。</b>CPU 没有 CUDA Graph：<code>enforce_eager</code> 对非 CUDA 设备恒为真，不录制、不回放，也不会产生 padding 行。 <a href="cpu-5-exec-cli.html">去看 →</a></div>
+<h2>性能收益</h2>
+<h3>依据</h3>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th class="num">改前</th><th class="num">改后</th><th>来源</th></tr></thead><tbody><tr><td>unfused 图，融合版引擎，S1：eager → graph（tok/s）</td><td class="num">385.6</td><td class="num">439</td><td><span class="src lab">消融实测</span></td></tr><tr><td>融合图 S1：eager → graph（tok/s）</td><td class="num">435.7</td><td class="num">485</td><td><span class="src lab">消融实测</span></td></tr><tr><td>融合图 S4：eager → graph（tok/s）</td><td class="num">1938</td><td class="num">2129.8</td><td><span class="src lab">消融实测</span></td></tr><tr><td>S1 全程 launch 次数（融合图）</td><td class="num">384020 次 cudaLaunchKernel</td><td class="num">1338 次 cudaGraphLaunch</td><td><span class="src lab">nsys 实测</span></td></tr><tr><td>加载耗时（含录制 20 个桶，s）</td><td class="num">0.38</td><td class="num">0.74</td><td><span class="src lab">消融实测</span></td></tr></tbody></table></div>
+<h3>对 llmgen 的预期</h3>
+<p>lab 的消融：同样是 unfused 粒度的图，S1 从 385.6 到 439 tok/s，快 1.14 倍（ITL 2.56 → 2.24 ms）。节点越多，图的收益越大：融合图（每层 9 个节点）只快 1.11 倍。</p>
+<p>对 llmgen：图的粒度和 lab 相同，预期 ITL 降 0.3 ms 左右，吞吐提升 10–15% <span class="src est">推算</span>。</p>
+<p>代价是启动时间：每个桶录制一次要十几毫秒，lab 录 20 个桶多花 0.3 秒。现在 <code>MAX_SEQS = 1</code> 只有一个桶，感觉不到。</p>
+<p>到这里是里程碑 M2 的验收点：<b>S1 的吞吐接近 401 tok/s，ITL 接近 2.449 ms，TTFT 约 13 ms</b>。单序列的路走完了。</p>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>S1 ITL mean (ms)：LLMGEN_EAGER=1</td><td class="num fill" contenteditable="true" data-key="17-cuda-graph.html|S1 ITL mean (ms)：LLMGEN_EAGER=1|before"></td><td class="num fill" contenteditable="true" data-key="17-cuda-graph.html|S1 ITL mean (ms)：LLMGEN_EAGER=1|after"></td><td class="num gain"></td></tr><tr><td>S1 ITL mean (ms)：默认</td><td class="num fill" contenteditable="true" data-key="17-cuda-graph.html|S1 ITL mean (ms)：默认|before"></td><td class="num fill" contenteditable="true" data-key="17-cuda-graph.html|S1 ITL mean (ms)：默认|after"></td><td class="num gain"></td></tr><tr><td>S1 输出吞吐 (tok/s)</td><td class="num fill" contenteditable="true" data-key="17-cuda-graph.html|S1 输出吞吐 (tok/s)|before"></td><td class="num fill" contenteditable="true" data-key="17-cuda-graph.html|S1 输出吞吐 (tok/s)|after"></td><td class="num gain"></td></tr><tr><td>S1 TTFT mean (ms)</td><td class="num fill" contenteditable="true" data-key="17-cuda-graph.html|S1 TTFT mean (ms)|before"></td><td class="num fill" contenteditable="true" data-key="17-cuda-graph.html|S1 TTFT mean (ms)|after"></td><td class="num gain"></td></tr><tr><td>加载耗时 (s)</td><td class="num fill" contenteditable="true" data-key="17-cuda-graph.html|加载耗时 (s)|before"></td><td class="num fill" contenteditable="true" data-key="17-cuda-graph.html|加载耗时 (s)|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td><code>error.GraphCaptureFailed</code></td><td>录制期间有不能录的操作：同步拷贝、<code>cudaMalloc</code>、<code>cudaStreamSynchronize</code>、cuBLAS 自己申请 workspace。检查 <code>runNodes</code> 路径上有没有残留的 <code>sync</code>（<code>sync_each</code> 和 profiler 分支在 eager 之外不该进）。</td></tr><tr><td>回放的输出和 eager 不同</td><td>有随步变化的值被录死了。逐个检查 Impl：传给 C 接口的参数只能是 <code>g_step</code> 里的规模 / 指针、节点的 <code>data</code>、权重指针、模型常数。</td></tr><tr><td>回放输出恒定不变（每步同一个 token）</td><td>元数据没更新到录制时的那块显存。<code>Layout.init(Tn, Sn, 0, …)</code> 回放时的参数必须和录制时相同，否则各段偏移不同。</td></tr><tr><td>带温度采样时每步抽到同样的噪声</td><td>seed 没更新。它在元数据包头 8 字节，<code>fillMeta</code> 每步递增，随 <code>uploadMeta</code> 上传。</td></tr><tr><td>第一步 decode 很慢</td><td>正常，第一次 <code>cudaGraphLaunch</code> 有一次性的初始化。压测前先预热（第 21 步）。</td></tr><tr><td><code>LLMGEN_PROFILE=1</code> 下没有 graph 步</td><td>设计如此：profile 要逐算子同步，只能 eager。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li>greedy 输出：默认和 <code>LLMGEN_EAGER=1</code> 逐 token 相同</li><li><code>n_graph_steps</code> ≈ 生成的 token 数，<code>n_eager_steps</code> ≈ prefill 的次数</li><li>M2：S1 的吞吐、ITL、TTFT 接近目标</li><li>阶段 4 结束：把数字填进总览页的汇总表</li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="16-memory-plan.html"><small>← 上一步</small>活跃区间激活规划</a><a class="next" href="18-block-manager.html"><small>下一步 →</small>序列级块表与 KV 预算</a></div>
+</main>
+</div>
+</body>
+</html>

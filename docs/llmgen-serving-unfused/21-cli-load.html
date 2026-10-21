@@ -1,0 +1,509 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CLI 与快速加载 · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html" class="active"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">阶段 6 · 收尾</div>
+<h1>CLI 与快速加载</h1>
+<p class="lead">正式的 chat / bench 子命令；权重不经过进程堆。</p>
+<div class="callout goal"><span class="t">本步目标</span>把一路上攒下的环境变量开关整理成正式的命令行（<code>chat</code> 和 <code>bench</code> 两个子命令），bench 输出和 lab、nano-vllm 同格式的 JSON。顺手把加载改成“权重不经过进程堆”，RSS 降 1.5 GB，加载到 1 秒以内。</div>
+<h2>原理</h2>
+<h3>为什么要正式的命令行</h3>
+<p>到现在为止的开关：<code>LLMGEN_MODEL</code>、<code>LLMGEN_WORKLOAD</code>、<code>LLMGEN_EAGER</code>、<code>LLMGEN_SYNC_EACH</code>、<code>LLMGEN_POLICY</code>、<code>LLMGEN_PROFILE</code>、<code>LLMGEN_METRICS</code>……prompt 和 <code>max_model_len</code> 还写死在 <code>llmgen.zig</code> 里。下一步要用脚本批量跑四个场景、和另外两个引擎对比，需要：</p>
+<ul>
+  <li>每次运行的参数能从命令行完整给出、能记在日志里；</li>
+  <li>结果是机器可读的 JSON，字段和另外两个引擎一致，一个 <code>report.py</code> 就能汇总。</li>
+</ul>
+
+<h3>bench 的口径</h3>
+<p>和 lab、<code>bench_nanovllm.py</code> 完全相同，这是三方数字能放在一张表里的前提：</p>
+<div class="tablewrap"><table><thead><tr><th></th><th>口径</th></tr></thead><tbody><tr><td>预热</td><td>正式计时前跑一条 8 token 输入、64 token 输出的短请求。吃掉 GPU 升频、cuBLAS 初始化、第一次 graph launch</td></tr><tr><td>提交</td><td>一轮的所有请求在 t0 同时 <code>addRequest</code></td></tr><tr><td>TTFT</td><td>每条请求第一个 token 回到 host 的时刻 − t0（含排队）</td></tr><tr><td>ITL</td><td>同一请求相邻两个 token 的间隔，所有请求的样本合在一起算 mean / p50 / p99</td></tr><tr><td>吞吐</td><td>一轮的输出 token 数 ÷ 一轮的墙钟。多轮取墙钟的中位数</td></tr><tr><td>峰值 RSS</td><td><code>/proc/self/status</code> 的 <code>VmHWM</code></td></tr><tr><td>峰值显存</td><td>进程外用 NVML 每 50 ms 采样（<code>gpu_mon.py</code>），不信任引擎自报</td></tr></tbody></table></div>
+
+<h3>加载：权重为什么不该经过进程堆</h3>
+<div class="codeblock"><div class="cap"><span><b>src/gguf.zig · GGUFParser.init</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-zig">    pub fn init(allocator: std.mem.Allocator, filename: []const u8) !Self {
+        const file = try std.fs.cwd().openFile(filename, .{});
+        defer file.close();
+
+        const file_stat = try file.stat();
+        const file_size = file_stat.size;
+        const buffer = try allocator.alloc(u8, @intCast(file_size));
+        errdefer allocator.free(buffer);
+
+        var offset: usize = 0;
+        while (offset &lt; buffer.len) {
+            const n = try file.read(buffer[offset..]);
+            if (n == 0) break;
+            offset += n;
+        }
+
+        const gguf_info = try parse(allocator, buffer); // 开始解析 gguf 格式
+
+        return .{
+            .gguf_info = gguf_info,
+            .buffer = buffer,
+            .data_offset = gguf_info.data_offset,
+            .allocator = allocator,
+        };
+    }</code></pre></div>
+<p>起点把整个 GGUF 文件（1.5 GB）读进一块堆内存，解析头部，然后逐个张量从这块内存 H2D。两个问题：</p>
+<ul>
+  <li><b>RSS</b>：这 1.5 GB 一直占着，直到 parser 析构。目标 lab 的峰值 RSS 是 519 MB。</li>
+  <li><b>拷贝</b>：从普通（pageable）内存 H2D，驱动内部要先拷到它自己的 pinned 暂存区，等于多拷一遍。</li>
+</ul>
+<p>lab 的做法：只读文件开头的一小段（16 MB，不够就翻倍）来解析头部；权重数据留在磁盘上，加载时 <code>pread</code> 直接读进一块 32 MB 的 pinned 暂存区，再 H2D。</p>
+<div class="codeblock"><div class="cap"><span><b>gguf_parser.zig</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">    /// 对照 GGUFParser::GGUFParser(filename).
+    /// [serving] 与 module-style 的差异:只读文件**前缀**直到头部能完整解析(不够就翻倍重读),
+    /// 张量数据留在磁盘,由 readTensor 按需 pread —— 1.5GB 的 BF16 权重不经过进程堆.
+    pub fn init(alloc: std.mem.Allocator, filename: []const u8) !GGUFParser {
+        const file = try std.fs.cwd().openFile(filename, .{});
+        errdefer file.close();
+        const size: usize = @intCast((try file.stat()).size);
+        var want: usize = @min(size, 16 &lt;&lt; 20);
+        while (true) {
+            const buffer = try alloc.alloc(u8, want);
+            const n = try file.preadAll(buffer, 0);
+            if (parse(alloc, buffer[0..n])) |parsed| {
+                return .{
+                    .info_ = parsed.info,
+                    .buffer = buffer,
+                    .data_offset_ = parsed.info.offset,
+                    .file = file,
+                    .alloc = alloc,
+                };
+            } else |e| {
+                alloc.free(buffer);
+                if (e != ParseError.OutOfBounds or want &gt;= size) return e;
+                want = @min(size, want * 2);
+            }
+        }
+    }
+
+    /// 把某张量的原始磁盘字节(bf16/f16/f32 未反量化)读进 dst(长度须 == t.bytes()).
+    pub fn readTensor(self: *const GGUFParser, t: *const TensorInfo, dst: []u8) !void {
+        std.debug.assert(dst.len == t.bytes());
+        const n = try self.file.?.preadAll(dst, self.data_offset_ + t.offset);
+        if (n != dst.len) return error.ShortRead;
+    }</code></pre></div>
+<div class="codeblock"><div class="cap"><span><b>manager.zig · loadOne 的 bf16 分支</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">                .bf16 =&gt; {
+                    if (p.dtype != .GGML_TYPE_BF16) return error.WeightMustBeBf16;
+                    const total = p.bytes();
+                    const file_off = parser.dataOffset() + p.offset;
+                    if (stage) |st| {
+                        if (comptime !opts.have_cuda) unreachable;
+                        // 分块: pread → pinned → H2D(同步), 暂存区只有 32MB
+                        var done: usize = 0;
+                        while (done &lt; total) {
+                            const chunk = @min(STAGE_BYTES, total - done);
+                            const n = try parser.file.?.preadAll(st[0..chunk], file_off + done);
+                            if (n != chunk) return error.ShortRead;
+                            cu.cuda_h2d(dev_base + dst_off + done, st, chunk);
+                            done += chunk;
+                        }
+                    } else {
+                        const n = try parser.file.?.preadAll(dev_base[dst_off..][0..total], file_off);
+                        if (n != total) return error.ShortRead;
+                    }
+                    dst_off += total;
+                },</code></pre></div>
+
+<h2>改动</h2>
+<h3><span class="stepno">1</span>命令行</h3>
+<div class="codeblock"><div class="cap"><span><b>main.zig · Options</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">const Options = struct {
+    cmd: []const u8 = &quot;chat&quot;,
+    device: ?[]const u8 = null, // null = 挑最好的可用设备
+    arg0: ?[]const u8 = null,
+    max_new: usize = 64,
+    model: []const u8 = &quot;weights/Qwen3-0.6B-BF16.gguf&quot;,
+    out: ?[]const u8 = null,
+    temp: f32 = 0,
+    eager: bool = false,
+    debug_sync: bool = false,
+    sync_each: bool = false,
+    max_num_seqs: usize = 256,
+    max_batched: usize = 16384,
+    max_model_len: usize = 4096,
+    block_size: usize = 16,
+    gpu_util: f32 = 0.9,
+    kv_blocks: ?usize = null, // null: CUDA 按 gpu_util 自动算, CPU / Metal 用 HOST_KV_BLOCKS
+    policy: []const u8 = &quot;prefill_first&quot;,
+    chunk: usize = 2048,
+    pass_tokens: ?usize = null, // null: CUDA 8192, CPU / Metal HOST_PASS_TOKENS
+};
+
+const HOST_KV_BLOCKS: usize = 512; // × 16 token × 28 层 × K/V × 8 头 × 128 × 2B ≈ 0.9 GB
+const HOST_PASS_TOKENS: usize = 2048;</code></pre></div>
+<div class="codeblock"><div class="cap"><span><b>main.zig · parseArgs</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">fn parseArgs(alloc: std.mem.Allocator) !struct { o: Options, args: std.process.ArgIterator } {
+    var it = try std.process.argsWithAllocator(alloc);
+    _ = it.next();
+    var o = Options{};
+    var pos: usize = 0;
+    while (it.next()) |a| {
+        if (std.mem.startsWith(u8, a, &quot;--&quot;)) {
+            const key = a[2..];
+            if (std.mem.eql(u8, key, &quot;eager&quot;)) {
+                o.eager = true;
+                continue;
+            }
+            if (std.mem.eql(u8, key, &quot;debug-sync&quot;)) {
+                o.debug_sync = true;
+                continue;
+            }
+            if (std.mem.eql(u8, key, &quot;sync-each&quot;)) {
+                o.sync_each = true;
+                continue;
+            }
+            const v = it.next() orelse return error.MissingOptionValue;
+            if (std.mem.eql(u8, key, &quot;model&quot;)) o.model = v //
+            else if (std.mem.eql(u8, key, &quot;device&quot;)) o.device = v //
+            else if (std.mem.eql(u8, key, &quot;out&quot;)) o.out = v //
+            else if (std.mem.eql(u8, key, &quot;temp&quot;)) o.temp = try std.fmt.parseFloat(f32, v) //
+            else if (std.mem.eql(u8, key, &quot;max-num-seqs&quot;)) o.max_num_seqs = try std.fmt.parseInt(usize, v, 10) //
+            else if (std.mem.eql(u8, key, &quot;max-batched-tokens&quot;)) o.max_batched = try std.fmt.parseInt(usize, v, 10) //
+            else if (std.mem.eql(u8, key, &quot;max-model-len&quot;)) o.max_model_len = try std.fmt.parseInt(usize, v, 10) //
+            else if (std.mem.eql(u8, key, &quot;block-size&quot;)) o.block_size = try std.fmt.parseInt(usize, v, 10) //
+            else if (std.mem.eql(u8, key, &quot;gpu-util&quot;)) o.gpu_util = try std.fmt.parseFloat(f32, v) //
+            else if (std.mem.eql(u8, key, &quot;kv-blocks&quot;)) o.kv_blocks = try std.fmt.parseInt(usize, v, 10) //
+            else if (std.mem.eql(u8, key, &quot;policy&quot;)) o.policy = v //
+            else if (std.mem.eql(u8, key, &quot;chunk&quot;)) o.chunk = try std.fmt.parseInt(usize, v, 10) //
+            else if (std.mem.eql(u8, key, &quot;pass-tokens&quot;)) o.pass_tokens = try std.fmt.parseInt(usize, v, 10) //
+            else return error.UnknownOption;
+        } else {
+            switch (pos) {
+                0 =&gt; o.cmd = a,
+                1 =&gt; o.arg0 = a,
+                2 =&gt; o.max_new = try std.fmt.parseInt(usize, a, 10),
+                else =&gt; return error.TooManyArgs,
+            }
+            pos += 1;
+        }
+    }
+    return .{ .o = o, .args = it };
+}</code></pre></div>
+<p>把这两段搬进 <code>llmgen.zig</code>，<code>run()</code> 开头调 <code>parseArgs</code>，用 <code>o.max_model_len</code> / <code>o.max_num_seqs</code> / <code>o.gpu_util</code> 等填 <code>GraphScheduler.Config</code> 和 <code>EngineConfig</code>；<code>--eager</code> / <code>--sync-each</code> 取代同名的环境变量。<code>--device</code> 和 Metal 相关的可以先不搬。</p>
+
+<h3><span class="stepno">2</span>chat 和 bench</h3>
+<div class="codeblock"><div class="cap"><span><b>main.zig · chat</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">fn chat(alloc: std.mem.Allocator, w: *std.Io.Writer, parser: anytype, engine: anytype, o: Options) !void {
+    const tkz = @import(&quot;tokenizer.zig&quot;);
+    var tok = try tkz.Tokenizer.fromGguf(alloc, parser);
+    defer tok.deinit();
+    const text = o.arg0 orelse &quot;中国的首都是哪里？&quot;;
+    const templated = try tkz.qwenChatTemplate(alloc, text, true);
+    defer alloc.free(templated);
+    const ids = try tok.encode(templated);
+    defer alloc.free(ids);
+    try w.print(&quot;prompt: \&quot;{s}\&quot; ({d} tokens)\n&quot;, .{ text, ids.len });
+    try w.flush();
+
+    const seq = try engine.addRequest(ids, .{ .temperature = o.temp, .max_tokens = o.max_new, .ignore_eos = false });
+    const t0 = std.time.nanoTimestamp();
+    var t_first: i128 = 0;
+    var n_out: usize = 0;
+    while (!engine.isFinished()) {
+        _ = try engine.step();
+        for (engine.lastEmitted()) |e| {
+            if (n_out == 0) t_first = std.time.nanoTimestamp();
+            n_out += 1;
+            const tk = e.token;
+            if (tk == engine.eos) continue;
+            const s = try tok.decode(&amp;[_]i32{tk});
+            defer alloc.free(s);
+            try w.print(&quot;{s}&quot;, .{s});
+            try w.flush();
+        }
+    }
+    const t_end = std.time.nanoTimestamp();
+    const ttft_ms = @as(f64, @floatFromInt(t_first - t0)) / 1e6;
+    const dec_ms = @as(f64, @floatFromInt(t_end - t_first)) / 1e6;
+    try w.print(&quot;\n---\n生成 {d} token | TTFT {d:.2} ms | decode {d:.2} ms/token ({d:.1} tok/s)\n&quot;, .{
+        n_out, ttft_ms, if (n_out &gt; 1) dec_ms / @as(f64, @floatFromInt(n_out - 1)) else 0, if (n_out &gt; 1) @as(f64, @floatFromInt(n_out - 1)) * 1e3 / dec_ms else 0,
+    });
+    try w.print(&quot;token ids:&quot;, .{});
+    for (seq.token_ids.items[seq.num_prompt_tokens..]) |t| try w.print(&quot; {d}&quot;, .{t});
+    try w.print(&quot;\n&quot;, .{});
+    try w.flush();
+}</code></pre></div>
+<div class="codeblock"><div class="cap"><span><b>metrics.zig（拷到 src/bench/recorder.zig）</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">pub const Stats = struct {
+    mean: f64 = 0,
+    p50: f64 = 0,
+    p90: f64 = 0,
+    p99: f64 = 0,
+    max: f64 = 0,
+    n: usize = 0,
+};
+
+/// 分位数: 线性插值(同 numpy.percentile 默认).
+fn percentile(sorted: []const f64, q: f64) f64 {
+    if (sorted.len == 0) return 0;
+    if (sorted.len == 1) return sorted[0];
+    const pos = q * @as(f64, @floatFromInt(sorted.len - 1));
+    const lo: usize = @intFromFloat(@floor(pos));
+    const hi = @min(lo + 1, sorted.len - 1);
+    const frac = pos - @as(f64, @floatFromInt(lo));
+    return sorted[lo] + (sorted[hi] - sorted[lo]) * frac;
+}
+
+/// 会就地排序 xs.
+pub fn stats(xs: []f64) Stats {
+    if (xs.len == 0) return .{};
+    std.sort.pdq(f64, xs, {}, std.sort.asc(f64));
+    var sum: f64 = 0;
+    for (xs) |x| sum += x;
+    return .{
+        .mean = sum / @as(f64, @floatFromInt(xs.len)),
+        .p50 = percentile(xs, 0.5),
+        .p90 = percentile(xs, 0.9),
+        .p99 = percentile(xs, 0.99),
+        .max = xs[xs.len - 1],
+        .n = xs.len,
+    };
+}
+
+/// 一次压测运行的逐请求 token 时间戳收集器.
+pub const Recorder = struct {
+    alloc: Alloc,
+    t0_ns: i128 = 0,
+    first: []i128, // 每个请求首 token 时刻(0 = 尚未产出)
+    prev: []i128, // 上一个 token 时刻
+    count: []usize,
+    itl_ms: std.ArrayListUnmanaged(f64) = .empty,
+
+    pub fn init(alloc: Alloc, n: usize) !Recorder {
+        const r = Recorder{
+            .alloc = alloc,
+            .first = try alloc.alloc(i128, n),
+            .prev = try alloc.alloc(i128, n),
+            .count = try alloc.alloc(usize, n),
+        };
+        @memset(r.first, 0);
+        @memset(r.prev, 0);
+        @memset(r.count, 0);
+        return r;
+    }
+
+    pub fn deinit(self: *Recorder) void {
+        self.alloc.free(self.first);
+        self.alloc.free(self.prev);
+        self.alloc.free(self.count);
+        self.itl_ms.deinit(self.alloc);
+    }
+
+    pub fn start(self: *Recorder, now: i128) void {
+        self.t0_ns = now;
+    }
+
+    pub fn token(self: *Recorder, req: usize, now: i128) !void {
+        if (self.count[req] == 0) {
+            self.first[req] = now;
+        } else {
+            try self.itl_ms.append(self.alloc, @as(f64, @floatFromInt(now - self.prev[req])) / 1e6);
+        }
+        self.prev[req] = now;
+        self.count[req] += 1;
+    }
+
+    /// TTFT 样本(ms), 调用方负责 free.
+    pub fn ttftMs(self: *const Recorder, alloc: Alloc) ![]f64 {
+        const out = try alloc.alloc(f64, self.first.len);
+        for (self.first, 0..) |f, i| out[i] = @as(f64, @floatFromInt(f - self.t0_ns)) / 1e6;
+        return out;
+    }
+};</code></pre></div>
+<div class="codeblock"><div class="cap"><span><b>main.zig · bench</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">fn bench(alloc: std.mem.Allocator, w: *std.Io.Writer, engine: anytype, sched: anytype, o: Options, load_s: f64) !void {
+    const mt = @import(&quot;metrics.zig&quot;);
+    const path = o.arg0 orelse return error.MissingWorkload;
+    const bytes = try std.fs.cwd().readFileAlloc(alloc, path, 256 &lt;&lt; 20);
+    defer alloc.free(bytes);
+    const parsed = try std.json.parseFromSlice(Workload, alloc, bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const wl = parsed.value;
+    const n_rounds = wl.rounds.len;
+    const reqs0 = wl.rounds[0];
+
+    var in_tok: usize = 0;
+    var out_tok: usize = 0;
+    for (reqs0) |r| {
+        in_tok += r.prompt_ids.len;
+        out_tok += r.max_tokens;
+    }
+    try w.print(&quot;[bench] {s}: {d} 请求 × {d} 轮, 输入 {d} / 输出 {d} token\n&quot;, .{ wl.name, reqs0.len, n_rounds, in_tok, out_tok });
+    try w.flush();
+
+    // 预热(同 nano-vllm bench.py: 一条短请求)
+    {
+        const n = @min(8, reqs0[0].prompt_ids.len);
+        _ = try engine.addRequest(reqs0[0].prompt_ids[0..n], .{ .temperature = 1.0, .max_tokens = 64 });
+        while (!engine.isFinished()) _ = try engine.step();
+        engine.reapFinished();
+    }
+
+    var ttft_all: std.ArrayListUnmanaged(f64) = .empty;
+    defer ttft_all.deinit(alloc);
+    var itl_all: std.ArrayListUnmanaged(f64) = .empty;
+    defer itl_all.deinit(alloc);
+    var walls = try alloc.alloc(f64, n_rounds);
+    defer alloc.free(walls);
+    var n_steps: usize = 0;
+    const pre0 = engine.sched.num_preemptions;
+
+    for (wl.rounds, 0..) |reqs, rep| {
+        var rec = try mt.Recorder.init(alloc, reqs.len);
+        defer rec.deinit();
+        const base_id = engine.next_id;
+        rec.start(std.time.nanoTimestamp());
+        for (reqs) |r| {
+            _ = try engine.addRequest(r.prompt_ids, .{ .temperature = r.temperature, .max_tokens = r.max_tokens, .ignore_eos = r.ignore_eos });
+        }
+        while (!engine.isFinished()) {
+            _ = try engine.step();
+            n_steps += 1;
+            const now = std.time.nanoTimestamp();
+            for (engine.lastEmitted()) |e| try rec.token(@intCast(e.seq.id - base_id), now);
+        }
+        const t_end = std.time.nanoTimestamp();
+        walls[rep] = @as(f64, @floatFromInt(t_end - rec.t0_ns)) / 1e9;
+        const tt = try rec.ttftMs(alloc);
+        defer alloc.free(tt);
+        try ttft_all.appendSlice(alloc, tt);
+        try itl_all.appendSlice(alloc, rec.itl_ms.items);
+        engine.reapFinished();
+        try w.print(&quot;[bench] 第 {d} 轮: {d:.3} s, {d:.1} tok/s\n&quot;, .{ rep + 1, walls[rep], @as(f64, @floatFromInt(out_tok)) / walls[rep] });
+        try w.flush();
+    }
+
+    const wall = mt.stats(walls).p50;
+    const ttft = mt.stats(ttft_all.items);
+    const itl = mt.stats(itl_all.items);
+    var free: usize = 0;
+    var total: usize = 0;
+    if (comptime opts.have_cuda) {
+        if (engine.executor.device == .CUDA) @import(&quot;backend/cuda/cuda.zig&quot;).cuda_mem_info(&amp;free, &amp;total);
+    }
+    const mb = 1024.0 * 1024.0;
+    const Summary = struct {
+        engine: []const u8,
+        workload: []const u8,
+        n_requests: usize,
+        repeat: usize,
+        input_tokens: usize,
+        output_tokens: usize,
+        wall_s: f64,
+        throughput_out: f64,
+        throughput_total: f64,
+        ttft_ms: mt.Stats,
+        itl_ms: mt.Stats,
+        peak_rss_mb: f64,
+        device_used_mb: f64,
+        weights_mb: f64,
+        kv_cache_mb: f64,
+        kv_tokens: usize,
+        load_s: f64,
+        preemptions: usize,
+        steps: usize,
+        graph_steps: usize,
+        eager_steps: usize,
+        policy: []const u8,
+    };
+    const summary = Summary{
+        .engine = if (engine.executor.device == .CUDA) &quot;module-serving-unfused&quot; else switch (engine.executor.device) {
+            .METAL =&gt; &quot;module-serving-unfused-metal&quot;,
+            else =&gt; &quot;module-serving-unfused-cpu&quot;,
+        },
+        .workload = wl.name,
+        .n_requests = reqs0.len,
+        .repeat = n_rounds,
+        .input_tokens = in_tok,
+        .output_tokens = out_tok,
+        .wall_s = wall,
+        .throughput_out = @as(f64, @floatFromInt(out_tok)) / wall,
+        .throughput_total = @as(f64, @floatFromInt(out_tok + in_tok)) / wall,
+        .ttft_ms = ttft,
+        .itl_ms = itl,
+        .peak_rss_mb = peakRssMb(),
+        .device_used_mb = @as(f64, @floatFromInt(total - free)) / mb,
+        .weights_mb = @as(f64, @floatFromInt(sched.mm.weight_bytes)) / mb,
+        .kv_cache_mb = @as(f64, @floatFromInt(sched.kv_bytes)) / mb,
+        .kv_tokens = sched.num_kv_blocks * sched.config.block_size,
+        .load_s = load_s,
+        .preemptions = engine.sched.num_preemptions - pre0,
+        .steps = n_steps,
+        .graph_steps = engine.executor.n_graph_steps,
+        .eager_steps = engine.executor.n_eager_steps,
+        .policy = @tagName(engine.sched.cfg.policy),
+    };
+    const js = try std.json.Stringify.valueAlloc(alloc, summary, .{ .whitespace = .indent_2 });
+    defer alloc.free(js);
+    try w.print(&quot;{s}\n&quot;, .{js});
+    try w.flush();
+    if (o.out) |p| try std.fs.cwd().writeFile(.{ .sub_path = p, .data = js });
+}</code></pre></div>
+<p>移植时的命名对应：<code>engine.step()</code> → <code>engine.runStep()</code>，<code>e.token</code> → <code>e.token_id</code>，<code>engine.reapFinished()</code> → <code>engine.releaseFinishedSeqs()</code>，<code>engine.sched</code> → <code>engine.batch_scheduler</code>。<code>Summary</code> 里的 <code>engine</code> 字段填 <code>"llmgen"</code>。</p>
+
+<h3><span class="stepno">3</span>只解析头部</h3>
+<p>照 lab 的 <code>init</code> 改 <code>GGUFParser.init</code>：保留打开的 <code>file</code>，<code>deinit</code> 里关闭。<code>tensorData()</code> 不再可用（数据不在内存里了），换成 <code>readTensor(info, dst)</code>。tokenizer 读的是 metadata，在头部里，不受影响。</p>
+
+<h3><span class="stepno">4</span>权重经 pinned 暂存区上传</h3>
+<div class="codeblock"><div class="cap"><span><b>src/memory/manager.zig · loadWeights 的 GPU 部分</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-zig">        for (gpu_weights.items) |e| {
+            const key = self.getLayerDevice(@intCast(e.tensor.layer_id)) orelse return error.LayerNotRegistered;
+            const device_pools = self.get(key.device_type, key.device_id) orelse return error.NoDevicePools;
+            const wp = &amp;(device_pools.weight orelse return error.NoWeightPool);
+            const raw = parser.tensorData(parser.getInfo().findTensor(e.tensor.name).?);
+            const block = try wp.allocate(raw.len, 32);
+            if (opts.have_cuda) cuda.cudaH2D(block.ptr[0..raw.len], raw); // ← 显存:只能 H2D, 不能 @memcpy
+            e.tensor.data = block.ptr;
+            e.tensor.offset = block.offset;
+        }</code></pre></div>
+<div class="codeblock diff"><div class="cap"><span><b>src/memory/manager.zig · loadWeights</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln add">const STAGE_BYTES: usize = 32 &lt;&lt; 20; // pinned 暂存区</span><span class="ln ctx">...</span><span class="ln add">        // 一块 pinned 暂存区, 所有权重轮流用:磁盘 → pinned → 显存, 不经过进程堆</span><span class="ln add">        const stage: [*]u8 = @ptrCast(cuda.cuda_host_alloc(STAGE_BYTES) orelse return error.PinnedAllocFailed);</span><span class="ln add">        defer cuda.cuda_host_free(stage);</span><span class="ln add"> </span><span class="ln ctx">        for (gpu_weights.items) |e| {</span><span class="ln ctx">            ...</span><span class="ln del">            const raw = parser.tensorData(parser.getInfo().findTensor(e.tensor.name).?);</span><span class="ln del">            const block = try wp.allocate(raw.len, 32);</span><span class="ln del">            if (opts.have_cuda) cuda.cudaH2D(block.ptr[0..raw.len], raw);</span><span class="ln add">            const info = parser.getInfo().findTensor(e.tensor.name).?;</span><span class="ln add">            const total = info.bytes();</span><span class="ln add">            const block = try wp.allocate(total, 32);</span><span class="ln add">            const file_off = parser.data_offset + info.offset;</span><span class="ln add">            var done: usize = 0;</span><span class="ln add">            while (done &lt; total) {</span><span class="ln add">                const chunk = @min(STAGE_BYTES, total - done);</span><span class="ln add">                const n = try parser.file.preadAll(stage[0..chunk], file_off + done);</span><span class="ln add">                if (n != chunk) return error.ShortRead;</span><span class="ln add">                cuda.cuda_h2d(block.ptr + done, stage, chunk);</span><span class="ln add">                done += chunk;</span><span class="ln add">            }</span></code></pre></div>
+<p>CPU 分支（现在只有 RoPE 相关，没有权重了）如果还有用到 <code>tensorData</code> 的地方，同样换成 <code>readTensor</code> 直接读进池里。</p>
+
+<h3><span class="stepno">5</span>Release 构建不用 DebugAllocator</h3>
+<div class="codeblock diff"><div class="cap"><span><b>src/llmgen.zig · run()</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;</span><span class="ln del">    defer std.debug.assert(debug_allocator.deinit() == .ok);</span><span class="ln del">    const allocator = debug_allocator.allocator();</span><span class="ln add">    defer _ = debug_allocator.deinit();</span><span class="ln add">    // DebugAllocator 每次分配都记账, 适合查泄漏, 不适合压测;Release 构建换成通用分配器</span><span class="ln add">    const allocator = if (@import(&quot;builtin&quot;).mode == .Debug) debug_allocator.allocator() else std.heap.smp_allocator;</span></code></pre></div>
+<p>Engine 每步有几次小分配（<code>emitted</code>、<code>buf</code>）。<code>DebugAllocator</code> 每次分配要抓调用栈，S1 每步多出几微秒到几十微秒。</p>
+
+<h2>对拍验证</h2>
+<div class="codeblock"><div class="cap"><span><b>终端</b> <span class="tag out">命令</span></span><button type="button">复制</button></div><pre><code class="language-bash">zig build -Dcuda=true -Dnvcc=/usr/local/cuda/bin/nvcc -Doptimize=ReleaseFast
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64
+
+./zig-out/bin/llminfer chat &quot;中国的首都是哪里？&quot; 64
+./zig-out/bin/llminfer bench src/bench/workloads/s3.json --out /tmp/llmgen-s3.json
+./zig-out/bin/llminfer bench src/bench/workloads/s3.json --policy chunked --chunk 2048
+./zig-out/bin/llminfer bench src/bench/workloads/s1.json --eager          # 不用 CUDA Graph
+./zig-out/bin/llminfer bench src/bench/workloads/s3.json --kv-blocks 5376 # 固定 KV 块数</code></pre></div>
+<ul>
+  <li><code>chat</code> 的 greedy token id 和改之前相同，和 lab 的 <code>chat</code> 相同。</li>
+  <li><code>bench … --out x.json</code> 生成的 JSON 字段齐全：<code>throughput_out</code>、<code>ttft_ms.mean</code>、<code>itl_ms.p99</code>、<code>peak_rss_mb</code>、<code>kv_tokens</code>、<code>load_s</code>、<code>preemptions</code>、<code>graph_steps</code>。</li>
+  <li>S1 的 <code>graph_steps</code> 约等于 5 × 255，<code>eager_steps</code> 约等于 5（每轮一次 prefill）加预热。</li>
+</ul>
+<h2>CPU 同步</h2>
+<div class="callout cpu"><span class="t">这一步 CPU 后端要做的事</span><b>两处。</b>加 <code>--device cpu|cuda</code>；<code>loadWeights</code> 的 CPU 分支改成从磁盘直接 <code>pread</code> 进池（不需要 pinned 暂存区）。 <a href="cpu-5-exec-cli.html#load">去看 →</a></div>
+<h2>性能收益</h2>
+<h3>依据</h3>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th class="num">改前</th><th class="num">改后</th><th>来源</th></tr></thead><tbody><tr><td>加载耗时（s）：nano-vllm → unfused</td><td class="num">16.51</td><td class="num">0.77</td><td><span class="src lab">lab 实测</span></td></tr><tr><td>峰值 RSS（MB）：nano-vllm → unfused</td><td class="num">2275</td><td class="num">519</td><td><span class="src lab">lab 实测</span></td></tr><tr><td>其中 CUDA Graph 录制（20 个桶）</td><td class="num">—</td><td class="num">约 0.36 s</td><td><span class="src lab">消融实测</span></td></tr></tbody></table></div>
+<h3>对 llmgen 的预期</h3>
+<p><b>RSS</b>：起点把 1.5 GB 的文件整个读进堆，RSS 至少 1.5 GB。改完后进程堆里只有头部（16 MB）、32 MB 暂存区和各种小结构，预期降到 500–600 MB <span class="src est">推算</span>（其中大部分是 CUDA 运行时自己占的）。</p>
+<p><b>加载</b>：目标 0.77 s，其中约 0.35 s 是录 CUDA Graph。读盘部分取决于文件是否在 page cache 里：热的时候 1.5 GB 约 0.3 s。第一次冷读会慢得多，压测前先 <code>cat model.gguf &gt; /dev/null</code> 一次。</p>
+<p><b>吞吐</b>：换掉 DebugAllocator 对 S1 可能有 1–3% 的影响 <span class="src est">推算</span>，对大批场景没有。</p>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>峰值 RSS (MB)</td><td class="num fill" contenteditable="true" data-key="21-cli-load.html|峰值 RSS (MB)|before"></td><td class="num fill" contenteditable="true" data-key="21-cli-load.html|峰值 RSS (MB)|after"></td><td class="num gain"></td></tr><tr><td>加载耗时 (s)</td><td class="num fill" contenteditable="true" data-key="21-cli-load.html|加载耗时 (s)|before"></td><td class="num fill" contenteditable="true" data-key="21-cli-load.html|加载耗时 (s)|after"></td><td class="num gain"></td></tr><tr><td>S1 输出吞吐 (tok/s)</td><td class="num fill" contenteditable="true" data-key="21-cli-load.html|S1 输出吞吐 (tok/s)|before"></td><td class="num fill" contenteditable="true" data-key="21-cli-load.html|S1 输出吞吐 (tok/s)|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td><code>error.OutOfBounds</code> 在解析头部时</td><td>读进来的前缀不够长。lab 的写法是遇到这个错误就把长度翻倍重读；如果你的 <code>parse</code> 用的是别的错误名，对应改 <code>if (e != …)</code> 那一行。</td></tr><tr><td>tokenizer 初始化崩溃</td><td>tokenizer 引用了 parser 缓冲区里的字符串。头部缓冲区（<code>buffer</code>）要活到 tokenizer 析构之后，不能解析完就释放。</td></tr><tr><td><code>error.ShortRead</code></td><td><code>file_off</code> 算错：数据区偏移是 <code>data_offset + info.offset</code>，<code>data_offset</code> 是对齐之后的值。</td></tr><tr><td>bench 的吞吐比第 19 步低</td><td>检查是不是每个 token 都在 <code>flush</code> 输出，或者 Recorder 的 <code>token()</code> 被放进了内层循环之外的地方重复调用。</td></tr><tr><td><code>peak_rss_mb</code> 是 0</td><td>macOS 没有 <code>/proc</code>，lab 的 <code>peakRssMb</code> 有 <code>getrusage</code> 的回退分支，一起搬。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li><code>chat</code> 和 <code>bench</code> 两个子命令都能用</li><li>bench 的 JSON 字段和 lab 的一致</li><li>峰值 RSS 降到 600 MB 以内，加载 1 秒左右</li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="20-scheduling.html"><small>← 上一步</small>调度策略与抢占</a><a class="next" href="22-final-bench.html"><small>下一步 →</small>最终对比</a></div>
+</main>
+</div>
+</body>
+</html>

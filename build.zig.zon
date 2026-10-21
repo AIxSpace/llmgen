@@ -1,0 +1,12 @@
+.{
+    .name = .llmgen,
+    .version = "0.1.0",
+    .fingerprint = 0xa462d508f46b816a,
+    .minimum_zig_version = "0.15.1",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

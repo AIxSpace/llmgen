@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>全图上 GPU · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html" class="active"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">阶段 1 · 去掉主机开销</div>
+<h1>全图上 GPU</h1>
+<p class="lead">embedding 搬上 GPU，tied 权重只存一份。</p>
+<div class="callout goal"><span class="t">本步目标</span>把 embedding 搬到 GPU 上做，input_ids 直接放进显存。做完之后图里只剩两条拷贝边：RoPE 表（只算一次）和 logits 回拷（第 09 步去掉）；CPU 上那份 311 MB 的词表权重也不用再存。</div>
+<h2>原理</h2>
+<h3>现在 embedding 是怎么跑的</h3>
+<p>调度器把所有 <code>layer_id &lt; 0</code> 的全局节点放在 CPU：</p>
+<div class="codeblock"><div class="cap"><span><b>src/graph/scheduler.zig</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-zig">    pub fn assignGlobalNodes(self: *Self, device_type: DeviceType) void {
+        for (self.compute_graph.tensors.items) |t| {
+            if (t.layer_id &lt; 0) {
+                t.device_type = device_type;
+            }
+        }
+    }</code></pre></div>
+<p>而 <code>ops.zig</code> 里 embedding 的派发写死了 CPU 特化：</p>
+<div class="codeblock"><div class="cap"><span><b>src/ops.zig</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-zig">    pub fn embedding(out_tensor: *Tensor, device_id: i32) !void {
+        try EmbeddingImpl(.CPU).execute(device_id, out_tensor);
+    }</code></pre></div>
+<p>于是每一步是这样的：</p>
+<div class="diagram"><div class="flow">
+  <div class="box cpu"><b>embedding</b><small>CPU：逐元素 elemF32 / storeF32</small></div><div class="arrow">→</div>
+  <div class="box cpu"><b>copy_embd</b><small>拷贝代理：H2D</small></div><div class="arrow">→</div>
+  <div class="box gpu"><b>28 层</b><small>GPU</small></div><div class="arrow">→</div>
+  <div class="box gpu"><b>logits</b><small>GPU</small></div><div class="arrow">→</div>
+  <div class="box cpu"><b>copy_logits</b><small>拷贝代理：D2H</small></div><div class="arrow">→</div>
+  <div class="box cpu"><b>sample</b><small>CPU</small></div>
+</div></div>
+<p>代价有三样：</p>
+<ul>
+  <li><b>一份多余的权重。</b>embedding 和 lm_head 用的是同一张 <code>token_embd.weight</code>（tied）。embedding 在 CPU、lm_head 在 GPU，同一张表存了两份：起点日志里 CPU 的 weight 池是 297 MiB <span class="src start">llmgen 起点实测</span>。</li>
+  <li><b>每步一次 H2D。</b>CPU 算完的 embedding 要经拷贝代理搬上显存。</li>
+  <li><b>CPU 上的逐元素循环。</b><code>elemF32</code> / <code>storeF32</code> 每个元素做一次 dtype 分支，prefill 512 token 就是 52 万次。</li>
+</ul>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cpu/embedding.zig</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-zig">const std = @import(&quot;std&quot;);
+const common = @import(&quot;common.zig&quot;);
+
+const types = @import(&quot;../../types.zig&quot;);
+const Tensor = @import(&quot;../../Tensor.zig&quot;);
+
+pub const EmbeddingImpl = struct {
+    pub fn execute(_: i32, out_tensor: *Tensor) !void {
+        const token_ids = out_tensor.src[0].?;
+        const weight = out_tensor.src[1].?;
+
+        // [vocab, hidden]
+        const vocab_size = common.dimAt(weight, 0);
+        const hidden = common.dimAt(weight, 1);
+
+        const seq_len = common.dimAt(out_tensor, 1);
+
+        const token_ids_array = common.i32DataPtr(token_ids);
+
+        for (0..seq_len) |s| {
+            const id = token_ids_array[s];
+            if (id &lt; 0 or id &gt;= @as(i32, @intCast(vocab_size))) return error.TokenOutOfRange;
+            const row: usize = @as(usize, @intCast(id)) * hidden;
+            for (0..hidden) |h| {
+                common.storeF32(out_tensor, s * hidden + h, common.elemF32(weight, row + h));
+            }
+        }
+    }
+};</code></pre></div>
+
+<h3>embedding 在 GPU 上是什么</h3>
+<p>embedding 查表就是按行拷贝：<code>out[t] = W[ids[t]]</code>。一行 1024 个 bf16 = 2 KB。kernel 里一个 block 负责一个 token，128 个线程每人搬一个 16 字节的 <code>bf16x8</code>，正好一行。</p>
+<p>唯一的要求是 <code>ids</code> 也得在显存里。这一步先给它单独开一块常驻缓冲，每步 H2D 几个字节；第 04 步会把它并进统一的元数据包。</p>
+
+<h2>改动</h2>
+<h3><span class="stepno">1</span>给 .cu 加一组公共工具</h3>
+<p>后面每一步从 lab 搬过来的 kernel 都依赖这组工具：<code>bf16x8</code>（8 个 bf16 = 16 字节的向量化读写）、<code>warp_sum</code>、<code>block_sum</code>、全局 stream。把下面这段加到 llmgen 的 <code>cuda_common.cuh</code> 末尾、<code>#endif</code> 之前：</p>
+<div class="codeblock"><div class="cap"><span><b>backend/cuda/cuda_common.cuh（#endif 之前的部分）</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">// 全部 kernel 排进这一条 stream(定义在 cuda_context.cu); CUDA Graph 也在它上面录制.
+extern cudaStream_t g_cuda_stream;
+extern cublasHandle_t g_cublas;
+
+#define CUDA_CHECK(expr)                                                                        \
+    do {                                                                                      \
+        cudaError_t _e = (expr);                                                              \
+        if (_e != cudaSuccess) fprintf(stderr, &quot;[serve] %s:%d %s: %s\n&quot;, __FILE__, __LINE__, \
+                                       #expr, cudaGetErrorString(_e));                        \
+    } while (0)
+
+// 回退开关(cuda-course Part H 复现性能问题用): 读环境变量, 未设置返回 def. 各 .cu 在首次调用时读一次并缓存,
+// 所以要在 cuda_init / CUDA Graph 录制之前设好; 默认值即正常的优化路径, 关闭时没有额外开销.
+static inline int cuda_env_int(const char *name, int def) {
+    const char *v = getenv(name);
+    return (v &amp;&amp; *v) ? atoi(v) : def;
+}
+
+// 逐元素 kernel 的 grid 大小(grid-stride 循环, 上限 65535·8 个 block)
+static inline unsigned grid_for(long n, int threads) {
+    long b = (n + threads - 1) / threads;
+    return (unsigned)(b &gt; 65535L * 8 ? 65535L * 8 : b);
+}
+
+typedef __nv_bfloat16 bf16;
+
+__device__ __forceinline__ float bf2f(bf16 x) { return __bfloat162float(x); }
+__device__ __forceinline__ bf16 f2bf(float x) { return __float2bfloat16(x); }
+// 把 float 舍入到 bf16 精度再转回(复刻 PyTorch 在 bf16 张量之间的中间舍入)
+__device__ __forceinline__ float round_bf(float x) { return __bfloat162float(__float2bfloat16(x)); }
+
+// 8 个 bf16 = 16 字节的向量化读写
+struct __align__(16) bf16x8 { __nv_bfloat162 h[4]; };
+
+__device__ __forceinline__ void unpack8(const bf16x8 &amp;v, float *f) {
+#pragma unroll
+    for (int i = 0; i &lt; 4; ++i) {
+        float2 t = __bfloat1622float2(v.h[i]);
+        f[2 * i] = t.x;
+        f[2 * i + 1] = t.y;
+    }
+}
+__device__ __forceinline__ bf16x8 pack8(const float *f) {
+    bf16x8 v;
+#pragma unroll
+    for (int i = 0; i &lt; 4; ++i) v.h[i] = __floats2bfloat162_rn(f[2 * i], f[2 * i + 1]);
+    return v;
+}
+
+__device__ __forceinline__ float warp_sum(float v) {
+#pragma unroll
+    for (int o = 16; o &gt; 0; o &gt;&gt;= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+__device__ __forceinline__ float warp_max(float v) {
+#pragma unroll
+    for (int o = 16; o &gt; 0; o &gt;&gt;= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+
+// 块内求和(blockDim.x 为 32 的倍数, ≤ 1024); 结果广播给所有线程
+__device__ __forceinline__ float block_sum(float v) {
+    __shared__ float sh[32];
+    int lane = threadIdx.x &amp; 31, wid = threadIdx.x &gt;&gt; 5;
+    v = warp_sum(v);
+    __syncthreads();
+    if (lane == 0) sh[wid] = v;
+    __syncthreads();
+    int nw = (blockDim.x + 31) &gt;&gt; 5;
+    float r = (lane &lt; nw) ? sh[lane] : 0.f;
+    return warp_sum(r);
+}</code></pre></div>
+<p>再在 <code>cuda_context.cu</code> 里定义这两个全局量：</p>
+<div class="codeblock diff"><div class="cap"><span><b>src/backend/cuda/cuda_context.cu</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">#include &quot;cuda_common.cuh&quot;</span><span class="ln ctx"> </span><span class="ln ctx">static bool g_inited = false;</span><span class="ln add">// 所有新 kernel 都排进 g_cuda_stream。现在它是 nullptr, 也就是默认 stream, 行为和以前一样;</span><span class="ln add">// 第 07 步才把它换成一条真正的独立 stream。g_cublas 第 12 步用。</span><span class="ln add">cudaStream_t g_cuda_stream = nullptr;</span><span class="ln add">cublasHandle_t g_cublas = nullptr;</span></code></pre></div>
+<div class="callout tip"><span class="t">为什么先用 nullptr</span><code>cudaStream_t</code> 为 0 就是默认 stream。新 kernel 写的是 <code>&lt;&lt;&lt;grid, threads, 0, g_cuda_stream&gt;&gt;&gt;</code>，现在和老 kernel 一样排在默认 stream 上，行为不变。等热路径上的 malloc / free / 小拷贝都清掉之后（第 06 步），第 07 步再把它换成真正的独立 stream。</div>
+
+<h3><span class="stepno">2</span>embedding kernel</h3>
+<div class="codeblock"><div class="cap"><span><b>backend/cuda/embedding.cu</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">// lab: module-serving-unfused -- embedding.cu -- token embedding 查表(tied 权重, BF16)
+// 对照 module-style backend/cpu/embedding.zig(EmbeddingImpl); C++ 的 CUDA 后端没有单独的 embedding.cu, 这里单列便于对照.
+#include &quot;cuda_common.cuh&quot;
+
+// ------------------------------------------------------------------
+// embedding: out[t] = W[ids[t]]
+// ------------------------------------------------------------------
+__global__ void embedding_kernel(bf16x8 *out, const int *ids, const bf16x8 *w, int H8) {
+    int t = blockIdx.x;
+    long id = ids[t];
+    for (int i = threadIdx.x; i &lt; H8; i += blockDim.x) out[(long)t * H8 + i] = w[id * H8 + i];
+}
+
+extern &quot;C&quot; void cuda_embedding(cuda_bf16_t *out, const int *ids, const cuda_bf16_t *w, int T, int H) {
+    if (T &lt;= 0) return;
+    int H8 = H / 8;
+    embedding_kernel&lt;&lt;&lt;T, 128, 0, g_cuda_stream&gt;&gt;&gt;((bf16x8 *)out, ids, (const bf16x8 *)w, H8);
+}</code></pre></div>
+<div class="codeblock diff"><div class="cap"><span><b>src/backend/cuda/cuda_shim.h</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">#ifdef __cplusplus</span><span class="ln ctx">extern &quot;C&quot; {</span><span class="ln ctx">#endif</span><span class="ln ctx"> </span><span class="ln add">typedef unsigned short cuda_bf16_t; /* BF16 原始位 */</span><span class="ln add"> </span><span class="ln add">/* embedding.cu: out[t] = W[ids[t]] */</span><span class="ln add">void cuda_embedding(cuda_bf16_t *out, const int *ids, const cuda_bf16_t *w, int T, int H);</span><span class="ln add"> </span><span class="ln ctx">int cuda_init(void);</span></code></pre></div>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cuda/embedding.zig</b> <span class="tag new">新建文件</span></span><button type="button">复制</button></div><pre><code class="language-zig">//! cuda/embedding.zig -- EmbeddingImpl&lt;CUDA&gt;: 查表在显存里做, 一个 block 拷一行
+const Tensor = @import(&quot;../../Tensor.zig&quot;);
+const cu = @import(&quot;cuda.zig&quot;);
+
+/// src[0] = input_ids [1, T] i32(显存), src[1] = W [vocab, hidden] bf16(显存) → out [1, T, hidden] bf16
+pub const EmbeddingImpl = struct {
+    pub fn execute(device_id: i32, out_tensor: *Tensor) !void {
+        _ = device_id;
+        const ids = out_tensor.src[0].?;
+        const w = out_tensor.src[1].?;
+        if (w.data_type != .GGML_TYPE_BF16 or out_tensor.data_type != .GGML_TYPE_BF16) return error.EmbeddingNeedsBf16;
+        cu.cuda_embedding(out_tensor.data, ids.data, w.data, @intCast(out_tensor.dims[1]), @intCast(w.dims[1]));
+    }
+};</code></pre></div>
+
+<h3><span class="stepno">3</span>接线</h3>
+<div class="codeblock diff"><div class="cap"><span><b>接线：四个文件各一行</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">// ---- src/backend/cuda/cuda.zig ----</span><span class="ln add">pub extern fn cuda_embedding(out: ?*anyopaque, ids: ?*const anyopaque, w: ?*const anyopaque, T: c_int, H: c_int) void;</span><span class="ln ctx"> </span><span class="ln ctx">// ---- src/backend/cuda/impls.zig ----</span><span class="ln ctx">pub const MemcpyImpl = @import(&quot;memcpy.zig&quot;).MemcpyImpl;</span><span class="ln add">pub const EmbeddingImpl = @import(&quot;embedding.zig&quot;).EmbeddingImpl;</span><span class="ln ctx"> </span><span class="ln ctx">// ---- src/ops.zig ----</span><span class="ln ctx">    pub fn embedding(out_tensor: *Tensor, device_id: i32) !void {</span><span class="ln del">        try EmbeddingImpl(.CPU).execute(device_id, out_tensor);</span><span class="ln add">        try device.dispatchOp(EmbeddingImpl, out_tensor.device_type, device_id, out_tensor);</span><span class="ln ctx">    }</span><span class="ln ctx"> </span><span class="ln ctx">// ---- build.zig ----</span><span class="ln ctx">const CUDA_SRC = [_][]const u8{</span><span class="ln ctx">    &quot;cuda_context.cu&quot;,</span><span class="ln ctx">    &quot;memcpy.cu&quot;,</span><span class="ln add">    &quot;embedding.cu&quot;,</span></code></pre></div>
+
+<h3><span class="stepno">4</span>全局节点跟着第 0 层走</h3>
+<div class="codeblock diff"><div class="cap"><span><b>src/graph/scheduler.zig</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln del">        // 4. 为全局 Tensor 分配 CPU 设备</span><span class="ln del">        self.assignGlobalNodes(.CPU);</span><span class="ln add">        // 4. 全局节点(input_ids / embedding)跟第 0 层走, 整张图落在同一台设备上</span><span class="ln add">        self.assignGlobalNodes(self.deviceTypeForLayer(0) orelse .CPU);</span><span class="ln ctx"> </span><span class="ln ctx">...</span><span class="ln ctx"> </span><span class="ln ctx">    pub fn assignGlobalNodes(self: *Self, device_type: DeviceType) void {</span><span class="ln ctx">        for (self.compute_graph.tensors.items) |t| {</span><span class="ln del">            if (t.layer_id &lt; 0) {</span><span class="ln del">                t.device_type = device_type;</span><span class="ln del">            }</span><span class="ln add">            if (t.layer_id &gt;= 0) continue;</span><span class="ln add">            // RoPE 表只算一次, 只有 CPU 特化;留在 CPU, 由拷贝代理搬上显存后常驻(现状就是这样, 不动)</span><span class="ln add">            t.device_type = if (t.op_type == .OP_TYPE_ROPE_CACHE) .CPU else device_type;</span><span class="ln ctx">        }</span><span class="ln ctx">    }</span></code></pre></div>
+
+<h3><span class="stepno">5</span>同名权重在 GPU 上只传一次</h3>
+<p><code>createMemoryPools</code> 定 weight 池容量时已经按“同设备同名只算一份”去重了，但 <code>loadWeights</code> 的 GPU 分支没有去重。现在 embedding 和 lm_head 都在 GPU 上，不去重会把词表传两遍，把池子撑爆。另外全局节点的 <code>layer_id</code> 是 -1，原来的 <code>@intCast</code> 会直接 panic。</p>
+<div class="codeblock diff"><div class="cap"><span><b>src/memory/manager.zig · loadWeights</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">        std.mem.sort(Entry, gpu_weights.items, {}, Entry.lessThan);</span><span class="ln ctx"> </span><span class="ln add">        // 同一设备上的同名权重只上传一次:embedding 和 lm_head 共用 token_embd.weight</span><span class="ln add">        var bound_gpu: std.StringHashMapUnmanaged(Bound) = .empty;</span><span class="ln add">        defer bound_gpu.deinit(self.allocator);</span><span class="ln add"> </span><span class="ln ctx">        for (gpu_weights.items) |e| {</span><span class="ln del">            const key = self.getLayerDevice(@intCast(e.tensor.layer_id)) orelse return error.LayerNotRegistered;</span><span class="ln add">            if (bound_gpu.get(e.tensor.name)) |b| {</span><span class="ln add">                e.tensor.data = b.ptr;</span><span class="ln add">                e.tensor.offset = b.offset;</span><span class="ln add">                continue;</span><span class="ln add">            }</span><span class="ln add">            // 全局节点(layer_id &lt; 0)没登记过&quot;层 → 设备&quot;, 直接用张量自己的 device_type, 设备号 0</span><span class="ln add">            const key: DeviceKey = if (e.tensor.layer_id &lt; 0)</span><span class="ln add">                .{ .device_type = e.tensor.device_type, .device_id = 0 }</span><span class="ln add">            else</span><span class="ln add">                self.getLayerDevice(@intCast(e.tensor.layer_id)) orelse return error.LayerNotRegistered;</span><span class="ln ctx">            const device_pools = self.get(key.device_type, key.device_id) orelse return error.NoDevicePools;</span><span class="ln ctx">            const wp = &amp;(device_pools.weight orelse return error.NoWeightPool);</span><span class="ln ctx">            const raw = parser.tensorData(parser.getInfo().findTensor(e.tensor.name).?);</span><span class="ln ctx">            const block = try wp.allocate(raw.len, 32);</span><span class="ln ctx">            if (opts.have_cuda) cuda.cudaH2D(block.ptr[0..raw.len], raw); // ← 显存:只能 H2D, 不能 @memcpy</span><span class="ln ctx">            e.tensor.data = block.ptr;</span><span class="ln ctx">            e.tensor.offset = block.offset;</span><span class="ln add">            try bound_gpu.put(self.allocator, e.tensor.name, .{ .ptr = block.ptr, .offset = block.offset });</span><span class="ln ctx">        }</span></code></pre></div>
+
+<h3><span class="stepno">6</span>input_ids 放进显存</h3>
+<div class="codeblock diff"><div class="cap"><span><b>src/executor.zig</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">    input_buf: []i32,</span><span class="ln add">    ids_dev: ?[*]u8 = null, // input_ids 在显存里的常驻缓冲(第 04 步并进元数据包)</span><span class="ln ctx">    input_tensor: *Tensor,</span><span class="ln ctx"> </span><span class="ln ctx">...</span><span class="ln ctx">// ---- init(): self 建好之后 ----</span><span class="ln add">        if (opts.have_cuda and self.input_tensor.device_type == .CUDA) {</span><span class="ln add">            const dp = memory_manager.get(.CUDA, 0) orelse return error.NoDevicePools;</span><span class="ln add">            const pool = &amp;(dp.activation orelse return error.NoActivationPool);</span><span class="ln add">            const blk = try pool.allocate(max_seq * @sizeOf(i32), pools.POOL_ALIGN);</span><span class="ln add">            pool.markPersistent(); // resetAllActivations 只回卷到这里, 这块不会被激活覆盖</span><span class="ln add">            self.ids_dev = blk.ptr;</span><span class="ln add">        }</span><span class="ln ctx"> </span><span class="ln ctx">...</span><span class="ln ctx">// ---- forward() ----</span><span class="ln ctx">        @memcpy(self.input_buf[0..tokens.len], tokens);</span><span class="ln del">        self.input_tensor.data = @ptrCast(self.input_buf.ptr);</span><span class="ln add">        if (self.ids_dev) |dev| {</span><span class="ln add">            if (opts.have_cuda) cuda.cudaH2D(dev[0 .. tokens.len * @sizeOf(i32)], std.mem.sliceAsBytes(self.input_buf[0..tokens.len]));</span><span class="ln add">            self.input_tensor.data = dev;</span><span class="ln add">        } else {</span><span class="ln add">            self.input_tensor.data = @ptrCast(self.input_buf.ptr);</span><span class="ln add">        }</span></code></pre></div>
+
+<h2>对拍验证</h2>
+<p>embedding 是按位拷贝，没有任何浮点运算，所以 greedy 输出必须和第 01 步存的基线<b>逐 token 相同</b>。再看内存报告：</p>
+<div class="codeblock"><div class="cap"><span><b>预期输出：[CPU#0] 的 weight 池消失，CUDA 的 weight 池大小不变</b> <span class="tag out">输出</span></span><button type="button">复制</button></div><pre><code class="nohighlight">layers -1..28 -&gt; CUDA#0
+...
+=== 内存 ===
+[CUDA#0]
+  weight: used=1192230912/1192230912,peak=1192230912 (100.0%)
+  activation: ...
+  kv_cache: ...</code></pre></div>
+<h2>CPU 同步</h2>
+<div class="callout cpu"><span class="t">这一步 CPU 后端要做的事</span><b>可选。</b>这一步让全局节点跟着第 0 层的设备走：纯 CPU 构建时整张图都在 CPU，行为不变，旧的 CPU embedding 也照样能跑。可以顺手把它换成按行拷贝的版本。<b>CPU 的公共工具（bf16 直读、<code>parallelFor</code>）建议现在就加</b>，后面每个 CPU 算子都要用。 <a href="cpu-3-kernels-layout.html#embedding">去看 →</a></div>
+<h2>性能收益</h2>
+<h3>依据</h3>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th class="num">改前</th><th class="num">改后</th><th>来源</th></tr></thead><tbody><tr><td>CPU weight 池（MiB）</td><td class="num">297</td><td class="num">0</td><td><span class="src start">llmgen 起点实测</span></td></tr><tr><td>GPU weight 池（MiB）</td><td class="num">1137</td><td class="num">1137（不变，lm_head 那份现在两边共用）</td><td><span class="src start">llmgen 起点实测</span></td></tr><tr><td>目标 lab 的峰值 RSS（MB）</td><td class="num">—</td><td class="num">519</td><td><span class="src lab">lab 实测</span></td></tr></tbody></table></div>
+<h3>对 llmgen 的预期</h3>
+<p>这一步的收益主要在内存和结构上，速度上是小头：</p>
+<ul>
+  <li><b>RSS 降约 300 MB</b>：CPU 不再存词表。</li>
+  <li><b>decode 每步</b>：少一次 CPU 查表和一次 2 KB 的 H2D，换成 4 字节 H2D 加一个 kernel。预期 ITL 变化在 0.1 ms 以内 <span class="src est">推算</span>。</li>
+  <li><b>prefill</b>：512 token 时 CPU 上 52 万次逐元素读写没了，预期 TTFT 降几毫秒 <span class="src est">推算</span>。</li>
+</ul>
+<p>更重要的是它让“整张图在一台设备上”成立，后面的 CUDA Graph（第 17 步）要求一步之内不能有 host 参与的计算。</p>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>峰值 RSS (MB)</td><td class="num fill" contenteditable="true" data-key="03-all-on-gpu.html|峰值 RSS (MB)|before"></td><td class="num fill" contenteditable="true" data-key="03-all-on-gpu.html|峰值 RSS (MB)|after"></td><td class="num gain"></td></tr><tr><td>S1 TTFT mean (ms)</td><td class="num fill" contenteditable="true" data-key="03-all-on-gpu.html|S1 TTFT mean (ms)|before"></td><td class="num fill" contenteditable="true" data-key="03-all-on-gpu.html|S1 TTFT mean (ms)|after"></td><td class="num gain"></td></tr><tr><td>S1 ITL mean (ms)</td><td class="num fill" contenteditable="true" data-key="03-all-on-gpu.html|S1 ITL mean (ms)|before"></td><td class="num fill" contenteditable="true" data-key="03-all-on-gpu.html|S1 ITL mean (ms)|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td>启动时 <code>OutOfPoolMemory</code>（weight 池）</td><td>第 5 步的去重没生效，词表传了两遍。检查 <code>bound_gpu</code> 的 put 是否在循环末尾。</td></tr><tr><td><code>integer cast truncated bits</code> / panic at loadWeights</td><td><code>layer_id = -1</code> 被 <code>@intCast</code> 成 usize。第 5 步的 <code>if (e.tensor.layer_id &lt; 0)</code> 分支漏了。</td></tr><tr><td>段错误，栈在 <code>RopeCacheImpl</code></td><td>RoPE cache 节点被分到了 GPU，CPU 特化往显存指针里写。检查 <code>assignGlobalNodes</code> 里对 <code>OP_TYPE_ROPE_CACHE</code> 的特判。</td></tr><tr><td>输出全是同一个 token</td><td><code>input_tensor.data</code> 还指着 host 的 <code>input_buf</code>，kernel 把它当显存地址读了。</td></tr><tr><td><code>error.EmbeddingNeedsBf16</code></td><td>模型不是 BF16 的 GGUF。这份教程全程假设 BF16 权重和激活。</td></tr><tr><td>链接报 <code>undefined symbol: g_cuda_stream</code></td><td><code>cuda_context.cu</code> 里没定义，或者 <code>embedding.cu</code> 没加进 <code>build.zig</code> 的 <code>CUDA_SRC</code>。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li>greedy 输出和基线逐 token 相同</li><li>内存报告里没有 <code>[CPU#0] weight</code> 这一行（或大小为 0）</li><li><code>LLMGEN_PROFILE=1</code> 的算子表里，decode 每步的 MEMCPY 只剩 1 次（logits 回拷）</li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="02-where-time-goes.html"><small>← 上一步</small>64 ms 去哪了</a><a class="next" href="04-step-state.html"><small>下一步 →</small>StepState：元数据一次上传</a></div>
+</main>
+</div>
+</body>
+</html>

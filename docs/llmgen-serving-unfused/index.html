@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>把 llmgen 优化到 serving-unfused 的性能 · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html" class="active"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">llmgen → module-serving-unfused</div>
+<h1>把 llmgen 优化到 serving-unfused 的性能</h1>
+<p class="lead">23 步，从 15 tok/s 到 400 tok/s。每一步讲原理、改哪里、能快多少；CPU 后端全程保持可用。</p>
+
+<div class="stat">
+  <div><div class="v">15.5 tok/s</div><div class="k">llmgen 起点（3090，单请求 decode）</div></div>
+  <div><div class="v">401.3 tok/s</div><div class="k">目标 lab 的 S1</div></div>
+  <div><div class="v">26×</div><div class="k">要追的差距</div></div>
+</div>
+
+<p>这份教程带你把 <code>src/llmgen</code> 一步步改到 <code>module-serving-unfused</code> 的性能水平。目标 lab 去掉了算子融合，
+图的粒度和 llmgen 现在一样（每个细粒度模块一个节点），所以<b>这条路上不需要做融合</b>：要补的全在执行层、kernel 和批处理。</p>
+
+<div class="callout tip"><span class="t">差距主要不在算子</span>
+起点每个 token 要 64.63 ms，其中 forward 占 93.5%。但这段时间里 GPU 大部分时候在等主机：
+每个算子后同步一次、每层写 KV 做十几次小拷贝、每层上传一次页表。所以顺序是先去掉主机开销（阶段 1），再裁掉多余计算（阶段 2），然后才轮到 kernel（阶段 3）。</div>
+
+<h2>差距在哪</h2>
+<div class="tablewrap"><table><thead><tr><th>方面</th><th>llmgen 起点</th><th>serving-unfused（目标）</th><th>在哪一步补</th></tr></thead><tbody><tr><td>同步</td><td>每发一个算子 <code>cudaDeviceSynchronize</code> 一次</td><td>整步排进一条 stream，结尾同步一次</td><td><a href="07-stream-sync.html">07</a></td></tr><tr><td>设备放置</td><td>embedding 在 CPU，logits 回拷 host</td><td>整张图在 GPU，没有拷贝边</td><td><a href="03-all-on-gpu.html">03</a></td></tr><tr><td>每步元数据</td><td>散在各处：RoPE 起点写 op_params，页表每层上传</td><td>打成一包，pinned 内存异步上传一次</td><td><a href="04-step-state.html">04</a></td></tr><tr><td>写 KV</td><td>逐 token × 逐头 D2D memcpy；页表每层 cudaMalloc / cudaFree</td><td>一个 <code>store_kv</code> kernel，按 slot 写</td><td><a href="06-store-kv.html">06</a></td></tr><tr><td>拆头</td><td>head-major，要发 permute kernel</td><td>token-major 零拷贝视图</td><td><a href="05-token-major-view.html">05</a></td></tr><tr><td>lm_head</td><td>对所有 token 算 <code>[seq, 151936]</code></td><td>先 gather_last，只算每条序列最后一行</td><td><a href="08-gather-last.html">08</a></td></tr><tr><td>采样</td><td>CPU 上 softmax + top-p，每次 4.209 ms</td><td>GPU 两段式 Gumbel-max，只拷回 token id</td><td><a href="09-gpu-sampling.html">09</a></td></tr><tr><td>逐元素 / norm / rope</td><td>一线程一元素</td><td>bf16x8 向量化、warp 归约、查表</td><td><a href="10-bf16x8.html">10</a>、<a href="11-norm-rope.html">11</a></td></tr><tr><td>Linear</td><td>全走 cuBLAS</td><td>M ≤ 2 自写 GEMV，其余 cuBLAS</td><td><a href="12-linear-gemv.html">12</a></td></tr><tr><td>注意力</td><td>一个 warp 一个 query 的朴素分页版</td><td>decode split-K，prefill tensor core FA2</td><td><a href="06-store-kv.html">06</a> 换上，<a href="13-flash-decoding.html">13</a>、<a href="14-fa2-prefill.html">14</a> 讲原理</td></tr><tr><td>激活内存</td><td>按层回卷的 bump 分配</td><td>活跃区间规划，地址恒定</td><td><a href="16-memory-plan.html">16</a></td></tr><tr><td>launch 开销</td><td>每步 600 多次 kernel launch</td><td>decode 整步录成 CUDA Graph 回放</td><td><a href="17-cuda-graph.html">17</a></td></tr><tr><td>批处理</td><td>只能跑单序列</td><td>连续批处理、变长打包、抢占</td><td><a href="18-block-manager.html">18</a>–<a href="20-scheduling.html">20</a></td></tr><tr><td>KV 容量</td><td>写死 1024 token，112 MB</td><td>按显存比例分配，176736 token</td><td><a href="18-block-manager.html">18</a></td></tr></tbody></table></div>
+
+<h2>目标数字</h2>
+<p>目标 lab 在 RTX 3090、Qwen3-0.6B BF16 上的实测 <span class="src lab">lab 实测</span>：</p>
+<div class="tablewrap"><table><thead><tr><th>场景</th><th class="num">输出吞吐 tok/s</th><th class="num">TTFT mean ms</th><th class="num">ITL mean ms</th></tr></thead><tbody><tr><td>S1 单请求（512 → 256，5 轮）</td><td class="num">401.3</td><td class="num">13.47</td><td class="num">2.449</td></tr><tr><td>S2 32 并发</td><td class="num">3786.1</td><td class="num">169.42</td><td class="num">5.245</td></tr><tr><td>S3 256 条（nano-vllm bench.py 同款）</td><td class="num">5580</td><td class="num">1355.78</td><td class="num">27.293</td></tr><tr><td>S4 8 并发 × 3 轮</td><td class="num">1670.1</td><td class="num">57.86</td><td class="num">3.489</td></tr></tbody></table></div>
+<p>峰值 RSS 519 MB，加载 0.77 s，KV 容量 176736 token。完整表格在第 <a href="22-final-bench.html">22</a> 步。</p>
+
+<h2>步骤</h2>
+<div class="tablewrap"><table class="roadmap"><thead><tr><th>#</th><th>步骤</th><th>主要改动</th><th>直接效果</th></tr></thead><tbody><tr><td><b>阶段 0 · 先能量</b></td><td></td><td></td><td></td></tr><tr><td>01</td><td><a href="01-bench.html">基准对齐</a></td><td>bench 脚本、workload</td><td>能用 S1 口径量出 TTFT / ITL / 吞吐</td></tr><tr><td>02</td><td><a href="02-where-time-goes.html">64 ms 去哪了</a></td><td>只测不改</td><td>拿到一份 64 ms 的账本</td></tr><tr><td><b>阶段 1 · 去掉主机开销</b></td><td></td><td></td><td></td></tr><tr><td>03</td><td><a href="03-all-on-gpu.html">全图上 GPU</a></td><td>scheduler.zig、embedding kernel</td><td>CPU 上不再存词表；embedding 不再经 H2D</td></tr><tr><td>04</td><td><a href="04-step-state.html">StepState：元数据一次上传</a></td><td>common.zig、executor.zig</td><td>每步的小数据一次上传；forward 改吃 Entry 列表</td></tr><tr><td>05</td><td><a href="05-token-major-view.html">token-major 零拷贝拆头</a></td><td>module/shape.zig、attention.zig、rope.cu</td><td>每层少 4 个 permute kernel</td></tr><tr><td>06</td><td><a href="06-store-kv.html">写 KV 改成一个 kernel</a></td><td>page_atten.zig、attention.cu</td><td>每步 500 次小拷贝 + 56 次 malloc/free → 28 个 kernel</td></tr><tr><td>07</td><td><a href="07-stream-sync.html">一条 stream，一步一同步</a></td><td>cuda_context.cu、executor.zig</td><td>同步次数：每步 500+ → 1</td></tr><tr><td><b>阶段 2 · 少算、少搬</b></td><td></td><td></td><td></td></tr><tr><td>08</td><td><a href="08-gather-last.html">gather_last：只算最后一行</a></td><td>qwen3.zig、memcpy.cu</td><td>prefill 的 lm_head 从 T 行降到 1 行</td></tr><tr><td>09</td><td><a href="09-gpu-sampling.html">GPU 采样</a></td><td>sample.cu、executor.zig</td><td>采样 4.2 ms → 微秒级</td></tr><tr><td><b>阶段 3 · kernel</b></td><td></td><td></td><td></td></tr><tr><td>10</td><td><a href="10-bf16x8.html">bf16x8 向量化</a></td><td>arithmetic.cu、activation.cu</td><td>逐元素 kernel 访存量减到 1/8 次</td></tr><tr><td>11</td><td><a href="11-norm-rope.html">RMSNorm 与 RoPE</a></td><td>norm.cu、rope.cu</td><td>norm / rope 用对线程映射</td></tr><tr><td>12</td><td><a href="12-linear-gemv.html">Linear：GEMV + cuBLAS</a></td><td>linear.cu</td><td>decode 的大头：读权重带宽</td></tr><tr><td>13</td><td><a href="13-flash-decoding.html">decode 注意力：split-K</a></td><td>只读不改，用开关量</td><td>弄懂第 06 步换上的 decode 注意力</td></tr><tr><td>14</td><td><a href="14-fa2-prefill.html">prefill 注意力：FA2</a></td><td>只读不改</td><td>弄懂第 06 步换上的 prefill 注意力</td></tr><tr><td>15</td><td><a href="15-kernel-test.html">kernel 对拍</a></td><td>tests.zig</td><td>每个新 kernel 都有对拍</td></tr><tr><td><b>阶段 4 · 执行层</b></td><td></td><td></td><td></td></tr><tr><td>16</td><td><a href="16-memory-plan.html">活跃区间激活规划</a></td><td>memory/plan.zig</td><td>激活池峰值降下来，地址恒定</td></tr><tr><td>17</td><td><a href="17-cuda-graph.html">CUDA Graph</a></td><td>cuda_context.cu、executor.zig</td><td>launch 开销：每步 500 次 → 1 次</td></tr><tr><td><b>阶段 5 · 连续批处理</b></td><td></td><td></td><td></td></tr><tr><td>18</td><td><a href="18-block-manager.html">序列级块表与 KV 预算</a></td><td>runner/block.zig、page_atten.zig</td><td>KV 容量跟显存走</td></tr><tr><td>19</td><td><a href="19-batched-forward.html">批量前向 execute(entries)</a></td><td>executor.zig、engine.zig</td><td>吞吐随并发放大</td></tr><tr><td>20</td><td><a href="20-scheduling.html">调度策略与抢占</a></td><td>runner/batching.zig</td><td>TTFT 和 ITL 尾延迟的取舍</td></tr><tr><td><b>阶段 6 · 收尾</b></td><td></td><td></td><td></td></tr><tr><td>21</td><td><a href="21-cli-load.html">CLI 与快速加载</a></td><td>llmgen.zig、manager.zig</td><td>加载时间、可复现的命令行</td></tr><tr><td>22</td><td><a href="22-final-bench.html">最终对比</a></td><td>bench/</td><td>四个场景全量对比</td></tr><tr><td>23</td><td><a href="23-switches-debug.html">附录：回退开关与排错</a></td><td>—</td><td>出问题时怎么二分</td></tr></tbody></table></div>
+
+<h2>步骤之间的依赖</h2>
+<div class="diagram">
+<div class="flow">
+  <div class="box"><b>01–02</b><small>能量、能看账本</small></div><div class="arrow">→</div>
+  <div class="box gpu"><b>03 全图上 GPU</b><small>embedding 进显存</small></div><div class="arrow">→</div>
+  <div class="box gpu"><b>04 StepState</b><small>后面每一步都从这个包里读</small></div><div class="arrow">→</div>
+  <div class="box gpu"><b>05 + 06</b><small>token-major、slot 寻址、新注意力：一起做</small></div><div class="arrow">→</div>
+  <div class="box gpu"><b>07 stream</b><small>热路径干净了才能去掉同步</small></div>
+</div>
+<div class="flow" style="margin-top:10px">
+  <div class="box"><b>08–09</b><small>图尾部：gather / sample</small></div><div class="arrow">→</div>
+  <div class="box"><b>10–12 kernel</b><small>互相独立，顺序随意</small></div><div class="arrow">→</div>
+  <div class="box"><b>13–15</b><small>读懂注意力、补对拍</small></div><div class="arrow">→</div>
+  <div class="box"><b>16 MemoryPlan</b><small>地址恒定</small></div><div class="arrow">→</div>
+  <div class="box"><b>17 CUDA Graph</b><small>依赖 04 / 07 / 12 / 16</small></div><div class="arrow">→</div>
+  <div class="box"><b>18–20 批处理</b></div>
+</div>
+<div class="cap2">19 之前所有步骤都按单序列验证。批处理放最后，但它需要的东西（Entry 列表、变长元数据、token-major）在阶段 1 就铺好了，到第 19 步 forward 一行不用改。</div>
+</div>
+
+<div class="callout warn"><span class="t">两处要提前知道</span><b>第 05、06 两步要连着做</b>：05 把 q / k / v 改成 token-major，06 才把写 KV 和注意力换成配套的 kernel，中间那个状态算出来的结果是错的。<br><b>CPU 后端要跟着主线同步改</b>：每一步页面里都有一个“CPU 同步”小节，写明这一步 CPU 要做什么（很多步是“不用动”）。具体怎么改在 CPU 支线里。</div>
+
+<h2>CPU 支线</h2>
+<p>主线只讲 CUDA 路径。想让 CPU 后端全程保持可用（mac 上开发、没有 GPU 的机器上演示、给 CUDA 当对拍参考），就在做主线的同时做这条支线：</p>
+<div class="tablewrap"><table class="roadmap"><thead><tr><th>#</th><th>页面</th><th>对应主线</th><th>内容</th></tr></thead><tbody><tr><td>C1</td><td><a href="cpu-1-overview.html">一套执行层两个后端</a></td><td>全程</td><td>CPU 和 CUDA 只在哪几处不同；每一步 CPU 要做什么的对照表</td></tr><tr><td>C2</td><td><a href="cpu-2-tools.html">并行与 SIMD 工具</a></td><td>开始之前</td><td>bf16 直读、<code>@Vector</code> 点积、fork-join 线程团队</td></tr><tr><td>C3</td><td><a href="cpu-3-kernels-layout.html">布局相关的算子</a></td><td>03、05、06、08、09</td><td>embedding、rope、attention、gather_last、sample</td></tr><tr><td>C4</td><td><a href="cpu-4-kernels-math.html">计算类算子</a></td><td>10、11、12、15</td><td>Linear、add / mul / silu、RMSNorm、CPU 单测</td></tr><tr><td>C5</td><td><a href="cpu-5-exec-cli.html">执行层与命令行</a></td><td>16–22</td><td>KV 预算、加载、<code>--device</code>、CPU / CUDA 逐 token 对拍</td></tr></tbody></table></div>
+<p>建议的顺序：<b>开始主线之前先做 C2 和 C4 的 Linear</b>（否则 CPU 上一次前向要十几秒，每步验证都要等）；之后主线做到哪一步，就按那一步“CPU 同步”小节的链接去做对应的一节。完整的对照表在 <a href="cpu-1-overview.html">C1</a>。</p>
+
+<h2>里程碑</h2>
+<div class="tablewrap"><table><thead><tr><th>里程碑</th><th>做完哪几步</th><th>验收</th></tr></thead><tbody><tr><td>M1</td><td>01–09</td><td>单请求 decode 超过 150 tok/s；greedy 输出和起点逐 token 一致</td></tr><tr><td>M2</td><td>10–17</td><td>S1 接近 401 tok/s，TTFT（512 token prompt）约 13 ms</td></tr><tr><td>M3</td><td>18–22</td><td>S2 / S3 / S4 的吞吐和延迟接近上表</td></tr></tbody></table></div>
+
+<h2>你的进度</h2>
+<p>每个阶段做完，把 S1 的三个数（以及批处理做完后的 S3）填在这里。格子可以直接点进去填，存在浏览器本地。</p>
+<div class="tablewrap"><table class="mine"><thead><tr><th>做完</th><th class="num">S1 吞吐 tok/s</th><th class="num">S1 TTFT ms</th><th class="num">S1 ITL ms</th><th class="num">S3 吞吐 tok/s</th></tr></thead><tbody><tr><td>起点（第 01 步量的）</td><td class="num fill" contenteditable="true" data-key="index.html|起点（第 01 步量的）|S1 吞吐 tok/s"></td><td class="num fill" contenteditable="true" data-key="index.html|起点（第 01 步量的）|S1 TTFT ms"></td><td class="num fill" contenteditable="true" data-key="index.html|起点（第 01 步量的）|S1 ITL ms"></td><td class="num fill" contenteditable="true" data-key="index.html|起点（第 01 步量的）|S3 吞吐 tok/s"></td></tr><tr><td>阶段 1（第 07 步）</td><td class="num fill" contenteditable="true" data-key="index.html|阶段 1（第 07 步）|S1 吞吐 tok/s"></td><td class="num fill" contenteditable="true" data-key="index.html|阶段 1（第 07 步）|S1 TTFT ms"></td><td class="num fill" contenteditable="true" data-key="index.html|阶段 1（第 07 步）|S1 ITL ms"></td><td class="num fill" contenteditable="true" data-key="index.html|阶段 1（第 07 步）|S3 吞吐 tok/s"></td></tr><tr><td>阶段 2（第 09 步）· M1</td><td class="num fill" contenteditable="true" data-key="index.html|阶段 2（第 09 步）· M1|S1 吞吐 tok/s"></td><td class="num fill" contenteditable="true" data-key="index.html|阶段 2（第 09 步）· M1|S1 TTFT ms"></td><td class="num fill" contenteditable="true" data-key="index.html|阶段 2（第 09 步）· M1|S1 ITL ms"></td><td class="num fill" contenteditable="true" data-key="index.html|阶段 2（第 09 步）· M1|S3 吞吐 tok/s"></td></tr><tr><td>阶段 3（第 15 步）</td><td class="num fill" contenteditable="true" data-key="index.html|阶段 3（第 15 步）|S1 吞吐 tok/s"></td><td class="num fill" contenteditable="true" data-key="index.html|阶段 3（第 15 步）|S1 TTFT ms"></td><td class="num fill" contenteditable="true" data-key="index.html|阶段 3（第 15 步）|S1 ITL ms"></td><td class="num fill" contenteditable="true" data-key="index.html|阶段 3（第 15 步）|S3 吞吐 tok/s"></td></tr><tr><td>阶段 4（第 17 步）· M2</td><td class="num fill" contenteditable="true" data-key="index.html|阶段 4（第 17 步）· M2|S1 吞吐 tok/s"></td><td class="num fill" contenteditable="true" data-key="index.html|阶段 4（第 17 步）· M2|S1 TTFT ms"></td><td class="num fill" contenteditable="true" data-key="index.html|阶段 4（第 17 步）· M2|S1 ITL ms"></td><td class="num fill" contenteditable="true" data-key="index.html|阶段 4（第 17 步）· M2|S3 吞吐 tok/s"></td></tr><tr><td>阶段 5（第 20 步）</td><td class="num fill" contenteditable="true" data-key="index.html|阶段 5（第 20 步）|S1 吞吐 tok/s"></td><td class="num fill" contenteditable="true" data-key="index.html|阶段 5（第 20 步）|S1 TTFT ms"></td><td class="num fill" contenteditable="true" data-key="index.html|阶段 5（第 20 步）|S1 ITL ms"></td><td class="num fill" contenteditable="true" data-key="index.html|阶段 5（第 20 步）|S3 吞吐 tok/s"></td></tr><tr><td>阶段 6（第 22 步）· M3</td><td class="num fill" contenteditable="true" data-key="index.html|阶段 6（第 22 步）· M3|S1 吞吐 tok/s"></td><td class="num fill" contenteditable="true" data-key="index.html|阶段 6（第 22 步）· M3|S1 TTFT ms"></td><td class="num fill" contenteditable="true" data-key="index.html|阶段 6（第 22 步）· M3|S1 ITL ms"></td><td class="num fill" contenteditable="true" data-key="index.html|阶段 6（第 22 步）· M3|S3 吞吐 tok/s"></td></tr><tr><td>目标 lab <span class="src lab">lab 实测</span></td><td class="num">401.3</td><td class="num">13.47</td><td class="num">2.449</td><td class="num">5580</td></tr></tbody></table></div>
+
+<h2>怎么读每一页</h2>
+<p>每页结构固定：<b>目标 → 原理 → 起点代码哪里慢 → 分步改动 → 对拍验证 → 性能收益 → 常见错误 → 检查点</b>。</p>
+<h3>代码块的几种标签</h3>
+<ul>
+  <li><span class="tag edit">起点（你现在的代码）</span>：教程开始时 llmgen 的快照（commit <code>91fac54</code>），用来指出慢在哪。</li>
+  <li><span class="tag out">lab 参考（3090 实测过）</span>：直接读目标 lab 的源文件，一字不改。命名是 lab 的（<code>dtype</code> / <code>device</code> / <code>alloc</code>），照搬时要换成 llmgen 的（<code>data_type</code> / <code>device_type</code> / <code>allocator</code>）。</li>
+  <li><span class="tag edit">改动对比</span>：绿色行加、红色行删、其余是定位用的上下文。复制按钮只复制改完后的代码。</li>
+  <li><span class="tag new">新建文件 / 新增</span>：按 llmgen 的命名写好的代码，可以整段复制。</li>
+</ul>
+<h3>性能数字的四种来源</h3>
+<ul>
+  <li><span class="src lab">lab 实测</span> <span class="src lab">消融实测</span> <span class="src lab">nsys 实测</span>：目标 lab 在同一块 3090 上的记录。消融数字出自<b>融合版</b> module-serving 关掉某个优化后的对比，方向和量级可以照搬，绝对值不行。</li>
+  <li><span class="src start">llmgen 起点实测</span>：<code>src/bench/40da889-dirty/run1.log</code>。</li>
+  <li><span class="src est">推算</span>：由上面的数字算出来的，文中给出算式。没有在 llmgen 上实测过。</li>
+  <li><b>你的实测</b>：每页有一张可以直接填的表，数字存在浏览器本地，自动算提升倍数。</li>
+</ul>
+
+<h2>构建和运行</h2>
+<div class="codeblock"><div class="cap"><span><b>终端</b> <span class="tag out">命令</span></span><button type="button">复制</button></div><pre><code class="language-bash"># 3090 上的构建和单次运行(Makefile 里已有)
+make llmgen-cuda
+
+# 带指标
+LLMGEN_METRICS=1 make llmgen-cuda
+
+# 带算子级 profile(会在每个算子后同步, 只用来看占比, 不用来报吞吐)
+LLMGEN_METRICS=1 LLMGEN_PROFILE=1 make llmgen-cuda
+
+# 单元测试 / kernel 对拍
+make llmgen-cuda-test
+
+# 跑 5 次取中位数
+bash src/bench/run.sh 5</code></pre></div>
+<p>目标 lab 的源码在 <code>Genllm/study/labs/module-serving-unfused/</code>，每页的“lab 参考”都标了文件名，遇到教程没讲清的地方直接去读它。</p>
+
+<h2>重新生成这份教程</h2>
+<div class="codeblock"><div class="cap"><span><b>终端</b> <span class="tag out">命令</span></span><button type="button">复制</button></div><pre><code class="language-bash">make llmgen-serving-unfused-docs
+python3 scripts/gen-llmgen-serving-unfused/gen.py 03-stream-sync.html   # 只生成某一页
+python3 scripts/gen-llmgen-serving-unfused/gen.py --check-perf          # 核对文中数字和来源文件一致</code></pre></div>
+
+
+<div class="pager"><span></span><a class="next" href="01-bench.html"><small>下一步 →</small>基准对齐</a></div>
+</main>
+</div>
+</body>
+</html>

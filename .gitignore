@@ -1,0 +1,7 @@
+.zig-cache
+zig-out
+data
+__pycache__
+.DS_Store
+bench/workloads/
+docs/qwen3-graph.dot

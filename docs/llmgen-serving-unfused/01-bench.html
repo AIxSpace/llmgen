@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>基准对齐 · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html" class="active"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">阶段 0 · 先能量</div>
+<h1>基准对齐</h1>
+<p class="lead">换成和目标 lab 同一把尺子，再存一份对拍基线。</p>
+<div class="callout goal"><span class="t">本步目标</span>用目标 lab 的 S1 口径（512 token 输入、256 token 输出、<code>ignore_eos</code>、5 轮）量出 llmgen 现在的 TTFT、ITL 和吞吐，并存一份 greedy 输出当对拍基线。后面每一步都靠这两样判断“改对了没有”和“快了多少”。</div>
+<h2>原理</h2>
+<h3>为什么不能继续用现在的 run.sh</h3>
+<p>现在的 <code>bench/run.sh</code> 跑的是 <code>llmgen.zig</code> 里写死的那条 prompt：</p>
+<div class="codeblock"><div class="cap"><span><b>src/bench/run.sh</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-bash">#!/usr/bin/env bash
+# 用法: bash src/bench/run.sh [次数, 默认 5]
+set -euo pipefail
+cd &quot;$(git rev-parse --show-toplevel)&quot;     # 不管在哪个目录运行, 都切到仓库根目录
+
+runs=&quot;${1:-5}&quot;
+commit=$(git rev-parse --short HEAD)
+git diff --quiet || commit=&quot;${commit}-dirty&quot;   # 工作区有未提交改动时打标记
+out=&quot;src/bench/${commit}&quot;
+mkdir -p &quot;$out&quot;
+
+# 和 Makefile 里 llmgen-cuda 保持一致
+export LLMGEN_MODEL=&quot;${LLMGEN_MODEL:-/home/deploy/qwen/qwen306b/models/Qwen3-0.6B-BF16.gguf}&quot;
+export LD_LIBRARY_PATH=&quot;/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}&quot;
+zig build -Dcuda=true -Dnvcc=/usr/local/cuda/bin/nvcc -Doptimize=ReleaseFast
+
+for i in $(seq 1 &quot;$runs&quot;); do
+  echo &quot;run ${i}/${runs} ...&quot;
+  LLMGEN_METRICS=1 \
+  LLMGEN_METRICS_JSON=&quot;${out}/run${i}.json&quot; \
+  ./zig-out/bin/llminfer &gt; /dev/null 2&gt; &quot;${out}/run${i}.log&quot; || {
+    echo &quot;第 ${i} 次运行失败, 日志: ${out}/run${i}.log&quot;; exit 1;
+  }
+done
+
+python3 - &quot;$out&quot; &lt;&lt;&#x27;EOF&#x27;
+import json, glob, sys, statistics as st
+files = sorted(glob.glob(sys.argv[1] + &quot;/*.json&quot;))
+if not files:
+    sys.exit(&quot;没有生成任何 JSON, 检查 run*.log&quot;)
+runs = [json.load(open(f)) for f in files]
+print(f&quot;{len(runs)} 次运行, 结果目录 {sys.argv[1]}&quot;)
+for k in [&quot;ttft_ms&quot;, &quot;tpot_ms&quot;, &quot;itl_p99_ms&quot;, &quot;prefill_tps&quot;, &quot;decode_tps&quot;]:
+    xs = [r[k] for r in runs]
+    m = st.median(xs)
+    print(f&quot;{k:12s} median={m:9.2f}  min={min(xs):9.2f}  max={max(xs):9.2f}  波动=±{(max(xs)-min(xs))/2/m*100:4.1f}%&quot;)
+EOF</code></pre></div>
+<p>它和目标 lab 的数字没法直接比，有三处口径不同：</p>
+<div class="tablewrap"><table><thead><tr><th></th><th>现在的 run.sh</th><th>目标 lab 的 S1</th></tr></thead><tbody><tr><td>prompt 长度</td><td>21 token</td><td>512 token（随机 id）</td></tr><tr><td>输出长度</td><td>遇到 EOS 就停，实测 455</td><td>固定 256，<code>ignore_eos</code></td></tr><tr><td>TTFT 含什么</td><td>21 token 的 prefill</td><td>512 token 的 prefill</td></tr><tr><td>ITL 的上下文</td><td>21 → 476</td><td>512 → 768</td></tr></tbody></table></div>
+<p>prefill 长度差 24 倍，TTFT 不可比；decode 的注意力开销随上下文长度线性增长，ITL 也不可比。所以先把 workload 对齐。</p>
+
+<h3>四个场景各量什么</h3>
+<div class="codeblock"><div class="cap"><span><b>bench/gen_workload.py（S1–S4）</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-python">def s1():
+    seed(0)
+    rounds = [[{&quot;prompt_ids&quot;: [randint(0, 10000) for _ in range(512)], &quot;max_tokens&quot;: 256,
+                &quot;temperature&quot;: 0.6, &quot;ignore_eos&quot;: True}] for _ in range(5)]
+    return {&quot;name&quot;: &quot;s1-single&quot;, &quot;rounds&quot;: rounds}
+
+
+def s2():
+    seed(1)
+    reqs = []
+    for _ in range(32):
+        prompt = [randint(0, 10000) for _ in range(randint(128, 512))]
+        reqs.append({&quot;prompt_ids&quot;: prompt, &quot;max_tokens&quot;: randint(128, 512), &quot;temperature&quot;: 0.6, &quot;ignore_eos&quot;: True})
+    return {&quot;name&quot;: &quot;s2-concurrent32&quot;, &quot;rounds&quot;: [reqs]}
+
+
+def s3():
+    # 与 nano-vllm bench.py 逐行一致: 先生成全部 prompt, 再生成全部 max_tokens
+    seed(0)
+    num_seqs, max_input_len, max_ouput_len = 256, 1024, 1024
+    prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
+    max_tokens = [randint(100, max_ouput_len) for _ in range(num_seqs)]
+    reqs = [{&quot;prompt_ids&quot;: p, &quot;max_tokens&quot;: m, &quot;temperature&quot;: 0.6, &quot;ignore_eos&quot;: True}
+            for p, m in zip(prompt_token_ids, max_tokens)]
+    return {&quot;name&quot;: &quot;s3-bench256&quot;, &quot;rounds&quot;: [reqs]}
+
+
+def s4():
+    # 各轮长度相同(bench 按第 0 轮统计 token 数), 只有 prompt 内容不同
+    seed(2)
+    lens = [(randint(256, 512), randint(128, 512)) for _ in range(8)]
+    rounds = [[{&quot;prompt_ids&quot;: [randint(0, 10000) for _ in range(n_in)], &quot;max_tokens&quot;: n_out,
+                &quot;temperature&quot;: 0.6, &quot;ignore_eos&quot;: True} for n_in, n_out in lens] for _ in range(3)]
+    return {&quot;name&quot;: &quot;s4-concurrent8&quot;, &quot;rounds&quot;: rounds}</code></pre></div>
+<div class="tablewrap"><table><thead><tr><th>场景</th><th>形状</th><th>主要看</th></tr></thead><tbody><tr><td>S1</td><td>1 请求 × 5 轮，512 → 256</td><td>单流 TTFT、ITL。<b>批处理做完之前只有它能跑</b></td></tr><tr><td>S2</td><td>32 并发，128~512 → 128~512</td><td>中等并发的吞吐</td></tr><tr><td>S3</td><td>256 并发，100~1024 → 100~1024</td><td>大批吞吐，时间主要花在 GEMM 和 KV 带宽</td></tr><tr><td>S4</td><td>8 并发 × 3 轮</td><td>decode 批落在 4~8，最考验小批 kernel</td></tr></tbody></table></div>
+<p>每轮 prompt 都不同，<code>temperature=0.6</code>，<code>ignore_eos=True</code>，所以每个引擎的输出 token 数严格相等，吞吐可以直接比。</p>
+
+<h3>指标口径</h3>
+<ul>
+  <li><b>TTFT</b>：请求提交到第一个 token 回到 host。包含 prefill 和第一次采样。</li>
+  <li><b>ITL</b>：同一请求相邻两个 token 的间隔。单请求时 1000 / ITL 就是 decode 吞吐。</li>
+  <li><b>输出吞吐</b>：输出 token 总数 ÷ 墙钟时间。墙钟包含 prefill，所以 S1 的吞吐（401.3）略低于 1000 / ITL（408）。</li>
+</ul>
+
+<h2>改动</h2>
+<h3><span class="stepno">1</span>生成 workload</h3>
+<div class="codeblock"><div class="cap"><span><b>终端</b> <span class="tag out">命令</span></span><button type="button">复制</button></div><pre><code class="language-bash">mkdir -p src/bench/workloads
+cp &lt;Genllm&gt;/study/labs/module-serving-unfused/bench/gen_workload.py src/bench/
+python3 src/bench/gen_workload.py src/bench/workloads
+# s1: 每轮 1 请求 × 5 轮, 每轮输入 512 / 输出 256 token
+# s2: 每轮 32 请求 × 1 轮, 每轮输入 9479 / 输出 9655 token
+# s3: 每轮 256 请求 × 1 轮, 每轮输入 142827 / 输出 133966 token
+# s4: 每轮 8 请求 × 3 轮, 每轮输入 2770 / 输出 2955 token</code></pre></div>
+<p>workload JSON 很大（S3 约 1 MB），别提交进仓库，把 <code>src/bench/workloads/</code> 加进 <code>.gitignore</code>。</p>
+
+<h3><span class="stepno">2</span>读 workload 的小模块</h3>
+<div class="codeblock"><div class="cap"><span><b>src/bench/workload.zig</b> <span class="tag new">新建文件</span></span><button type="button">复制</button></div><pre><code class="language-zig">//! bench/workload.zig -- 读 gen_workload.py 生成的 JSON(格式同 module-serving-unfused 的 main.zig)
+const std = @import(&quot;std&quot;);
+
+pub const Request = struct {
+    prompt_ids: []const i32,
+    max_tokens: usize,
+    temperature: f32 = 0.6,
+    ignore_eos: bool = true,
+};
+
+pub const Workload = struct {
+    name: []const u8 = &quot;workload&quot;,
+    rounds: []const []const Request, // 各轮依次跑, 轮内请求同时提交
+};
+
+pub fn load(allocator: std.mem.Allocator, path: []const u8) !std.json.Parsed(Workload) {
+    const bytes = try std.fs.cwd().readFileAlloc(allocator, path, 256 &lt;&lt; 20);
+    defer allocator.free(bytes);
+    // .alloc_always: 解析结果不引用 bytes, 上面可以放心 free
+    return std.json.parseFromSlice(Workload, allocator, bytes, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+}</code></pre></div>
+
+<h3><span class="stepno">3</span>generate 支持 ignore_eos 和长度检查</h3>
+<p><code>generate</code> 已经用 <code>next == eos</code> 判断停止。传一个负数的 eos 就等于 ignore_eos，不用加参数。顺手补上长度检查：现在超长只会在 KV 池用完时报 <code>OutOfBlocks</code>。</p>
+<div class="codeblock diff"><div class="cap"><span><b>src/executor.zig</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln del">    pub fn generate(self: *Self, prompt: []const i32, max_tokens: usize, eos: i32, tokenizer: ?*Tokenizer) ![]i32 {</span><span class="ln add">    /// eos &lt; 0 表示 ignore_eos:词表里没有负数 id, 永远不会命中</span><span class="ln add">    pub fn generate(self: *Self, prompt: []const i32, max_tokens: usize, eos: i32, tokenizer: ?*Tokenizer) ![]i32 {</span><span class="ln ctx">        if (prompt.len == 0) return error.EmptyPrompt;</span><span class="ln ctx">        if (max_tokens == 0) return error.BadMaxTokens;</span><span class="ln add">        if (prompt.len + max_tokens &gt; self.max_seq) return error.SequenceTooLong;</span></code></pre></div>
+<p>S1 需要 512 + 256 = 768 个位置，<code>llmgen.zig</code> 里的 <code>max_seq_len = 1024</code> 够用。</p>
+
+<h3><span class="stepno">4</span>时间戳一直记</h3>
+<div class="codeblock diff"><div class="cap"><span><b>src/executor.zig · generate()</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">            // 第一个 token 时顺带记下 TTFT</span><span class="ln del">            if (self.metrics.enabled) {</span><span class="ln del">                try self.metrics.onGenToken(self.allocator, total_timer.read());</span><span class="ln del">            }</span><span class="ln add">            // 时间戳一直记(一次 Timer.read + 一次 append, 几十纳秒);enabled 只控制要不要打印</span><span class="ln add">            try self.metrics.onGenToken(self.allocator, total_timer.read());</span></code></pre></div>
+
+<h3><span class="stepno">5</span>临时压测入口</h3>
+<div class="codeblock"><div class="cap"><span><b>src/llmgen.zig</b> <span class="tag new">新增</span></span><button type="button">复制</button></div><pre><code class="language-zig">/// 阶段 0 的临时压测入口:按 workload 逐条请求串行跑(批处理要到第 19 步)。
+/// 只有 S1 的数字能和目标 lab 直接比;S2–S4 的并发场景这里先不跑。
+fn benchSingle(allocator: std.mem.Allocator, executor: *Executor, path: []const u8) !void {
+    const workload = @import(&quot;bench/workload.zig&quot;);
+    const pcommon = @import(&quot;profiler/common.zig&quot;);
+
+    const parsed = try workload.load(allocator, path);
+    defer parsed.deinit();
+    const wl = parsed.value;
+
+    var ttft_ms: std.ArrayList(f64) = .empty;
+    defer ttft_ms.deinit(allocator);
+    var itl_ns: std.ArrayList(u64) = .empty;
+    defer itl_ns.deinit(allocator);
+    var out_tokens: usize = 0;
+    var wall_ns: u64 = 0;
+
+    executor.metrics.enabled = false; // 不让 generate 每次打印一屏指标, 下面自己汇总
+    for (wl.rounds) |reqs| {
+        for (reqs) |r| {
+            var timer = try std.time.Timer.start();
+            const out = try executor.generate(r.prompt_ids, r.max_tokens, -1, null);
+            wall_ns += timer.read();
+            defer allocator.free(out);
+
+            out_tokens += out.len;
+            try ttft_ms.append(allocator, pcommon.nsToMs(executor.metrics.ttft_ns));
+            try itl_ns.appendSlice(allocator, executor.metrics.itl_ns.items);
+        }
+    }
+
+    var ttft_sum: f64 = 0;
+    for (ttft_ms.items) |t| ttft_sum += t;
+    var itl_sum: u64 = 0;
+    for (itl_ns.items) |t| itl_sum += t;
+    const n_itl: f64 = @floatFromInt(@max(itl_ns.items.len, 1));
+
+    std.debug.print(
+        &quot;[bench] {s}: 输出 {d} token | 吞吐 {d:.1} tok/s | TTFT mean {d:.2} ms | ITL mean {d:.3} ms p99 {d:.3} ms\n&quot;,
+        .{
+            wl.name,
+            out_tokens,
+            pcommon.perSec(out_tokens, wall_ns),
+            ttft_sum / @as(f64, @floatFromInt(@max(ttft_ms.items.len, 1))),
+            pcommon.nsToMs(itl_sum) / n_itl,
+            pcommon.nsToMs(pcommon.percentile(itl_ns.items, 99)),
+        },
+    );
+}</code></pre></div>
+<div class="codeblock diff"><div class="cap"><span><b>src/llmgen.zig · run()</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">    // 7. generate</span><span class="ln ctx">    if (std.posix.getenv(&quot;LLMGEN_NO_KV_CACHE&quot;) != null) runtime_executor.use_kv_cache = false;</span><span class="ln add">    if (std.posix.getenv(&quot;LLMGEN_WORKLOAD&quot;)) |path| {</span><span class="ln add">        return benchSingle(allocator, &amp;runtime_executor, path);</span><span class="ln add">    }</span><span class="ln ctx">    const out_ids = try runtime_executor.generate(prompt_ids, max_new, eos, &amp;tokenizer);</span></code></pre></div>
+<div class="callout tip"><span class="t">这段代码是临时的</span>它调的是单序列的 <code>generate</code>。第 19 步接通 <code>Engine</code> 之后，会换成和目标 lab 的 <code>bench</code> 子命令同样的写法，S2–S4 才能跑。</div>
+
+<h3><span class="stepno">6</span>存一份 greedy 基线</h3>
+<p>性能优化最怕“变快了但算错了”。bf16 下每个张量边界舍入一次，只要计算顺序不变，greedy 输出应该逐 token 相同。</p>
+<div class="codeblock"><div class="cap"><span><b>终端</b> <span class="tag out">命令</span></span><button type="button">复制</button></div><pre><code class="language-bash"># 固定一条短 prompt, 用 greedy 把输出 token 存成基线。之后每一步改完都和它比。
+# (llmgen.zig 里把 prompt 换回 &quot;中国的首都是哪里?&quot;、max_new = 64, sample() 换成 sampleArgmax())
+make llmgen-cuda 2&gt;&amp;1 | tee /tmp/llmgen-golden.txt
+
+# 之后每一步:
+make llmgen-cuda 2&gt;&amp;1 | diff - /tmp/llmgen-golden.txt &amp;&amp; echo 一致</code></pre></div>
+<p>哪几步允许输出变化，对应页面会明说（比如第 09 步把采样换成 Gumbel-max 后，<code>temperature &gt; 0</code> 的输出会变，greedy 不变）。</p>
+
+<h2>对拍验证</h2>
+<div class="codeblock"><div class="cap"><span><b>终端</b> <span class="tag out">命令</span></span><button type="button">复制</button></div><pre><code class="language-bash">LLMGEN_WORKLOAD=src/bench/workloads/s1.json make llmgen-cuda</code></pre></div>
+<div class="codeblock"><div class="cap"><span><b>预期输出（数字是示意）</b> <span class="tag out">输出</span></span><button type="button">复制</button></div><pre><code class="nohighlight">[bench] s1-single: 输出 1280 token | 吞吐 14.x tok/s | TTFT mean xxxx ms | ITL mean 6x.xxx ms p99 7x.xxx ms</code></pre></div>
+<p>TTFT 会比之前的 423.39 ms 大很多：prefill 从 21 token 变成 512 token，而起点的 lm_head 对全部 512 行都算了一遍 151936 维的 logits。这正是第 08 步要解决的。</p>
+<h2>性能收益</h2>
+<h3>依据</h3>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th class="num">改前</th><th class="num">改后</th><th>来源</th></tr></thead><tbody><tr><td>目标 lab 的 S1 吞吐（tok/s）</td><td class="num">—</td><td class="num">401.3</td><td><span class="src lab">lab 实测</span></td></tr><tr><td>目标 lab 的 S1 TTFT（ms）</td><td class="num">—</td><td class="num">13.47</td><td><span class="src lab">lab 实测</span></td></tr><tr><td>目标 lab 的 S1 ITL mean（ms）</td><td class="num">—</td><td class="num">2.449</td><td><span class="src lab">lab 实测</span></td></tr><tr><td>llmgen 起点 decode 吞吐（21 token prompt）</td><td class="num">15.5</td><td class="num">—</td><td><span class="src start">llmgen 起点实测</span></td></tr><tr><td>llmgen 起点 TPOT（ms）</td><td class="num">64.63</td><td class="num">—</td><td><span class="src start">llmgen 起点实测</span></td></tr></tbody></table></div>
+<h3>对 llmgen 的预期</h3>
+<p>这一步不改性能，只是换把尺子。预期 S1 口径下的 ITL 比 64.63 ms 略高（上下文从平均 250 变成平均 640，注意力更贵），吞吐在 13–15 tok/s。把量到的数字填进下面的表，它就是后面所有步骤的“改前”。</p>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>S1 输出吞吐 (tok/s)</td><td class="num fill" contenteditable="true" data-key="01-bench.html|S1 输出吞吐 (tok/s)|before"></td><td class="num fill" contenteditable="true" data-key="01-bench.html|S1 输出吞吐 (tok/s)|after"></td><td class="num gain"></td></tr><tr><td>S1 TTFT mean (ms)</td><td class="num fill" contenteditable="true" data-key="01-bench.html|S1 TTFT mean (ms)|before"></td><td class="num fill" contenteditable="true" data-key="01-bench.html|S1 TTFT mean (ms)|after"></td><td class="num gain"></td></tr><tr><td>S1 ITL mean (ms)</td><td class="num fill" contenteditable="true" data-key="01-bench.html|S1 ITL mean (ms)|before"></td><td class="num fill" contenteditable="true" data-key="01-bench.html|S1 ITL mean (ms)|after"></td><td class="num gain"></td></tr><tr><td>S1 ITL p99 (ms)</td><td class="num fill" contenteditable="true" data-key="01-bench.html|S1 ITL p99 (ms)|before"></td><td class="num fill" contenteditable="true" data-key="01-bench.html|S1 ITL p99 (ms)|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td><code>error.SequenceTooLong</code></td><td>workload 的 512 + 256 超过了 <code>max_seq_len</code>。S1 需要至少 768。</td></tr><tr><td><code>OutOfPoolMemory</code>（激活池）</td><td>起点的激活池按 <code>max_seq</code> 估算，lm_head 的 <code>[512, 151936]</code> bf16 输出要 148 MB。把 <code>max_seq_len</code> 调到 1024 以上会更大。第 08 步之后这个问题消失。</td></tr><tr><td>吞吐比 <code>run.sh</code> 的 15.5 低</td><td>正常。S1 的吞吐按墙钟算，包含 prefill。</td></tr><tr><td>每轮 TTFT 差很多</td><td>第一轮含 cuBLAS 初始化和 GPU 升频。正式记数前先跑一条短请求预热（第 21 步会加进 bench）。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li><code>LLMGEN_WORKLOAD=…/s1.json</code> 能跑完 5 轮，每轮输出 256 token</li><li>记下了 S1 的吞吐、TTFT、ITL mean / p99</li><li>存了一份 greedy 输出的 token 序列</li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="index.html"><small>← 上一步</small>总览</a><a class="next" href="02-where-time-goes.html"><small>下一步 →</small>64 ms 去哪了</a></div>
+</main>
+</div>
+</body>
+</html>

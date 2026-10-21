@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CPU：一套执行层两个后端 · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html" class="active"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">CPU 支线</div>
+<h1>CPU：一套执行层两个后端</h1>
+<p class="lead">主线每做一步，CPU 都还能跑，并且和 CUDA 逐 token 相同。</p>
+<div class="callout goal"><span class="t">本步目标</span>弄清为什么同一套执行层能同时驱动 CPU 和 CUDA，以及主线每一步 CPU 要跟着做什么。读完这一页，你手里有一张对照表：做主线第 N 步时，去 CPU 支线的哪一节。</div>
+<h2>原理</h2>
+<h3>执行层是设备无关的</h3>
+<p>主线阶段 1 搭起来的东西：图、每步的元数据包（StepState）、slot 寻址的分页 KV、活跃区间激活规划、连续批处理。这些都不依赖 GPU。它们只规定了“数据放在哪、每个算子读什么”，没规定算子怎么算。</p>
+<p>所以 CPU 后端要做的只是：<b>每个算子提供一个 CPU 特化，读同样的输入、同样的元数据，写同样布局的输出</b>。目标 lab 就是这样做的：<code>backend/cpu/</code> 和 <code>backend/cuda/</code> 文件一一对应，执行层一行不分叉。</p>
+
+<h3>CPU 和 CUDA 只在三处不同</h3>
+<div class="tablewrap"><table><thead><tr><th></th><th>CUDA</th><th>CPU</th></tr></thead><tbody><tr><td>内存池</td><td>显存，host 不能解引用</td><td>普通内存，host 直接读写</td></tr><tr><td>元数据</td><td>写进 pinned 缓冲 → 异步 H2D</td><td>直接写进 activation 池里那块缓冲，不用拷贝</td></tr><tr><td>取结果</td><td>异步 D2H 4·S 字节 + 同步 stream</td><td>直接读输出节点</td></tr><tr><td>同步</td><td><code>cudaStreamSynchronize</code></td><td>算子本来就是同步执行的，没有这回事</td></tr><tr><td>CUDA Graph</td><td>decode 步回放</td><td>没有，恒 eager</td></tr><tr><td>split-K scratch、采样 scratch</td><td>从 activation 池切</td><td>不需要（CPU 算子不用）</td></tr></tbody></table></div>
+<p>lab 把这些差别收在三个小函数里，其余代码不知道自己跑在哪种设备上：</p>
+<div class="codeblock"><div class="cap"><span><b>executor.zig：设备相关的动作全收在这三个小函数里</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">    fn uploadMeta(self: *Executor, bytes: usize) void {
+        if (comptime opts.have_cuda) {
+            if (self.device == .CUDA) cu.cuda_h2d_async(self.devAt(0), self.meta_host.?, bytes);
+        }
+    }
+
+    /// 等本设备上已派发的工作做完(CUDA: 同步 stream; Metal: 提交已编码的命令并等待; CPU: 同步执行, 无事可做).
+    fn syncDevice(self: *Executor) void {
+        switch (self.device) {
+            .CUDA =&gt; if (comptime opts.have_cuda) cu.cuda_sync(),
+            .METAL =&gt; if (comptime opts.have_metal) metal.flush(),
+            else =&gt; {},
+        }
+    }
+
+    /// 取回本步 S 个采样 token(CUDA: D2H 到 pinned; CPU / Metal: 直接读输出节点).
+    fn fetchOut(self: *Executor, out_ptr: usize, n_seq: usize) []const i32 {
+        if (comptime opts.have_cuda) {
+            if (self.device == .CUDA) {
+                cu.cuda_d2h_async(self.out_host.?, @ptrFromInt(out_ptr), n_seq * 4);
+                cu.cuda_sync();
+                return self.out_host.?[0..n_seq];
+            }
+        }
+        self.syncDevice();
+        return @as([*]const i32, @ptrFromInt(out_ptr))[0..n_seq];
+    }</code></pre></div>
+<p>主线各步给出的 llmgen 代码已经按这个思路写了：<code>allocMeta</code> 里 CPU 的 <code>meta_host</code> 直接指向池；<code>uploadMeta</code>、<code>fetchOut</code>、逐算子同步都带着 <code>device_type == .CUDA</code> 的判断；<code>enforce_eager</code> 在非 CUDA 时恒为真。所以执行层这边 CPU 几乎不用额外写代码（细节在 <a href="cpu-5-exec-cli.html">C5</a>）。要写的是算子。</p>
+
+<h3>数值：CPU 和 CUDA 逐点对齐</h3>
+<p>lab 的 CPU 算子和 <code>.cu</code> 遵守同一条规则：<b>在 f32 里算，每个 bf16 张量边界就近舍入一次</b>，舍入点的位置也相同（比如 RMSNorm 的 <code>round_bf(x·rstd)·w</code>）。结果是同一个 prompt 的 greedy 输出，CPU 和 CUDA 64 个 token 逐个相同 <span class="src lab">lab CPU 实测</span>。</p>
+<p>这给了你一个很强的验证手段：<b>CPU 版是 CUDA 版的活参考</b>。CPU 算子都是几十行的朴素循环，容易看对；CUDA kernel 改出问题时，用 CPU 跑同一个 prompt，两边一比就知道是不是 kernel 的锅。</p>
+
+<h2>对照表：主线每一步，CPU 要做什么</h2>
+<div class="tablewrap"><table><thead><tr><th>主线</th><th>CPU 要跟着做</th><th>在哪</th></tr></thead><tbody><tr><td>开始之前</td><td><b>建议先做</b>：并行工具 + Linear。起点的 CPU Linear 是单线程标量，一次前向要十几秒，不先做的话后面每一步验证都要等</td><td><a href="cpu-2-tools.html">C2</a>、<a href="cpu-4-kernels-math.html#linear">C4 · Linear</a></td></tr><tr><td><a href="03-all-on-gpu.html">03</a> 全图上 GPU</td><td>embedding 改成按行拷贝（可选，原来的也能跑）</td><td><a href="cpu-3-kernels-layout.html#embedding">C3 · embedding</a></td></tr><tr><td><a href="04-step-state.html">04</a> StepState</td><td>不用动。元数据缓冲在 CPU 上就是池里的一块内存</td><td>—</td></tr><tr><td><a href="05-token-major-view.html">05</a> token-major</td><td><b>必须</b>：RoPE 改成 token-major、位置读元数据</td><td><a href="cpu-3-kernels-layout.html#rope">C3 · rope</a></td></tr><tr><td><a href="06-store-kv.html">06</a> store_kv</td><td><b>必须</b>：注意力换成 slot 寻址的版本</td><td><a href="cpu-3-kernels-layout.html#attention">C3 · attention</a></td></tr><tr><td><a href="07-stream-sync.html">07</a> stream</td><td>不用动</td><td>—</td></tr><tr><td><a href="08-gather-last.html">08</a> gather_last</td><td><b>必须</b>：GatherLastImpl 的 CPU 特化</td><td><a href="cpu-3-kernels-layout.html#gather">C3 · gather_last</a></td></tr><tr><td><a href="09-gpu-sampling.html">09</a> GPU 采样</td><td><b>必须</b>：SampleImpl 的 CPU 特化（同一个算法）</td><td><a href="cpu-3-kernels-layout.html#sample">C3 · sample</a></td></tr><tr><td><a href="10-bf16x8.html">10</a> bf16x8</td><td>add / mul / silu 改成 bf16 直读直写 + 并行</td><td><a href="cpu-4-kernels-math.html#elementwise">C4 · 逐元素</a></td></tr><tr><td><a href="11-norm-rope.html">11</a> RMSNorm</td><td><b>必须</b>（否则 CPU 和 CUDA 的输出会分叉）：舍入点对齐</td><td><a href="cpu-4-kernels-math.html#norm">C4 · RMSNorm</a></td></tr><tr><td><a href="12-linear-gemv.html">12</a> Linear</td><td>前面已经做了</td><td><a href="cpu-4-kernels-math.html#linear">C4 · Linear</a></td></tr><tr><td><a href="13-flash-decoding.html">13</a>、<a href="14-fa2-prefill.html">14</a></td><td>不用动。CPU 上 decode 和 prefill 走同一条朴素路径</td><td>—</td></tr><tr><td><a href="15-kernel-test.html">15</a> kernel 对拍</td><td>CPU 算子的单测</td><td><a href="cpu-4-kernels-math.html#tests">C4 · 单测</a></td></tr><tr><td><a href="16-memory-plan.html">16</a> MemoryPlan</td><td>不用动。规划和设备无关</td><td>—</td></tr><tr><td><a href="17-cuda-graph.html">17</a> CUDA Graph</td><td>不用动。CPU 恒 eager</td><td>—</td></tr><tr><td><a href="18-block-manager.html">18</a> KV 预算</td><td><b>必须</b>：CPU 不能按“显存比例”算，给固定块数</td><td><a href="cpu-5-exec-cli.html#kv">C5 · KV</a></td></tr><tr><td><a href="19-batched-forward.html">19</a>、<a href="20-scheduling.html">20</a></td><td>不用动。批处理和调度与设备无关</td><td>—</td></tr><tr><td><a href="21-cli-load.html">21</a> CLI 与加载</td><td><code>--device</code>；权重直接 pread 进池</td><td><a href="cpu-5-exec-cli.html#load">C5 · 加载</a></td></tr><tr><td><a href="22-final-bench.html">22</a> 最终对比</td><td>CPU 的数字和 CPU / CUDA 对拍</td><td><a href="cpu-5-exec-cli.html#final">C5 · 最终</a></td></tr></tbody></table></div>
+
+<h2>改动：选设备</h2>
+<p>纯 CPU 构建（不带 <code>-Dcuda=true</code>）时设备列表里只有 CPU，什么都不用改。带 CUDA 构建时，调度器会优先把层分给 GPU；想在同一个二进制里跑 CPU，就只把 CPU 这一台设备交给它：</p>
+<div class="codeblock diff"><div class="cap"><span><b>src/llmgen.zig · run()（第 21 步换成 --device）</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">    try DeviceManager.instance().printDevices();</span><span class="ln del">    const devices = DeviceManager.instance().getDevices();</span><span class="ln del">    try graph_scheduler.schedule(devices);</span><span class="ln add">    // 一次只用一台设备跑整张图:LLMGEN_DEVICE=cpu 时只把 CPU 交给调度器</span><span class="ln add">    const all_devices = DeviceManager.instance().getDevices();</span><span class="ln add">    const want_cpu = if (std.posix.getenv(&quot;LLMGEN_DEVICE&quot;)) |d| std.ascii.eqlIgnoreCase(d, &quot;cpu&quot;) else false;</span><span class="ln add">    var picked: [1]backend.BackendInfo = undefined;</span><span class="ln add">    for (all_devices) |d| {</span><span class="ln add">        if ((d.device_type == .CPU) == want_cpu or all_devices.len == 1) {</span><span class="ln add">            picked[0] = d;</span><span class="ln add">            break;</span><span class="ln add">        }</span><span class="ln add">    }</span><span class="ln add">    try graph_scheduler.schedule(&amp;picked);</span></code></pre></div>
+<p>主线第 03 步让全局节点跟着第 0 层的设备走，所以这里只给 CPU，整张图就都在 CPU 上，没有拷贝边。</p>
+
+<h2>每一步怎么验证</h2>
+<div class="codeblock"><div class="cap"><span><b>终端</b> <span class="tag out">命令</span></span><button type="button">复制</button></div><pre><code class="language-bash"># mac 或没有 GPU 的机器:纯 CPU 构建
+zig build run -Doptimize=ReleaseFast
+
+# 3090 上:同一个二进制, 用 --device 选(第 21 步之前用环境变量 LLMGEN_DEVICE=cpu)
+./zig-out/bin/llminfer chat &quot;中国的首都是哪里？&quot; 64 --device cpu
+./zig-out/bin/llminfer chat &quot;中国的首都是哪里？&quot; 64 --device cuda</code></pre></div>
+<ul>
+  <li><b>CPU 自己跑通</b>：输出通顺，和上一步的 CPU 输出逐 token 相同（或在主线说明的“允许分叉”的步骤里前 20 个相同）。</li>
+  <li><b>CPU 对 CUDA</b>：同一个 prompt、temperature = 0，两边的 token id 逐个相同。从第 12 步起这应该严格成立；之前的步骤里 CUDA 还有旧 kernel，舍入点不同，允许近似并列处分叉。</li>
+</ul>
+<div class="callout tip"><span class="t">mac 上也能做大部分步骤</span>CPU 后端不依赖 CUDA。主线里执行层的改动（04、08、16、18–21）可以先在 mac 上用纯 CPU 构建跑通、对拍，再上 3090 验证 CUDA。</div>
+<h2>性能收益</h2>
+<h3>依据</h3>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th class="num">改前</th><th class="num">改后</th><th>来源</th></tr></thead><tbody><tr><td>lab：CPU 与 CUDA 的 greedy 输出</td><td class="num">—</td><td class="num">64 个 token 逐个相同</td><td><span class="src lab">lab CPU 实测</span></td></tr><tr><td>lab：3090 主机 CPU（Xeon E5-2682 v4，32 线程）单请求 decode</td><td class="num">—</td><td class="num">21 tok/s</td><td><span class="src lab">lab CPU 实测</span></td></tr><tr><td>lab：mac M3 Pro CPU 单请求 decode</td><td class="num">—</td><td class="num">20–29 tok/s</td><td><span class="src lab">lab CPU 实测</span></td></tr><tr><td>llmgen 早期 CPU 基线：8 次前向共</td><td class="num">139 s</td><td class="num">—</td><td><span class="src start">llmgen 早期 CPU 日志</span></td></tr></tbody></table></div>
+<h3>对 llmgen 的预期</h3>
+<p>CPU 支线不是为了让 CPU 跑得多快，是为了<b>一直能跑</b>。但做完之后速度也会差出两个数量级：</p>
+<p>llmgen 早期的 CPU 日志里，8 次前向（1 次 prefill + 7 次 decode）用了 139 秒 <span class="src start">llmgen 早期 CPU 日志</span>，其中 99.3% 在 Linear（单线程、逐元素 <code>elemF32</code>）。lab 的 CPU 后端在同类机器上是 21 tok/s。差别来自三处：多线程、SIMD、bf16 直接读（不做逐元素的 dtype 分支），都在 <a href="cpu-2-tools.html">C2</a> 和 <a href="cpu-4-kernels-math.html">C4</a>。</p>
+<p>那份早期日志不是当前起点（commit <code>91fac54</code>）量的，只说明量级。当前起点的 CPU 数字请自己量一次填在下面。</p>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>CPU 单请求 decode (tok/s)</td><td class="num fill" contenteditable="true" data-key="cpu-1-overview.html|CPU 单请求 decode (tok/s)|before"></td><td class="num fill" contenteditable="true" data-key="cpu-1-overview.html|CPU 单请求 decode (tok/s)|after"></td><td class="num gain"></td></tr><tr><td>CPU TTFT · 21 token prompt (ms)</td><td class="num fill" contenteditable="true" data-key="cpu-1-overview.html|CPU TTFT · 21 token prompt (ms)|before"></td><td class="num fill" contenteditable="true" data-key="cpu-1-overview.html|CPU TTFT · 21 token prompt (ms)|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td>带 CUDA 构建时 <code>LLMGEN_DEVICE=cpu</code> 仍然跑在 GPU 上</td><td>调度器收到的设备列表里还有 CUDA。只传 CPU 那一项。</td></tr><tr><td>CPU 上段错误，栈在某个 <code>cuda_*</code> 函数</td><td>有 Impl 或执行层代码没判断设备就调了 CUDA 接口。按“三处不同”那张表逐项查。</td></tr><tr><td>CPU 和 CUDA 的输出从第一个 token 就不同</td><td>不是舍入问题。多半是某个 CPU 算子还是旧布局（head-major）或旧接口。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li>知道主线每一步对应 CPU 支线的哪一节</li><li>纯 CPU 构建能跑 <code>chat</code></li><li>量了当前起点的 CPU 速度</li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="23-switches-debug.html"><small>← 上一步</small>附录：回退开关与排错</a><a class="next" href="cpu-2-tools.html"><small>下一步 →</small>CPU：并行与 SIMD 工具</a></div>
+</main>
+</div>
+</body>
+</html>

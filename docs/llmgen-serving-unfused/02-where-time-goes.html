@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>64 ms 去哪了 · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html" class="active"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">阶段 0 · 先能量</div>
+<h1>64 ms 去哪了</h1>
+<p class="lead">读两份账本：算子 profiler 和 nsys。先看清楚再动手。</p>
+<div class="callout goal"><span class="t">本步目标</span>弄清起点每个 token 的 64.63 ms 花在哪。这一步不改代码，只学会读两份账本：llmgen 自带的算子 profiler，和 nsys 的 CUDA API 统计。</div>
+<h2>原理</h2>
+<h3>GPU 推理的时间分三类</h3>
+<div class="diagram">
+<div class="lanes">
+  <div class="lab">host</div><div class="lane"><span class="h">填参数</span><span class="h">launch</span><span class="x">等同步</span><span class="h">launch</span><span class="x">等同步</span><span class="x">malloc</span><span class="x">小拷贝</span><span class="x">free</span><span class="h">launch</span><span class="x">等同步</span></div>
+  <div class="lab">GPU</div><div class="lane"><span class="d">kernel A</span><span class="x">空闲</span><span class="d">kernel B</span><span class="x">空闲 …</span><span class="d">kernel C</span></div>
+</div>
+<div class="cap2">起点的时间线：GPU 干一小会儿，然后等 host 发下一个命令。</div>
+</div>
+<ol>
+  <li><b>kernel 真正在算</b>：GEMV 读权重、注意力读 KV。优化手段是改 kernel（阶段 3）。</li>
+  <li><b>CUDA API 的固定开销</b>：每次 launch、malloc、free、memcpy、sync 各几微秒到几十微秒，和数据量无关。次数多了就是大头。</li>
+  <li><b>host 自己在算</b>：CPU 上的 embedding、采样、调度。</li>
+</ol>
+<p>decode 是带宽受限的：每步要把 1.2 GB 权重读一遍，3090 显存带宽约 900 GB/s，下限就是 1.3 ms 左右。目标 lab 的 ITL 2.449 ms 已经离这个下限不远。起点的 64.63 ms 里绝大部分属于第 2、3 类。</p>
+
+<h3>起点里的三处固定开销</h3>
+<p><b>第一处：每个算子后同步。</b></p>
+<div class="codeblock"><div class="cap"><span><b>src/executor.zig</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-zig">    fn executorTensor(self: *Self, tensor: *Tensor) !void {
+        if (isViewOp(tensor.op_type)) {
+            return executeView(tensor); // 内部转换处理
+        }
+
+        const device_id = self.graph_scheduler.deviceIdForLayer(tensor.layer_id) orelse 0;
+
+        try self.allocateOutput(tensor, device_id);
+
+        // 需要分析时开启，不要影响指标 metrics 评估
+        if (self.profiler.enabled) {
+            var timer = try std.time.Timer.start();
+            try dispatchKernel(tensor, @intCast(device_id));
+            if (opts.have_cuda and tensor.device_type != .CPU) {
+                // 这里目前是同步操作，所以 OpProfiler 能算准
+                cuda.CudaContext.instance().sync(); // cuda 同步操作
+            }
+            const ns = timer.read();
+            const ctx: u64 = @intCast(self.seq_pos + self.cur_tokens); // forward 期间 seq_pos 还没更新
+            self.profiler.record(
+                tensor.op_type,
+                tensor.device_type,
+                ns,
+                profiler.opCost(tensor, ctx),
+            );
+        } else {
+            try dispatchKernel(tensor, @intCast(device_id));
+            if (opts.have_cuda and tensor.device_type != .CPU) {
+                cuda.CudaContext.instance().sync(); // cuda 同步操作
+            }
+        }
+    }</code></pre></div>
+<p>每层 22 个 kernel（norm、q/k/v、3 个拆头 permute、q/k norm、q/k rope、attn、合头 permute、o、两个残差、ffn norm、gate/up、silu、mul、down），28 层共 616 个，每个后面一次 <code>cudaDeviceSynchronize</code>。</p>
+
+<p><b>第二处：写 KV 逐 token、逐头拷贝。</b></p>
+<div class="codeblock"><div class="cap"><span><b>src/memory/page_atten.zig · appendKVFromTensor</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-zig">        var seq_idx: i32 = 0;
+        while (seq_idx &lt; seq_len) : (seq_idx += 1) {
+            const global_pos = prev_cached + seq_idx;
+
+            const logical_block: usize = @intCast(@divFloor(global_pos, PAGE_BLOCK_SIZE));
+            const offset_in_block: usize = @intCast(@mod(global_pos, PAGE_BLOCK_SIZE));
+
+            const entry = layer_state.page_table.items[logical_block];
+            const nk: usize = @intCast(n_kv_heads);
+            const kv_base = offset_in_block * nk * @as(usize, @intCast(head_dim)) * elem_size;
+            const k_blk = layer_state.k_pool.blockData(entry.k_block_id);
+            const v_blk = layer_state.v_pool.blockData(entry.v_block_id);
+
+            var h: usize = 0;
+            while (h &lt; nk) : (h += 1) {
+                const src_offset = h * head_stride_bytes + @as(usize, @intCast(seq_idx)) * head_dim_bytes; // 输入 head-major
+                const dst_offset = kv_base + h * head_dim_bytes; // 块内 token-major:[token][kv_head][hd]
+
+                const device_type = self.pool.getDeviceType(); // pools.zig 里把 getDeviceType 改成 pub
+                deviceMemcpy(k_blk[dst_offset .. dst_offset + head_dim_bytes], k_data[src_offset .. src_offset + head_dim_bytes], device_type);
+                deviceMemcpy(v_blk[dst_offset .. dst_offset + head_dim_bytes], v_data[src_offset .. src_offset + head_dim_bytes], device_type);
+            }
+        }
+    }</code></pre></div>
+<p>decode 每步每层：8 个 KV 头 × (K + V) = 16 次 <code>cudaMemcpy</code>（D2D），28 层共 448 次。每次只搬 256 字节。</p>
+
+<p><b>第三处：页表每层重新上传。</b></p>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cuda/attention.cu</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">static void upload_page_table(const int32_t* h_page_k_ids, const int32_t* h_page_v_ids, int32_t num_blocks,
+                              int32_t** d_page_k_ids, int32_t** d_page_v_ids) {
+    cudaMalloc(d_page_k_ids, num_blocks * sizeof(int32_t));
+    cudaMalloc(d_page_v_ids, num_blocks * sizeof(int32_t));
+    cudaMemcpy(*d_page_k_ids, h_page_k_ids, num_blocks * sizeof(int32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(*d_page_v_ids, h_page_v_ids, num_blocks * sizeof(int32_t), cudaMemcpyHostToDevice);
+}</code></pre></div>
+<p>每层 2 次 <code>cudaMalloc</code>、2 次 H2D <code>cudaMemcpy</code>、2 次 <code>cudaFree</code>，28 层共 56 / 56 / 56 次。<code>cudaFree</code> 还会隐式等待设备空闲。</p>
+
+<h3>这些调用单次多贵</h3>
+<p>下面是 module-style（和 llmgen 起点同源的托管式实现）在同一块 3090 上的 nsys 统计 <span class="src lab">nsys 实测</span>：</p>
+<div class="codeblock"><div class="cap"><span><b>cuda-course/results-serving.txt</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="nohighlight">## nsys-style_cuda_api_sum   (module-style, 托管式: 每个算子 cudaMalloc → H2D → kernel → sync → D2H → cudaFree)
+  52.0%     1201.0 ms  n=   11088  avg=    108.3 us  cudaMemcpy
+  23.6%      545.9 ms  n=   11845  avg=     46.1 us  cudaFree
+  17.5%      405.2 ms  n=   11847  avg=     34.2 us  cudaMalloc
+   3.2%       74.2 ms  n=    5740  avg=     12.9 us  cudaLaunchKernel
+   2.7%       62.4 ms  n=    3780  avg=     16.5 us  cudaDeviceSynchronize</code></pre></div>
+<p>对比目标形态（融合版 module-serving 的 S1）<span class="src lab">nsys 实测</span>：</p>
+<div class="codeblock"><div class="cap"><span><b>cuda-course/results-serving.txt</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="nohighlight">## nsys-s1_cuda_api_sum   (融合版 module-serving, S1, CUDA Graph 开)
+  76.4%     2852.1 ms  n=    1365  avg=   2089.4 us  cudaStreamSynchronize
+  14.2%      531.6 ms  n=    1338  avg=    397.3 us  cudaGraphLaunch_v10000
+   3.0%      113.5 ms  n=     320  avg=    354.6 us  cudaMemcpy
+   1.7%       61.9 ms  n=   12562  avg=      4.9 us  cudaLaunchKernel
+   0.4%       16.4 ms  n=    2708  avg=      6.1 us  cudaMemcpyAsync</code></pre></div>
+<p>目标形态里几乎只剩 <code>cudaStreamSynchronize</code>：每步一次，host 在那里等 GPU 把活干完。这才是“GPU 一直在忙”的样子。</p>
+
+<h2>动手量一遍</h2>
+<h3><span class="stepno">1</span>算子级 profile</h3>
+<div class="codeblock"><div class="cap"><span><b>终端</b> <span class="tag out">命令</span></span><button type="button">复制</button></div><pre><code class="language-bash">LLMGEN_METRICS=1 LLMGEN_PROFILE=1 make llmgen-cuda 2&gt;&amp;1 | tee /tmp/llmgen-profile.txt</code></pre></div>
+<p>看 decode 阶段的表，关注三件事：</p>
+<ul>
+  <li>哪类算子占比最高。预期是 <code>LINEAR</code> 和 <code>PAGED_ATTN</code>。</li>
+  <li><code>PAGED_ATTN</code> 的平均耗时。它包含了 <code>appendKVFromTensor</code> 的 16 次拷贝和页表上传，kernel 本身只占一小部分。</li>
+  <li>“框架开销”一行（<code>printOverhead</code> 打的）。forward 总时间减去各算子时间之和。</li>
+</ul>
+<div class="callout warn"><span class="t">profile 模式下的吞吐不能当成绩</span><code>LLMGEN_PROFILE=1</code> 要在每个算子后同步才能量准。起点本来就每个算子同步，所以现在两种模式差不多；第 07 步之后，profile 模式会明显更慢，报吞吐一律用不带 PROFILE 的运行。</div>
+
+<h3><span class="stepno">2</span>nsys 看 CUDA API</h3>
+<div class="codeblock"><div class="cap"><span><b>终端</b> <span class="tag out">命令</span></span><button type="button">复制</button></div><pre><code class="language-bash"># nsys 在 CUDA toolkit 里(/usr/local/cuda/bin/nsys)。--trace=cuda 只抓 CUDA API 和 kernel。
+LLMGEN_MODEL=/home/deploy/qwen/qwen306b/models/Qwen3-0.6B-BF16.gguf \
+LD_LIBRARY_PATH=/usr/local/cuda/lib64 \
+nsys profile --trace=cuda -o /tmp/llmgen-start ./zig-out/bin/llminfer
+
+# 三张表:CUDA API 耗时、kernel 耗时、memcpy 耗时
+nsys stats --report cuda_api_sum --report cuda_gpu_kern_sum --report cuda_gpu_mem_time_sum /tmp/llmgen-start.nsys-rep</code></pre></div>
+<p>把你的 <code>cuda_api_sum</code> 和上面 module-style 那张表并排看。预期起点的形状介于两者之间：权重和激活已经常驻显存，所以 <code>cudaMemcpy</code> 的平均耗时会比 108 µs 小很多（搬的是 256 字节而不是整块权重），但次数仍然是每步五百多次。</p>
+
+<h3><span class="stepno">3</span>手算一遍，和实测对照</h3>
+<div class="tablewrap"><table><thead><tr><th>来源</th><th>每步次数</th><th>单次（lab 实测）</th><th class="num">估计每步</th></tr></thead><tbody><tr><td><code>cudaDeviceSynchronize</code></td><td>616</td><td>16.5 µs</td><td class="num">10.2 ms</td></tr><tr><td><code>cudaLaunchKernel</code></td><td>616</td><td>12.9 µs</td><td class="num">7.9 ms</td></tr><tr><td>页表 <code>cudaMalloc</code></td><td>56</td><td>34.2 µs</td><td class="num">1.9 ms</td></tr><tr><td>页表 <code>cudaFree</code></td><td>56</td><td>46.1 µs</td><td class="num">2.6 ms</td></tr><tr><td>CPU 采样</td><td>1</td><td>4.209 ms <span class="src start">llmgen 起点实测</span></td><td class="num">4.209 ms</td></tr></tbody></table></div>
+<p>这几项加起来约 27 ms <span class="src est">推算</span>，
+还没算 504 次小 <code>cudaMemcpy</code>（同步拷贝，每次都要等前面的 kernel 做完）、CPU 上的 embedding、以及 kernel 本身。
+单次耗时取自 module-style 的统计，llmgen 上会有出入，所以这张表只说明量级：<b>固定开销是几十毫秒，目标的整步才 2.449 ms</b>。准确数字以你的 nsys 为准。</p>
+<h2>性能收益</h2>
+<h3>依据</h3>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th class="num">改前</th><th class="num">改后</th><th>来源</th></tr></thead><tbody><tr><td>module-style（托管式）端到端</td><td class="num">1.82 tok/s</td><td class="num">—</td><td><span class="src lab">nsys 实测</span></td></tr><tr><td>llmgen 起点（权重、激活已常驻）</td><td class="num">15.5 tok/s</td><td class="num">—</td><td><span class="src start">llmgen 起点实测</span></td></tr><tr><td>融合版 module-serving S1</td><td class="num">—</td><td class="num">485 tok/s</td><td><span class="src lab">消融实测</span></td></tr><tr><td>cudaLaunchKernel 单次</td><td class="num">12.9 µs（托管式）</td><td class="num">4.0 µs（常驻 + 一条 stream）</td><td><span class="src lab">nsys 实测</span></td></tr></tbody></table></div>
+<h3>对 llmgen 的预期</h3>
+<p>这一步不改代码，没有提升。它的产出是一份账本：把 nsys 三张表存下来，阶段 1 每做完一步重新抓一次，看对应的那一行有没有消失。</p>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>cudaDeviceSynchronize 次数 / 步</td><td class="num fill" contenteditable="true" data-key="02-where-time-goes.html|cudaDeviceSynchronize 次数 / 步|before"></td><td class="num fill" contenteditable="true" data-key="02-where-time-goes.html|cudaDeviceSynchronize 次数 / 步|after"></td><td class="num gain"></td></tr><tr><td>cudaMemcpy 次数 / 步</td><td class="num fill" contenteditable="true" data-key="02-where-time-goes.html|cudaMemcpy 次数 / 步|before"></td><td class="num fill" contenteditable="true" data-key="02-where-time-goes.html|cudaMemcpy 次数 / 步|after"></td><td class="num gain"></td></tr><tr><td>cudaMalloc 次数 / 步</td><td class="num fill" contenteditable="true" data-key="02-where-time-goes.html|cudaMalloc 次数 / 步|before"></td><td class="num fill" contenteditable="true" data-key="02-where-time-goes.html|cudaMalloc 次数 / 步|after"></td><td class="num gain"></td></tr><tr><td>PAGED_ATTN 平均耗时 (µs)</td><td class="num fill" contenteditable="true" data-key="02-where-time-goes.html|PAGED_ATTN 平均耗时 (µs)|before"></td><td class="num fill" contenteditable="true" data-key="02-where-time-goes.html|PAGED_ATTN 平均耗时 (µs)|after"></td><td class="num gain"></td></tr><tr><td>LINEAR 平均耗时 (µs)</td><td class="num fill" contenteditable="true" data-key="02-where-time-goes.html|LINEAR 平均耗时 (µs)|before"></td><td class="num fill" contenteditable="true" data-key="02-where-time-goes.html|LINEAR 平均耗时 (µs)|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td><code>nsys: command not found</code></td><td>在 <code>/usr/local/cuda/bin/</code> 下，加进 PATH。没装的话 <code>apt install cuda-nsight-systems-12-6</code>（版本号跟 toolkit 走）。</td></tr><tr><td>nsys 报告里 kernel 名字一长串</td><td>模板实例化后的全名。<code>nsys stats</code> 默认截断，够认了。</td></tr><tr><td>profile 各算子之和比 forward 时间小很多</td><td>差值就是框架开销。起点里 <code>appendKVFromTensor</code> 算在 PAGED_ATTN 里，不在这个差值里。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li>存了一份 decode 阶段的算子 profile</li><li>存了 nsys 的 <code>cuda_api_sum</code> 和 <code>cuda_gpu_kern_sum</code></li><li>能说出每步有多少次 sync、memcpy、malloc，各自大约多少毫秒</li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="01-bench.html"><small>← 上一步</small>基准对齐</a><a class="next" href="03-all-on-gpu.html"><small>下一步 →</small>全图上 GPU</a></div>
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>prefill 注意力：FA2 · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html" class="active"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">阶段 3 · kernel</div>
+<h1>prefill 注意力：FA2</h1>
+<p class="lead">tensor core 上的 FlashAttention-2，直接读分页 KV。</p>
+<div class="callout goal"><span class="t">本步目标</span>读懂第 06 步换上的 prefill 注意力 kernel：FlashAttention 为什么不需要 T × T 的分数矩阵，tensor core 怎么用，K/V 怎么从分页 cache 搬进来。这一步也不改代码。</div>
+<h2>原理</h2>
+<h3>prefill 注意力是计算问题</h3>
+<p>和 decode 相反，prefill 时每条序列有 T 个 query，要算 T × T / 2 个点积。T = 512 时每层每头 13 万个 128 维点积；计算量随 T² 增长。这是 GPU 的 tensor core 该出场的地方。</p>
+
+<h3>第一层：不存分数矩阵（FlashAttention）</h3>
+<p>教科书的写法是三步：<code>S = Q·Kᵀ</code>（存下 T × T 的矩阵）→ 逐行 softmax → <code>O = P·V</code>。T = 4096、16 个头时，S 矩阵要 1 GB。</p>
+<p>FlashAttention 把 K/V 切成块，每个 query 行维护一组“运行中”的 <code>(m, l, o)</code>：每来一块 K/V，算出这一块的分数，和已有的状态合并（就是第 13 步的 online softmax），分数用完就丢。额外显存是 0。</p>
+<div class="codeblock"><div class="cap"><span><b>cuda-course/results.txt · 第 10 课：朴素 vs flash（标量）</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="nohighlight">[2][3] 性能: 16 个头, 因果
+       T      naive(us)      flash(us)       加速 naive 的 S 矩阵
+     512         2103.2          364.9         5.8x            16 MB
+  [PASS] T=512 flash vs naive           max|err| = 0.000488 (tol 0.01)
+    1024         8255.0         1219.1         6.8x            64 MB
+  [PASS] T=1024 flash vs naive          max|err| = 0.000488 (tol 0.01)
+    2048        33528.8         4463.1         7.5x           256 MB
+  [PASS] T=2048 flash vs naive          max|err| = 0.000488 (tol 0.01)
+    4096       136156.7        17326.6         7.9x          1024 MB
+  [PASS] T=4096 flash vs naive          max|err| = 0.000488 (tol 0.01)
+  naive 的 S 矩阵随 T^2 增长: T=16384 时要 16 GB; flash 版额外显存为 0 —— 这也是 plan.zig 里没有 [T,T] 激活的原因</code></pre></div>
+<p>光这一层（标量实现）就快 6–8 倍：数据留在 shared memory 和寄存器里，不用反复读写显存里的大矩阵。</p>
+
+<h3>第二层：tensor core</h3>
+<div class="codeblock"><div class="cap"><span><b>cuda-course/results.txt · 第 12 课：标量 flash vs tensor core</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="nohighlight">[2] 性能: 单序列因果 prefill, 16 个 q 头 / 8 个 kv 头
+       T 标量 flash(第10课)        tensor core FA2   加速
+    1024      1230 us   3.50 TF       153 us   28.2 TF     8.1x
+  [PASS] T=1024 tensor core vs 标量   max|err| = 0.00391 (tol 0.01)
+    2048      4476 us   3.84 TF       435 us   39.5 TF    10.3x
+  [PASS] T=2048 tensor core vs 标量   max|err| = 0.00391 (tol 0.01)
+    4096     17379 us   3.96 TF      1459 us   47.1 TF    11.9x
+  [PASS] T=4096 tensor core vs 标量   max|err| = 0.00391 (tol 0.01)
+    8192     67548 us   4.07 TF      5210 us   52.8 TF    13.0x
+  [PASS] T=8192 tensor core vs 标量   max|err| = 0.00391 (tol 0.01)
+  tensor core 版的 P 在喂给 mma 前被舍入成 bf16, 所以与 f32 标量版有 ~1e-3 级差异(flash-attn 同样如此)</code></pre></div>
+<p>再快 8–13 倍。tensor core 的指令是 <code>mma.sync.m16n8k16</code>：一个 warp 一条指令算 16×8 的输出块、内积长度 16，bf16 输入、f32 累加。</p>
+<div class="codeblock"><div class="cap"><span><b>backend/cuda/attention.cu</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">// ==================================================================
+// prefill / 混合: tensor core 版 FlashAttention-2(mma.sync m16n8k16 BF16, f32 累加)
+//
+// 一个 block = 一个 query tile(64 行) × 一个 KV 头的 G 个 query 头, 每个头 4 个 warp 各管 16 行.
+//   S = Q·K^T : Q 片段常驻寄存器(ldmatrix), K tile(64 key)经 ldmatrix 喂 mma
+//   online softmax 在 mma 累加器布局上直接做(每线程持 2 行 × 若干列, quad 内 shuffle 求行 max)
+//   O += P·V  : P 从 S 累加器原地打包成 A 片段(FA2 经典技巧), V 用 ldmatrix.trans 取 B 片段
+// shared memory 行宽补到 136 个 bf16(272B), ldmatrix 的 8 行落在不同 bank, 无冲突.
+// ==================================================================
+#define TC_BQ 64
+#define TC_BK 64
+#define SROW 136</code></pre></div>
+<div class="codeblock"><div class="cap"><span><b>backend/cuda/attention.cu · 四个指令级原语</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">__device__ __forceinline__ void ldsm_x4(uint32_t *r, const void *p) {
+    uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
+    asm volatile(&quot;ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n&quot;
+                 : &quot;=r&quot;(r[0]), &quot;=r&quot;(r[1]), &quot;=r&quot;(r[2]), &quot;=r&quot;(r[3]) : &quot;r&quot;(a));
+}
+__device__ __forceinline__ void ldsm_x4_t(uint32_t *r, const void *p) {
+    uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
+    asm volatile(&quot;ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n&quot;
+                 : &quot;=r&quot;(r[0]), &quot;=r&quot;(r[1]), &quot;=r&quot;(r[2]), &quot;=r&quot;(r[3]) : &quot;r&quot;(a));
+}
+__device__ __forceinline__ void mma_bf16(float *c, const uint32_t *a, uint32_t b0, uint32_t b1) {
+    asm volatile(&quot;mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n&quot;
+                 : &quot;+f&quot;(c[0]), &quot;+f&quot;(c[1]), &quot;+f&quot;(c[2]), &quot;+f&quot;(c[3])
+                 : &quot;r&quot;(a[0]), &quot;r&quot;(a[1]), &quot;r&quot;(a[2]), &quot;r&quot;(a[3]), &quot;r&quot;(b0), &quot;r&quot;(b1));
+}
+__device__ __forceinline__ uint32_t pack_bf2(float lo, float hi) {
+    __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+    return *reinterpret_cast&lt;uint32_t *&gt;(&amp;v);
+}
+
+__device__ __forceinline__ void cp_async16(void *smem, const void *gmem, bool valid) {
+    uint32_t a = (uint32_t)__cvta_generic_to_shared(smem);
+    int n = valid ? 16 : 0; // src-size=0 → 目标 16B 填零
+    asm volatile(&quot;cp.async.cg.shared.global [%0], [%1], 16, %2;\n&quot; ::&quot;r&quot;(a), &quot;l&quot;(gmem), &quot;r&quot;(n));
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile(&quot;cp.async.commit_group;\n&quot; ::); }
+template &lt;int N&gt;
+__device__ __forceinline__ void cp_async_wait() { asm volatile(&quot;cp.async.wait_group %0;\n&quot; ::&quot;n&quot;(N)); }</code></pre></div>
+<div class="tablewrap"><table><thead><tr><th>原语</th><th>作用</th></tr></thead><tbody><tr><td><code>ldmatrix</code></td><td>从 shared memory 按 tensor core 要的“片段”布局把矩阵读进寄存器。<code>.trans</code> 版本读的是转置</td></tr><tr><td><code>mma.sync</code></td><td>16×16 的 A 片段 × 16×8 的 B 片段，累加到 f32</td></tr><tr><td><code>cp.async</code></td><td>显存 → shared memory 的异步拷贝，不经过寄存器。发起后线程可以先干别的</td></tr></tbody></table></div>
+
+<h3>一个 block 的分工</h3>
+<ul>
+  <li>一个 block = 一个 query tile（64 行）× 一个 kv 头的 G 个 q 头。G = 2 时 8 个 warp，每个 warp 管一个头的 16 行。</li>
+  <li><b>Q 常驻寄存器</b>：开头用 <code>ldmatrix</code> 把本 warp 的 16 行 Q 读成 A 片段，整个 kernel 期间不再读。</li>
+  <li><b>K/V 双缓冲</b>：shared memory 里放两个 stage。算第 i 块时，第 i+1 块已经用 <code>cp.async</code> 在路上了，搬运和计算重叠。</li>
+  <li><b>P 原地变成 A 片段</b>：<code>S = Q·Kᵀ</code> 的累加器经过 softmax 后就是概率 P，直接打包成 bf16 的 A 片段去乘 V，不落地到内存。这是 FA2 的经典技巧。</li>
+  <li><b>因果掩码</b>：整块都在对角线上方的 warp 直接跳过（<code>kb &lt;= warp_pos_max</code> 才算），对角线上的块逐元素置 -∞。</li>
+</ul>
+<div class="codeblock"><div class="cap"><span><b>backend/cuda/attention.cu · K/V 从分页 cache 搬进 shared memory</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">    auto prefetch = [&amp;](int it, int st) {
+        const int kb = it * TC_BK;
+        bf16 *Kd = Kst(st), *Vd = Vst(st);
+        for (int i = tid; i &lt; TC_BK * 16; i += NT) {
+            int r = i &gt;&gt; 4, c = i &amp; 15, t = kb + r;
+            bool ok = t &lt; kend;
+            long base = 0;
+            if (ok) {
+                long blk = bt[t / block_size];
+                base = (blk * nkv + kvh) * head_stride + (long)(t % block_size) * HD;
+            }
+            cp_async16(Kd + r * SROW + c * 8, kc + base + c * 8, ok);
+            cp_async16(Vd + r * SROW + c * 8, vc + base + c * 8, ok);
+        }
+    };</code></pre></div>
+<p>这段是它和普通 FlashAttention 的区别：K/V 不是连续数组，而是经块表 <code>bt[t / block_size]</code> 从分页 cache 里一行一行搬。越界的行用 <code>cp.async</code> 的 src-size = 0 填零。</p>
+<div class="codeblock"><div class="cap"><span><b>backend/cuda/attention.cu · 主循环</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">    for (int it = 0; it &lt; n_tiles; ++it) {
+        if (it + 1 &lt; n_tiles) prefetch(it + 1, (it + 1) &amp; 1);
+        cp_async_commit();
+        cp_async_wait&lt;1&gt;();
+        __syncthreads();
+        const int kb = it * TC_BK;
+        const bf16 *Ks = Kst(it &amp; 1), *Vs = Vst(it &amp; 1);
+
+        if (kb &lt;= warp_pos_max) { // 整块都在对角线之上的 warp 跳过(因果)
+            float sc[8][4];
+#pragma unroll
+            for (int i = 0; i &lt; 8; ++i)
+#pragma unroll
+                for (int e = 0; e &lt; 4; ++e) sc[i][e] = 0.f;
+#pragma unroll
+            for (int j = 0; j &lt; 8; ++j) {
+#pragma unroll
+                for (int np = 0; np &lt; 4; ++np) {
+                    uint32_t kb4[4];
+                    ldsm_x4(kb4, Ks + (np * 16 + (lane &amp; 7) + ((lane &gt;&gt; 4) &lt;&lt; 3)) * SROW + j * 16 + ((lane &gt;&gt; 3) &amp; 1) * 8);
+                    mma_bf16(sc[2 * np], qa[j], kb4[0], kb4[1]);
+                    mma_bf16(sc[2 * np + 1], qa[j], kb4[2], kb4[3]);
+                }
+            }
+            float mx0 = -INFINITY, mx1 = -INFINITY;
+#pragma unroll
+            for (int nt = 0; nt &lt; 8; ++nt) {
+#pragma unroll
+                for (int e = 0; e &lt; 4; ++e) {
+                    int key = kb + nt * 8 + (lane &amp; 3) * 2 + (e &amp; 1);
+                    bool ok = (e &lt; 2) ? (v0 &amp;&amp; key &lt;= pos0) : (v1 &amp;&amp; key &lt;= pos1);
+                    float v = ok ? sc[nt][e] * sl2 : -INFINITY;
+                    sc[nt][e] = v;
+                    if (e &lt; 2) mx0 = fmaxf(mx0, v); else mx1 = fmaxf(mx1, v);
+                }
+            }
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+            mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
+            mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+            const float mn0 = fmaxf(m0, mx0), mn1 = fmaxf(m1, mx1);
+            const float r0 = (mn0 == -INFINITY) ? 0.f : mn0, r1 = (mn1 == -INFINITY) ? 0.f : mn1;
+            const float c0 = exp2f(m0 - r0), c1 = exp2f(m1 - r1);
+            float ls0 = 0.f, ls1 = 0.f;
+#pragma unroll
+            for (int nt = 0; nt &lt; 8; ++nt) {
+                sc[nt][0] = exp2f(sc[nt][0] - r0);
+                sc[nt][1] = exp2f(sc[nt][1] - r0);
+                sc[nt][2] = exp2f(sc[nt][2] - r1);
+                sc[nt][3] = exp2f(sc[nt][3] - r1);
+                ls0 += sc[nt][0] + sc[nt][1];
+                ls1 += sc[nt][2] + sc[nt][3];
+            }
+            l0 = l0 * c0 + ls0; // 各线程只累加自己那几列, 结尾再 quad 内求和(c 对整行一致, 可交换)
+            l1 = l1 * c1 + ls1;
+#pragma unroll
+            for (int i = 0; i &lt; 16; ++i) {
+                o[i][0] *= c0;
+                o[i][1] *= c0;
+                o[i][2] *= c1;
+                o[i][3] *= c1;
+            }
+            m0 = mn0;
+            m1 = mn1;
+#pragma unroll
+            for (int j2 = 0; j2 &lt; 4; ++j2) {
+                uint32_t pa[4] = {pack_bf2(sc[2 * j2][0], sc[2 * j2][1]), pack_bf2(sc[2 * j2][2], sc[2 * j2][3]),
+                                  pack_bf2(sc[2 * j2 + 1][0], sc[2 * j2 + 1][1]), pack_bf2(sc[2 * j2 + 1][2], sc[2 * j2 + 1][3])};
+#pragma unroll
+                for (int dp = 0; dp &lt; 8; ++dp) {
+                    uint32_t vb[4];
+                    ldsm_x4_t(vb, Vs + (j2 * 16 + (lane &amp; 7) + ((lane &gt;&gt; 3) &amp; 1) * 8) * SROW + dp * 16 + (lane &gt;&gt; 4) * 8);
+                    mma_bf16(o[2 * dp], pa, vb[0], vb[1]);
+                    mma_bf16(o[2 * dp + 1], pa, vb[2], vb[3]);
+                }
+            }
+        }
+        __syncthreads(); // 本 stage 读完, 下一轮的 prefetch 才能覆盖它
+    }</code></pre></div>
+
+<h3>它同时支持三种情况</h3>
+<div class="codeblock"><div class="cap"><span><b>cuda-course/results.txt · 第 12 课</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="nohighlight">[1] 正确性: 3 条序列混批 —— (ctx=130, q=130) 普通 prefill / (ctx=200, q=50) 前 150 个已缓存 / (ctx=90, q=1) decode 行
+  query tile 数 = 5 (每条序列按 64 行切分), grid = (5, 8 kv 头)
+  [PASS] tensor core FA2 vs CPU         max|err| = 0.00312 (tol 0.01)</code></pre></div>
+<p>kernel 读的 K/V 来自 cache（本步的 k/v 已经由 <code>store_kv</code> 先写进去了），每个 tile 知道自己属于哪条序列、从第几个 query 开始、这条序列的上下文多长。所以：</p>
+<ul>
+  <li><b>普通 prefill</b>：ctx = q_len。</li>
+  <li><b>chunked prefill</b>：ctx &gt; q_len，前面的 token 已经在 cache 里。第 20 步的调度策略靠这个。</li>
+  <li><b>混批里的 decode 行</b>：q_len = 1。prefill 和 decode 混在同一步时，全部走这个 kernel。</li>
+</ul>
+<p>这就是元数据里 <code>cu_q</code>、<code>tile_seq</code>、<code>tile_q0</code> 三个数组的用途（第 04 步）。</p>
+
+<h2>量一遍</h2>
+<p>prefill 注意力没有回退开关（没有标量版可以切回去）。直接看 S1 的 TTFT 和 profile 里 prefill 阶段 PAGED_ATTN 的耗时。</p>
+<h2>CPU 同步</h2>
+<div class="callout cpu"><span class="t">这一步 CPU 后端要做的事</span><b>不用动。</b>CPU 上没有 tensor core。prefill 注意力是 O(T²) 的在线 softmax 循环，长 prompt 会慢，这是 CPU 后端的已知短板。 <a href="cpu-3-kernels-layout.html#attention">去看 →</a></div>
+<h2>性能收益</h2>
+<h3>依据</h3>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th class="num">改前</th><th class="num">改后</th><th>来源</th></tr></thead><tbody><tr><td>朴素（存 S 矩阵）→ 标量 flash，T = 512</td><td class="num">2103.2 µs</td><td class="num">364.9 µs</td><td><span class="src lab">lab 实测</span></td></tr><tr><td>标量 flash → tensor core FA2，T = 1024</td><td class="num">1230 µs</td><td class="num">153 µs</td><td><span class="src lab">lab 实测</span></td></tr><tr><td>标量 flash → tensor core FA2，T = 4096</td><td class="num">17379 µs</td><td class="num">1459 µs</td><td><span class="src lab">lab 实测</span></td></tr><tr><td>融合版 S1 的 attn_prefill_tc_kernel（T = 512）</td><td class="num">—</td><td class="num">45.3 µs / 次</td><td><span class="src lab">nsys 实测</span></td></tr><tr><td>目标 lab 的 S1 TTFT（ms）</td><td class="num">—</td><td class="num">13.47</td><td><span class="src lab">lab 实测</span></td></tr><tr><td>llmgen 起点的 TTFT（21 token prompt，ms）</td><td class="num">423.39</td><td class="num">—</td><td><span class="src start">llmgen 起点实测</span></td></tr></tbody></table></div>
+<h3>对 llmgen 的预期</h3>
+<p>512 token 的 prefill，注意力 kernel 每层 45.3 µs，28 层共 1.3 ms。目标 lab 的 TTFT 13.47 ms 里，注意力只占一成，其余是 GEMM（7 个 Linear × 28 层，每个 512 行）。</p>
+<p>起点的 kernel 是“一个 warp 一个 query，逐 token 标量点积”，对应上表“朴素”和“标量 flash”之间的水平。按 T = 512 时标量 flash 365 µs 对 tensor core 约 45 µs 估，每层省 0.3 ms，28 层省约 9 ms <span class="src est">推算</span>。</p>
+<p>阶段 3 结束时 S1 的 TTFT 应该降到 20 ms 以内。和 13.47 ms 的差距主要是 prefill 步的 launch 开销，不大。</p>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>S1 TTFT mean (ms)</td><td class="num fill" contenteditable="true" data-key="14-fa2-prefill.html|S1 TTFT mean (ms)|before"></td><td class="num fill" contenteditable="true" data-key="14-fa2-prefill.html|S1 TTFT mean (ms)|after"></td><td class="num gain"></td></tr><tr><td>PAGED_ATTN 平均耗时 · prefill (µs)</td><td class="num fill" contenteditable="true" data-key="14-fa2-prefill.html|PAGED_ATTN 平均耗时 · prefill (µs)|before"></td><td class="num fill" contenteditable="true" data-key="14-fa2-prefill.html|PAGED_ATTN 平均耗时 · prefill (µs)|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td>prefill 后第一个 token 错，decode 正常</td><td>多半是 tile 元数据：<code>n_tiles</code> 要等于 <code>Σ ceil(q_len / 64)</code>，<code>tile_q0</code> 是 tile 在<b>序列内</b>的起始 query 序号（0, 64, 128, …）。</td></tr><tr><td><code>attn_prefill: GQA 组 … 过大</code></td><td>kernel 只支持 G = 1 / 2。</td></tr><tr><td>编译 .cu 时报 <code>mma</code> / <code>ldmatrix</code> 指令不认识</td><td><code>-arch</code> 要 sm_80 以上。llmgen 的 <code>build.zig</code> 默认 sm_86，没问题。</td></tr><tr><td>prompt 很短（&lt; 16 token）时结果错</td><td>不应该：越界的 query 行用 valid 标志屏蔽。检查 <code>cu_q</code> 是不是前缀和（<code>cu_q[0] = 0</code>，<code>cu_q[1] = q_len</code>）。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li>能说清 online softmax 怎么让分数矩阵不落地</li><li>能说清 K/V 双缓冲在省什么</li><li>记下了 S1 的 TTFT 和 prefill 阶段 PAGED_ATTN 的耗时</li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="13-flash-decoding.html"><small>← 上一步</small>decode 注意力：split-K</a><a class="next" href="15-kernel-test.html"><small>下一步 →</small>kernel 对拍</a></div>
+</main>
+</div>
+</body>
+</html>

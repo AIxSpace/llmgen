@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kernel 对拍 · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html" class="active"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">阶段 3 · kernel</div>
+<h1>kernel 对拍</h1>
+<p class="lead">每个 kernel 对一个朴素的 CPU 参考。</p>
+<div class="callout goal"><span class="t">本步目标</span>给阶段 1–3 换上的每个 kernel 配一个对拍测试：随机输入，GPU 的结果和 CPU 上的 f32 参考逐元素比。之后再改 kernel，先过这一关。</div>
+<h2>原理</h2>
+<h3>为什么端到端对拍不够</h3>
+<p>greedy 输出相同是个很强的信号，但它有盲区：</p>
+<ul>
+  <li><b>覆盖不到的路径</b>。一条短 prompt 只走 M = 1 的 GEMV 和几十 token 的 prefill；M = 3 的 cuBLAS 路、跨多个块的注意力、G ≠ 2 的 GQA 都没碰到。</li>
+  <li><b>错了不知道错在哪</b>。输出不对时，五百个 kernel 里是哪一个？</li>
+  <li><b>允许分叉之后就失效了</b>。第 06、11、12 步都说“近似并列处允许不同”，这句话没法自动验证。</li>
+</ul>
+<p>单算子对拍补上这三点：每个 kernel 单独喂随机数据，和一个朴素、明显正确的 CPU 实现比，容差按 bf16 的精度给。</p>
+
+<h3>llmgen 现有的测试需要重写</h3>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cuda/tests.zig（现有的测试）</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="nohighlight">test &quot;MemcpyImpl&lt;CUDA&gt;:CPU → CUDA → CPU 往返&quot;
+test &quot;LinearImpl&lt;CUDA&gt; 与 CPU 对拍(bf16 x · bf16 W)&quot;
+test &quot;RmsNormImpl&lt;CUDA&gt; 与 CPU 对拍(bf16 x, f32 gain;两种形状)&quot;
+test &quot;Add / Mul / SiLU / Softmax &lt;CUDA&gt; 与 CPU 对拍(bf16)&quot;
+test &quot;Permute {0,2,1,3} / ApplyRope &lt;CUDA&gt; 与 CPU 对拍(bf16)&quot;</code></pre></div>
+<p>它们是“CUDA 特化对 CPU 特化”：同一个 <code>Tensor</code>，分别走 <code>XxxImpl(.CPU)</code> 和 <code>XxxImpl(.CUDA)</code>。阶段 1–3 之后这套办法不成立了：CPU 特化还是 head-major 和旧舍入点，CUDA 特化依赖 <code>g_step</code>，Permute 和 Softmax 的 kernel 已经不在图里。</p>
+<p>lab 的做法更直接：<b>绕过 Impl，直接调 C 接口</b>（<code>cu.cuda_linear</code> 等），参考实现就写在测试文件里，不依赖 CPU 后端。</p>
+
+<h2>改动</h2>
+<h3><span class="stepno">1</span>辅助函数</h3>
+<div class="codeblock"><div class="cap"><span><b>kernel_test.zig · 辅助函数</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">fn toBf16(x: f32) u16 {
+    const b: u32 = @bitCast(x);
+    return @intCast((b + 0x7fff + ((b &gt;&gt; 16) &amp; 1)) &gt;&gt; 16); // 就近舍入
+}
+fn fromBf16(h: u16) f32 {
+    return @bitCast(@as(u32, h) &lt;&lt; 16);
+}
+
+fn randBf16(alloc: std.mem.Allocator, rng: std.Random, n: usize, scale: f32) ![]u16 {
+    const v = try alloc.alloc(u16, n);
+    for (v) |*e| e.* = toBf16((rng.float(f32) * 2 - 1) * scale);
+    return v;
+}
+
+fn upload(data: anytype) !*anyopaque {
+    const bytes = std.mem.sliceAsBytes(data);
+    const p = cu.cuda_malloc(bytes.len) orelse return error.OutOfDeviceMemory;
+    cu.cuda_h2d(p, bytes.ptr, bytes.len);
+    return p;
+}
+
+fn download(comptime T: type, alloc: std.mem.Allocator, dev: *anyopaque, n: usize) ![]T {
+    const out = try alloc.alloc(T, n);
+    cu.cuda_sync();
+    const host: [*]u8 = @ptrCast(cu.cuda_host_alloc(n * @sizeOf(T)) orelse return error.PinnedAllocFailed);
+    defer cu.cuda_host_free(host);
+    cu.cuda_d2h_async(host, dev, n * @sizeOf(T));
+    cu.cuda_sync();
+    @memcpy(std.mem.sliceAsBytes(out), host[0 .. n * @sizeOf(T)]);
+    return out;
+}</code></pre></div>
+
+<h3><span class="stepno">2</span>GEMM：两条路都要测</h3>
+<div class="codeblock"><div class="cap"><span><b>kernel_test.zig · GEMM</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">test &quot;GEMM: GEMV(小 M) 与 cuBLAS 两条路都对上 CPU 参考&quot; {
+    try testing.expectEqual(@as(c_int, 0), cu.cuda_init(32 &lt;&lt; 20));
+    const a = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(1);
+    const rng = prng.random();
+    const N = 384;
+    const K = 512;
+    for ([_]usize{ 1, 2, 3, 4, 8, 33 }) |M| {
+        const x = try randBf16(a, rng, M * K, 1);
+        defer a.free(x);
+        const w = try randBf16(a, rng, N * K, 0.1);
+        defer a.free(w);
+        const dx = try upload(x);
+        defer cu.cuda_free(dx);
+        const dw = try upload(w);
+        defer cu.cuda_free(dw);
+        const dy = cu.cuda_malloc(M * N * 4).?;
+        defer cu.cuda_free(dy);
+        cu.cuda_linear(dy, 1, dx, dw, @intCast(M), N, K);
+        const y = try download(f32, a, dy, M * N);
+        defer a.free(y);
+        for (0..M) |m| for (0..N) |n| {
+            var ref: f32 = 0;
+            for (0..K) |k| ref += fromBf16(x[m * K + k]) * fromBf16(w[n * K + k]);
+            try testing.expectApproxEqAbs(ref, y[m * N + n], 1e-2);
+        };
+    }
+}</code></pre></div>
+<p>M 取 1, 2, 3, 4, 8, 33：前两个走 GEMV，后面走 cuBLAS。N = 384、K = 512 故意选得不是 2 的幂的倍数关系，能暴露行主 / 列主搞反的错误。</p>
+
+<h3><span class="stepno">3</span>注意力：分页 + GQA + 因果</h3>
+<div class="codeblock"><div class="cap"><span><b>kernel_test.zig · 注意力的 CPU 参考</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">/// CPU 参考: 分页 KV([blocks, nkv, bs, 128]) 上的因果 GQA 注意力, 一条序列.
+fn refAttention(q: []const u16, kc: []const u16, vc: []const u16, bt: []const i32, nq: usize, nkv: usize, bs: usize, q_len: usize, ctx: usize, out: []f32) void {
+    const hd = 128;
+    const G = nq / nkv;
+    const scale = 1.0 / @sqrt(@as(f32, hd));
+    var scores: [4096]f32 = undefined;
+    for (0..q_len) |i| {
+        const pos = ctx - q_len + i;
+        for (0..nq) |h| {
+            const kvh = h / G;
+            var mx: f32 = -std.math.inf(f32);
+            for (0..pos + 1) |t| {
+                const base = ((@as(usize, @intCast(bt[t / bs])) * nkv + kvh) * bs + t % bs) * hd;
+                var d: f32 = 0;
+                for (0..hd) |e| d += fromBf16(q[(i * nq + h) * hd + e]) * fromBf16(kc[base + e]);
+                scores[t] = d * scale;
+                mx = @max(mx, scores[t]);
+            }
+            var sum: f32 = 0;
+            for (0..pos + 1) |t| {
+                scores[t] = @exp(scores[t] - mx);
+                sum += scores[t];
+            }
+            for (0..hd) |e| {
+                var acc: f32 = 0;
+                for (0..pos + 1) |t| {
+                    const base = ((@as(usize, @intCast(bt[t / bs])) * nkv + kvh) * bs + t % bs) * hd;
+                    acc += scores[t] * fromBf16(vc[base + e]);
+                }
+                out[(i * nq + h) * hd + e] = acc / sum;
+            }
+        }
+    }
+}</code></pre></div>
+<div class="codeblock"><div class="cap"><span><b>kernel_test.zig · 注意力</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">test &quot;注意力: decode(split-K) 与 tensor core prefill 都对上 CPU 参考(分页 + GQA + 因果)&quot; {
+    try testing.expectEqual(@as(c_int, 0), cu.cuda_init(32 &lt;&lt; 20));
+    const a = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(7);
+    const rng = prng.random();
+    const nq = 4;
+    const nkv = 2;
+    const hd = 128;
+    const bs = 16;
+    const n_blocks = 32;
+    const ctx = 150; // 跨多个块且不对齐 16 / 64
+    const max_blocks = 16;
+    const kc = try randBf16(a, rng, n_blocks * nkv * bs * hd, 1);
+    defer a.free(kc);
+    const vc = try randBf16(a, rng, n_blocks * nkv * bs * hd, 1);
+    defer a.free(vc);
+    // 打乱的块表: 验证分页寻址
+    var bt = [_]i32{0} ** max_blocks;
+    for (0..max_blocks) |i| bt[i] = @intCast((i * 7 + 3) % n_blocks);
+    const dk = try upload(kc);
+    defer cu.cuda_free(dk);
+    const dv = try upload(vc);
+    defer cu.cuda_free(dv);
+    const dbt = try upload(@as([]const i32, &amp;bt));
+    defer cu.cuda_free(dbt);
+    const ctx_arr = [_]i32{ctx};
+    const dctx = try upload(@as([]const i32, &amp;ctx_arr));
+    defer cu.cuda_free(dctx);
+
+    // ---- prefill: 最后 q_len 个位置作为本步 query(模拟 chunked prefill 的后半段) ----
+    const q_len = 100;
+    const q = try randBf16(a, rng, q_len * nq * hd, 1);
+    defer a.free(q);
+    const ref = try a.alloc(f32, q_len * nq * hd);
+    defer a.free(ref);
+    refAttention(q, kc, vc, &amp;bt, nq, nkv, bs, q_len, ctx, ref);
+
+    const dq = try upload(q);
+    defer cu.cuda_free(dq);
+    const dout = cu.cuda_malloc(q_len * nq * hd * 2).?;
+    defer cu.cuda_free(dout);
+    const tile: usize = @intCast(cu.cuda_attn_prefill_tile());
+    var tseq: [8]i32 = undefined;
+    var tq0: [8]i32 = undefined;
+    var nt: usize = 0;
+    var q0: usize = 0;
+    while (q0 &lt; q_len) : (q0 += tile) {
+        tseq[nt] = 0;
+        tq0[nt] = @intCast(q0);
+        nt += 1;
+    }
+    const cuq = [_]i32{ 0, q_len };
+    const dcuq = try upload(@as([]const i32, &amp;cuq));
+    defer cu.cuda_free(dcuq);
+    const dts = try upload(@as([]const i32, tseq[0..nt]));
+    defer cu.cuda_free(dts);
+    const dtq = try upload(@as([]const i32, tq0[0..nt]));
+    defer cu.cuda_free(dtq);
+    cu.cuda_attn_prefill(dout, dq, dk, dv, dbt, dctx, dcuq, dts, dtq, @intCast(nt), nq, nkv, hd, max_blocks, bs, 1.0 / @sqrt(@as(f32, hd)));
+    try cu.check(&quot;attn_prefill&quot;);
+    const got = try download(u16, a, dout, q_len * nq * hd);
+    defer a.free(got);
+    for (ref, got) |r, g| try testing.expectApproxEqAbs(r, fromBf16(g), 2e-2);
+
+    // ---- decode: 只取最后一个位置, 用不同 part_size 覆盖 split-K 合并 ----
+    for ([_]c_int{ 64, 128, 512 }) |ps| {
+        const dq1 = try upload(q[(q_len - 1) * nq * hd ..]);
+        defer cu.cuda_free(dq1);
+        const d1 = cu.cuda_malloc(nq * hd * 2).?;
+        defer cu.cuda_free(d1);
+        const max_parts = @divTrunc(4096 + ps - 1, ps);
+        const po = cu.cuda_malloc(@intCast(nq * max_parts * hd * 4)).?;
+        defer cu.cuda_free(po);
+        const pml = cu.cuda_malloc(@intCast(nq * max_parts * 2 * 4)).?;
+        defer cu.cuda_free(pml);
+        cu.cuda_attn_decode(d1, dq1, dk, dv, dbt, dctx, 1, nq, nkv, hd, max_blocks, bs, 1.0 / @sqrt(@as(f32, hd)), po, pml, ps, max_parts);
+        try cu.check(&quot;attn_decode&quot;);
+        const g1 = try download(u16, a, d1, nq * hd);
+        defer a.free(g1);
+        for (ref[(q_len - 1) * nq * hd ..], g1) |r, g| try testing.expectApproxEqAbs(r, fromBf16(g), 2e-2);
+    }
+}</code></pre></div>
+<p>参考实现三重循环，慢但一眼能看出是对的。测试里块表是<b>打乱</b>的（逻辑块 0 不在物理块 0），专门抓“碰巧块号等于逻辑序号”的错误。</p>
+
+<h3><span class="stepno">4</span>细粒度算子</h3>
+<div class="codeblock"><div class="cap"><span><b>kernel_test.zig · 细粒度算子</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">test &quot;细粒度算子: add / mul / silu / rmsnorm(hidden 与每头) / rope / store_kv 对上 CPU 参考&quot; {
+    try testing.expectEqual(@as(c_int, 0), cu.cuda_init(32 &lt;&lt; 20));
+    const a = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(7);
+    const rng = prng.random();
+    const T = 5;
+    const H = 1024;
+    const nkv = 8;
+    const hd = 128;
+    const bs = 16;
+    const n = T * H;
+
+    const x = try randBf16(a, rng, n, 2);
+    defer a.free(x);
+    const y = try randBf16(a, rng, n, 2);
+    defer a.free(y);
+    const w = try a.alloc(f32, H);
+    defer a.free(w);
+    for (w) |*e| e.* = 0.5 + rng.float(f32);
+    const dx = try upload(x);
+    defer cu.cuda_free(dx);
+    const dy = try upload(y);
+    defer cu.cuda_free(dy);
+    const dw = try upload(w);
+    defer cu.cuda_free(dw);
+    const dout = cu.cuda_malloc(n * 2).?;
+    defer cu.cuda_free(dout);
+
+    // 逐元素: 结果 bf16 舍入 → 与 CPU f32 结果差在 bf16 末位以内
+    inline for (.{ &quot;add&quot;, &quot;mul&quot;, &quot;silu&quot; }) |op| {
+        if (comptime std.mem.eql(u8, op, &quot;add&quot;)) cu.cuda_add(dout, dx, dy, n);
+        if (comptime std.mem.eql(u8, op, &quot;mul&quot;)) cu.cuda_mul(dout, dx, dy, n);
+        if (comptime std.mem.eql(u8, op, &quot;silu&quot;)) cu.cuda_silu(dout, dx, n);
+        const g = try download(u16, a, dout, n);
+        defer a.free(g);
+        for (x, y, g) |xa, yb, gv| {
+            const fa = fromBf16(xa);
+            const fb = fromBf16(yb);
+            const want: f32 = if (comptime std.mem.eql(u8, op, &quot;add&quot;)) fa + fb else if (comptime std.mem.eql(u8, op, &quot;mul&quot;)) fa * fb else fa / (1 + @exp(-fa));
+            try testing.expectApproxEqAbs(want, fromBf16(gv), 1e-2 * @max(1, @abs(want)));
+        }
+    }
+
+    // rmsnorm: 行宽 hidden(block 一行)与 head_dim(warp 一行, 行数 = T·H/128)两条路
+    for ([_]usize{ H, hd }) |D| {
+        const rows = n / D;
+        cu.cuda_rmsnorm(dout, dx, dw, @intCast(rows), @intCast(D), 1e-6);
+        const g = try download(u16, a, dout, n);
+        defer a.free(g);
+        for (0..rows) |r| {
+            var ss: f32 = 0;
+            for (x[r * D ..][0..D]) |e| ss += fromBf16(e) * fromBf16(e);
+            const rstd = 1 / @sqrt(ss / @as(f32, @floatFromInt(D)) + 1e-6);
+            for (0..D) |i| {
+                const want = fromBf16(x[r * D + i]) * rstd * w[i];
+                try testing.expectApproxEqAbs(want, fromBf16(g[r * D + i]), 2e-2 * @max(1, @abs(want)));
+            }
+        }
+    }
+
+    // rope: x 看成 [T, H/128 头, 128], NEOX 配对 (i, i+64)
+    const nh = H / hd;
+    const cs = try a.alloc(f32, 64 * hd);
+    defer a.free(cs);
+    for (0..64) |p| for (0..hd / 2) |i| {
+        const ang = @as(f32, @floatFromInt(p)) / std.math.pow(f32, 10000, @as(f32, @floatFromInt(2 * i)) / hd);
+        cs[p * hd + i] = @cos(ang);
+        cs[p * hd + hd / 2 + i] = @sin(ang);
+    };
+    const pos = [_]i32{ 3, 17, 0, 42, 9 };
+    const dcs = try upload(cs);
+    defer cu.cuda_free(dcs);
+    const dpos = try upload(&amp;pos);
+    defer cu.cuda_free(dpos);
+    cu.cuda_rope(dout, dx, dcs, dpos, T, nh, hd);
+    {
+        const g = try download(u16, a, dout, n);
+        defer a.free(g);
+        for (0..T) |t| for (0..nh) |h| for (0..hd / 2) |i| {
+            const base = (t * nh + h) * hd;
+            const p: usize = @intCast(pos[t]);
+            const c = cs[p * hd + i];
+            const sn = cs[p * hd + hd / 2 + i];
+            const xa = fromBf16(x[base + i]);
+            const xb = fromBf16(x[base + i + hd / 2]);
+            try testing.expectApproxEqAbs(xa * c - xb * sn, fromBf16(g[base + i]), 2e-2);
+            try testing.expectApproxEqAbs(xb * c + xa * sn, fromBf16(g[base + i + hd / 2]), 2e-2);
+        };
+    }
+
+    // store_kv: k/v[T, nkv, 128] → cache 块内 [kv_head][slot][hd]; slot &lt; 0 不写(逐位拷贝)
+    const slots = [_]i32{ 3, 17, -1, 42, 9 };
+    const dslots = try upload(&amp;slots);
+    defer cu.cuda_free(dslots);
+    const kv_n = 4 * nkv * bs * hd; // 4 块
+    const zeros = try a.alloc(u16, kv_n);
+    defer a.free(zeros);
+    @memset(zeros, 0);
+    const dkc = try upload(zeros);
+    defer cu.cuda_free(dkc);
+    const dvc = try upload(zeros);
+    defer cu.cuda_free(dvc);
+    cu.cuda_store_kv(dx, dy, dslots, dkc, dvc, T, nkv, hd, bs);
+    const kc = try download(u16, a, dkc, kv_n);
+    defer a.free(kc);
+    const vc = try download(u16, a, dvc, kv_n);
+    defer a.free(vc);
+    var written: usize = 0;
+    for (0..T) |t| {
+        if (slots[t] &lt; 0) continue;
+        const slot: usize = @intCast(slots[t]);
+        const blk = slot / bs;
+        const off = slot % bs;
+        for (0..nkv) |h| {
+            const dst = ((blk * nkv + h) * bs + off) * hd;
+            const src = (t * nkv + h) * hd;
+            try testing.expectEqualSlices(u16, x[src..][0..hd], kc[dst..][0..hd]);
+            try testing.expectEqualSlices(u16, y[src..][0..hd], vc[dst..][0..hd]);
+            written += hd;
+        }
+    }
+    var nonzero: usize = 0;
+    for (kc) |e| {
+        if (e != 0) nonzero += 1;
+    }
+    try testing.expect(nonzero &lt;= written); // slot=-1 的行没写
+}</code></pre></div>
+
+<h3><span class="stepno">5</span>移植到 llmgen</h3>
+<p>把 lab 的 <code>kernel_test.zig</code> 整个拷到 <code>src/backend/cuda/kernel_test.zig</code>，改这几处：</p>
+<div class="codeblock diff"><div class="cap"><span><b>移植时要改的几处</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln del">const cu = @import(&quot;backend/cuda/cuda.zig&quot;);</span><span class="ln add">const cu = @import(&quot;cuda.zig&quot;); // 文件放在 src/backend/cuda/kernel_test.zig</span><span class="ln ctx">...</span><span class="ln del">    try testing.expectEqual(@as(c_int, 0), cu.cuda_init(32 &lt;&lt; 20));</span><span class="ln add">    _ = cu.CudaContext.instance(); // llmgen 的 cuda_init 没有参数, 由单例懒初始化</span><span class="ln ctx">...</span><span class="ln ctx">// 细粒度算子测试里的 rope:lab 是一张表, 每行 [cos(hd/2) | sin(hd/2)];llmgen 是两张表, 各 [位置, hd], 只用前半</span><span class="ln del">    const cs = try a.alloc(f32, 64 * hd);</span><span class="ln add">    const cos_t = try a.alloc(f32, 64 * hd); // sin_t 同样分配、同样 defer free</span><span class="ln ctx">...</span><span class="ln del">        cs[p * hd + i] = @cos(ang);</span><span class="ln del">        cs[p * hd + hd / 2 + i] = @sin(ang);</span><span class="ln add">        cos_t[p * hd + i] = @cos(ang);</span><span class="ln add">        sin_t[p * hd + i] = @sin(ang);</span><span class="ln ctx">...</span><span class="ln del">    const dcs = try upload(cs);</span><span class="ln del">    cu.cuda_rope(dout, dx, dcs, dpos, T, nh, hd);</span><span class="ln add">    const dcos = try upload(cos_t); // dsin 同理</span><span class="ln add">    cu.cuda_rope(dout, dx, dcos, dsin, dpos, T, nh, hd);</span><span class="ln ctx">...</span><span class="ln del">            const c = cs[p * hd + i];</span><span class="ln del">            const sn = cs[p * hd + hd / 2 + i];</span><span class="ln add">            const c = cos_t[p * hd + i];</span><span class="ln add">            const sn = sin_t[p * hd + i];</span><span class="ln ctx"> </span><span class="ln ctx">// ---- src/llmgen.zig 的 test 块 ----</span><span class="ln ctx">    if (opts.have_cuda) {</span><span class="ln del">        _ = @import(&quot;backend/cuda/tests.zig&quot;);</span><span class="ln add">        _ = @import(&quot;backend/cuda/kernel_test.zig&quot;);</span><span class="ln ctx">    }</span></code></pre></div>
+<p>旧的 <code>tests.zig</code> 可以删掉（里面的 <code>DevTensor</code> 没人用了）。</p>
+
+<h2>对拍验证</h2>
+<div class="codeblock"><div class="cap"><span><b>终端</b> <span class="tag out">命令</span></span><button type="button">复制</button></div><pre><code class="language-bash">make llmgen-cuda-test</code></pre></div>
+<p>三个 test 全过。任何一个不过，先别往下走：阶段 4 的 CUDA Graph 会把一步里的所有 kernel 录成一个整体，到时候更难定位。</p>
+<h2>CPU 同步</h2>
+<div class="callout cpu"><span class="t">这一步 CPU 后端要做的事</span><b>加一组 CPU 单测。</b>本页的 <code>kernel_test.zig</code> 只在 <code>-Dcuda</code> 时编译。CPU 算子的测试经派发入口调用，纯 CPU 构建（mac）就能跑。CPU 算子都换完后，CPU 还可以当 CUDA 的端到端参考。 <a href="cpu-4-kernels-math.html#tests">去看 →</a></div>
+<h2>性能收益</h2>
+<h3>对 llmgen 的预期</h3>
+<p>这一步不改性能。它保护的是前面所有步骤的成果：之后调 kernel（比如换 block 大小、改段长）时，有一道 10 秒钟就能跑完的检查。</p>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>kernel_test 通过的 test 数</td><td class="num fill" contenteditable="true" data-key="15-kernel-test.html|kernel_test 通过的 test 数|before"></td><td class="num fill" contenteditable="true" data-key="15-kernel-test.html|kernel_test 通过的 test 数|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td>GEMM 测试 M ≥ 3 时失败，M ≤ 2 通过</td><td>cuBLAS 路的行主 / 列主参数（<code>CUBLAS_OP_T</code>、<code>lda</code>）被改动过。对照 lab 的 <code>linear.cu</code>。</td></tr><tr><td>注意力测试 prefill 过、decode 不过</td><td><code>part_o</code> / <code>part_ml</code> 的 scratch 大小或 <code>max_parts</code> 和 kernel 里的不一致。</td></tr><tr><td>rmsnorm 差一点点超过容差</td><td>参考实现的舍入点要和 kernel 一样：<code>round_bf(v * rstd) * w</code>。</td></tr><tr><td>所有测试都读到 0</td><td><code>download</code> 之前要 <code>cuda_sync</code>。第 07 步之后 kernel 在独立 stream 上，同步的 <code>cudaMemcpy</code> 不会等它。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li><code>make llmgen-cuda-test</code> 全过</li><li>阶段 3 结束：把 S1 的吞吐、TTFT、ITL 填进总览页的汇总表</li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="14-fa2-prefill.html"><small>← 上一步</small>prefill 注意力：FA2</a><a class="next" href="16-memory-plan.html"><small>下一步 →</small>活跃区间激活规划</a></div>
+</main>
+</div>
+</body>
+</html>

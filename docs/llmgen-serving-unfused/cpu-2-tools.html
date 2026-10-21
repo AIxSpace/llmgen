@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CPU：并行与 SIMD 工具 · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html" class="active"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">CPU 支线</div>
+<h1>CPU：并行与 SIMD 工具</h1>
+<p class="lead">bf16 直读、@Vector 点积、fork-join 线程团队。</p>
+<div class="callout goal"><span class="t">本步目标</span>给 CPU 算子准备三样工具：bf16 的直接读写、SIMD 点积、一个 OpenMP 式的线程团队。后面所有 CPU 算子都建在它们上面。建议在主线开始之前就做，否则 CPU 上每验证一步都要等很久。</div>
+<h2>原理</h2>
+<h3>起点的 CPU 算子慢在哪</h3>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cpu/linear.zig</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-zig">pub const LinearImpl = struct {
+    pub fn execute(_: i32, out_tensor: *Tensor) !void {
+        const x = out_tensor.src[0].?;
+        const weight = out_tensor.src[1].?;
+
+        const in_dim = common.dimAt(weight, 1);
+        const out_dim = common.dimAt(weight, 0);
+
+        const seq_len = common.dimAt(x, 1); // [1, S, H]
+
+        for (0..seq_len) |seq_idx| {
+            for (0..out_dim) |out_idx| {
+                var acc: f32 = 0;
+                const wrow = out_idx * in_dim;
+                for (0..in_dim) |in_idx| {
+                    acc += common.elemF32(x, seq_idx * in_dim + in_idx) * common.elemF32(weight, wrow + in_idx);
+                }
+                common.storeF32(out_tensor, seq_idx * out_dim + out_idx, acc);
+            }
+        }
+    }
+};</code></pre></div>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cpu/common.zig</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-zig">/// 按 t.data_type 读第 i 个元素为 f32。
+pub fn elemF32(t: *const Tensor, i: usize) f32 {
+    return loadF32(t.data.?, t.data_type, i);
+}
+
+/// 按 dtype 从原始指针读第 i 个元素(给分页 KV 块这类不是 Tensor 的缓冲用)。
+pub fn loadF32(base: [*]const u8, data_type: types.GGMLDataType, i: usize) f32 {
+    return switch (data_type) {
+        .GGML_TYPE_F32 =&gt; @as([*]const f32, @ptrCast(@alignCast(base)))[i],
+        .GGML_TYPE_BF16 =&gt; bf16ToF32(@as([*]const u16, @ptrCast(@alignCast(base)))[i]),
+        .GGML_TYPE_F16 =&gt; f16ToF32(@as([*]const u16, @ptrCast(@alignCast(base)))[i]),
+        else =&gt; unsupportedDtype(&quot;loadF32&quot;, data_type),
+    };
+}
+
+/// 按 t.data_type 把 f32 写回第 i 个元素
+pub fn storeF32(t: *Tensor, i: usize, v: f32) void {
+    const tensor_data = t.data.?;
+    switch (t.data_type) {
+        .GGML_TYPE_F32 =&gt; @as([*]f32, @ptrCast(@alignCast(tensor_data)))[i] = v,
+        .GGML_TYPE_BF16 =&gt; @as([*]u16, @ptrCast(@alignCast(tensor_data)))[i] = f32ToBf16(v),
+        .GGML_TYPE_F16 =&gt; @as([*]u16, @ptrCast(@alignCast(tensor_data)))[i] = f32ToF16(v),
+        else =&gt; unsupportedDtype(&quot;storeF32&quot;, t.data_type),
+    }
+}</code></pre></div>
+<p>三个问题叠在一起：</p>
+<ul>
+  <li><b>单线程。</b>机器有几十个核，只用了一个。</li>
+  <li><b>没有 SIMD。</b>一次乘加一个元素。AVX2 一条指令能做 8 个。</li>
+  <li><b>每个元素一次 dtype 分支。</b><code>elemF32</code> 每读一个数都 <code>switch (data_type)</code>。最内层循环里的分支会挡住编译器的自动向量化。</li>
+</ul>
+<p>llmgen 早期的 CPU 日志里，一次 Linear 平均 87 ms，占总时间的 99.3% <span class="src start">llmgen 早期 CPU 日志</span>。</p>
+
+<h3>bf16 直接读</h3>
+<p>教程全程约定激活和权重都是 bf16。那就不需要通用的 <code>elemF32</code>：把指针当成 <code>[*]u16</code>，读出来左移 16 位就是 f32。没有分支，编译器可以向量化。</p>
+
+<h3>SIMD 点积</h3>
+<div class="codeblock"><div class="cap"><span><b>backend/cpu/common.zig · SIMD（原样加进 llmgen 的 common.zig）</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">/// SIMD 通道数: AVX2=8 / NEON=4(同 labs/cpu-parallel).
+pub const VLEN: usize = std.simd.suggestVectorLength(f32) orelse 8;
+pub const VecF = @Vector(VLEN, f32);
+
+/// 一次读 VLEN 个 bf16 为 f32(零扩展后左移 16 位, 对照 C++ load_bf16x8_f32).
+pub inline fn loadBf16(p: [*]const bf16) VecF {
+    const bits16: @Vector(VLEN, u16) = p[0..VLEN].*;
+    const bits32: @Vector(VLEN, u32) = @intCast(bits16);
+    return @bitCast(bits32 &lt;&lt; @as(@Vector(VLEN, u5), @splat(16)));
+}
+
+/// bf16 点积, f32 累加(n 不必是 VLEN 的倍数).
+pub fn dotBf16(a: [*]const bf16, b: [*]const bf16, n: usize) f32 {
+    var acc: VecF = @splat(0);
+    var i: usize = 0;
+    while (i + VLEN &lt;= n) : (i += VLEN) acc = @mulAdd(VecF, loadBf16(a + i), loadBf16(b + i), acc);
+    var s = @reduce(.Add, acc);
+    while (i &lt; n) : (i += 1) s += bf2f(a[i]) * bf2f(b[i]);
+    return s;
+}</code></pre></div>
+<p><code>std.simd.suggestVectorLength(f32)</code> 在 AVX2 上是 8，在 NEON 上是 4，同一份代码两种 CPU 都是满宽度。<code>loadBf16</code> 一次读 VLEN 个 u16，零扩展成 u32 再左移 16 位，按位重解释成 f32 向量。<code>@mulAdd</code> 在支持 FMA 的 CPU 上是一条指令。</p>
+<p>累加在 f32 里做，和 <code>.cu</code> 的 GEMV 一样。<b>但求和顺序不同</b>：这里是 VLEN 条部分和最后合并，CUDA 的 GEMV 是 32 个 lane 各自累加再归约。两者的 f32 结果有最后一位的差别；舍入成 bf16 后绝大多数相同。lab 实测端到端 64 个 token 仍然逐个相同 <span class="src lab">lab CPU 实测</span>。</p>
+
+<h3>线程：为什么不用 std.Thread.Pool</h3>
+<p>直觉的做法是用标准库的线程池：每块任务 <code>spawn</code> 一次。lab 一开始就是这么做的，结果在 32 线程的 Xeon 上 decode 只有 2 tok/s <span class="src lab">lab CPU 实测</span>。</p>
+<p>原因是任务太碎。一个 token 要派发五百多个算子，每个算子切成几十块，每块一次“加锁、入队、条件变量唤醒”。算下来一个 token 要唤醒线程上万次，上下文切换的开销压过了计算本身。</p>
+<p>换成 OpenMP 式的<b>常驻 fork-join 线程团队</b>之后是 20.8 tok/s <span class="src lab">lab CPU 实测</span>，快了 10 倍：</p>
+<div class="tablewrap"><table><thead><tr><th></th><th>std.Thread.Pool</th><th>fork-join 团队</th></tr></thead><tbody><tr><td>派发一次</td><td>每块：加锁 + 入队 + 唤醒</td><td>写一次任务描述，代数加一</td></tr><tr><td>谁做哪块</td><td>谁抢到谁做</td><td>第 i 块固定给第 i 个线程，主线程做第 0 块</td></tr><tr><td>空闲时</td><td>睡在条件变量上</td><td>先自旋 4096 轮等下一代任务，超时才 futex 睡</td></tr><tr><td>小任务</td><td>照样派发</td><td>小于 2 × grain 直接在主线程串行做</td></tr></tbody></table></div>
+<p>算子之间的间隙很短（主线程回去派发下一个算子只要几百纳秒），工作线程自旋等着，基本不会睡。这就是 <code>OMP_WAIT_POLICY=active</code> 的效果。</p>
+<div class="codeblock"><div class="cap"><span><b>backend/cpu/common.zig · fork-join 线程团队（原样加进 llmgen 的 common.zig）</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">// labs/cpu-parallel 用 std.Thread.Pool: 每块一次 spawn(加锁 + 条件变量唤醒). 服务引擎一个 token 要派发
+// 几百个算子, 在 32 线程的 Xeon 上这种唤醒开销压过了计算本身(实测 2 tok/s, 每 token 2 万次上下文切换).
+// 这里换成 OpenMP 式的常驻 fork-join 线程团队: 第 i 块固定给第 i 个线程(主线程拿第 0 块), 派发 = 写任务 +
+// 代数加一; 工作线程先自旋等下一代任务(算子之间的间隙很短, 基本不睡), 自旋超时才 futex 睡眠
+// (对照 OMP_WAIT_POLICY / GOMP_SPINCOUNT).
+const Team = struct {
+    n_workers: usize = 0,
+    gen: std.atomic.Value(u32) = .init(0), // 任务代数: 每派发一次加一
+    pending: std.atomic.Value(u32) = .init(0), // 本代还没做完的工作线程数
+    sleepers: std.atomic.Value(u32) = .init(0), // 正在 futex 上睡的工作线程数
+    run_fn: *const fn (*const anyopaque, usize, usize) void = undefined,
+    ctx: *const anyopaque = undefined,
+    n: usize = 0,
+    chunks: usize = 0,
+
+    const SPIN: u32 = 1 &lt;&lt; 12;
+
+    fn range(self: *const Team, i: usize) [2]usize {
+        const per = (self.n + self.chunks - 1) / self.chunks;
+        const b = @min(i * per, self.n);
+        return .{ b, @min(b + per, self.n) };
+    }
+
+    fn worker(self: *Team, id: usize) void {
+        var seen: u32 = 0;
+        while (true) {
+            var spins: u32 = 0;
+            while (self.gen.load(.acquire) == seen) {
+                if (spins &lt; SPIN) {
+                    spins += 1;
+                    std.atomic.spinLoopHint();
+                    continue;
+                }
+                _ = self.sleepers.fetchAdd(1, .seq_cst);
+                if (self.gen.load(.seq_cst) == seen) std.Thread.Futex.wait(&amp;self.gen, seen);
+                _ = self.sleepers.fetchSub(1, .seq_cst);
+            }
+            seen = self.gen.load(.acquire);
+            if (id &lt; self.chunks) {
+                const r = self.range(id);
+                if (r[0] &lt; r[1]) self.run_fn(self.ctx, r[0], r[1]);
+            }
+            _ = self.pending.fetchSub(1, .acq_rel);
+        }
+    }
+
+    /// 主线程调用: 发布任务 → 自己做第 0 块 → 等所有工作线程做完.
+    fn run(self: *Team, n: usize, chunks: usize, ctx: *const anyopaque, f: *const fn (*const anyopaque, usize, usize) void) void {
+        self.run_fn = f;
+        self.ctx = ctx;
+        self.n = n;
+        self.chunks = chunks;
+        self.pending.store(@intCast(self.n_workers), .release);
+        _ = self.gen.fetchAdd(1, .seq_cst);
+        if (self.sleepers.load(.seq_cst) &gt; 0) std.Thread.Futex.wake(&amp;self.gen, std.math.maxInt(u32));
+        const r = self.range(0);
+        f(ctx, r[0], r[1]);
+        while (self.pending.load(.acquire) != 0) std.atomic.spinLoopHint();
+    }
+};
+
+var g_team: Team = .{};
+var g_team_once = std.once(initTeam);
+
+fn initTeam() void {
+    const n = std.Thread.getCpuCount() catch 1;
+    var started: usize = 0;
+    for (1..n) |id| {
+        const t = std.Thread.spawn(.{ .stack_size = 1 &lt;&lt; 20 }, Team.worker, .{ &amp;g_team, id }) catch break;
+        t.detach(); // 进程级常驻, 同 OpenMP 的线程团队
+        started += 1;
+    }
+    g_team.n_workers = started;
+}
+
+/// 把区间 [0, n) 静态均分成块, 每块调用 body(ctx, start, end); 主线程也参与.
+/// grain = 每块至少多少个单位: 块数 = min(线程数, n / grain), 小活直接在主线程串行做.
+/// 只从主线程(Executor 派发)调用, 不可嵌套.
+pub fn parallelFor(n: usize, grain: usize, ctx: anytype, comptime body: fn (@TypeOf(ctx), usize, usize) void) void {
+    if (n == 0) return;
+    if (n &lt; 2 * grain) return body(ctx, 0, n);
+    g_team_once.call();
+    const chunks = @min(g_team.n_workers + 1, n / grain);
+    if (chunks &lt;= 1) return body(ctx, 0, n);
+    const Ctx = @TypeOf(ctx);
+    const Tramp = struct {
+        fn call(p: *const anyopaque, b: usize, e: usize) void {
+            const cp: *const Ctx = @ptrCast(@alignCast(p));
+            body(cp.*, b, e);
+        }
+    };
+    g_team.run(n, chunks, @ptrCast(&amp;ctx), Tramp.call);
+}</code></pre></div>
+<p><code>grain</code> 参数很重要：decode 时一次 add 只有 1024 个元素，开 32 个线程去分反而慢。每个算子按自己的工作量给一个合适的 grain，小活自动退化成串行。</p>
+<div class="codeblock"><div class="cap"><span><b>parallelFor 的用法</b> <span class="tag out">示意，不落地</span></span><button type="button">复制</button></div><pre><code class="language-zig">// 用法:把 [0, n) 切成块, 每块在一个线程里跑 body(ctx, begin, end)
+const Ctx = struct { out: [*]c.bf16, a: [*]const c.bf16, b: [*]const c.bf16 };
+
+fn body(ctx: Ctx, begin: usize, end: usize) void {
+    for (begin..end) |i| ctx.out[i] = c.f2bf(c.bf2f(ctx.a[i]) + c.bf2f(ctx.b[i]));
+}
+
+// grain = 32768:少于 65536 个元素就不开线程, 直接在主线程做
+c.parallelFor(n, 32768, Ctx{ .out = o, .a = a, .b = b }, body);</code></pre></div>
+
+<h2>改动</h2>
+<h3><span class="stepno">1</span>bf16 短名字和指针工具</h3>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cpu/common.zig</b> <span class="tag new">新增</span></span><button type="button">复制</button></div><pre><code class="language-zig">// ---- 加在 src/backend/cpu/common.zig(bf16ToF32 / f32ToBf16 已经有了, 这里只是起短名字) ----
+pub const bf16 = u16;
+
+pub inline fn bf2f(h: bf16) f32 {
+    return bf16ToF32(h);
+}
+pub inline fn f2bf(x: f32) bf16 {
+    return f32ToBf16(x);
+}
+/// 在 bf16 张量边界舍入一次(对应 .cu 的 round_bf)
+pub inline fn roundBf(x: f32) f32 {
+    return bf2f(f2bf(x));
+}
+
+/// 把张量的 data(或元数据指针)当成某种元素的数组
+pub fn ptrAs(comptime E: type, p: ?*anyopaque) [*]E {
+    return @ptrCast(@alignCast(p.?));
+}
+pub fn bf16Of(t: *const Tensor) [*]bf16 {
+    return ptrAs(bf16, t.data);
+}</code></pre></div>
+
+<h3><span class="stepno">2</span>SIMD 和线程团队</h3>
+<p>把上面 lab 的两段（SIMD、线程团队）原样加进 llmgen 的 <code>backend/cpu/common.zig</code>。它们只依赖 <code>std</code>，不用改名字。<code>global_allocator</code>、<code>elemF32</code>、<code>storeF32</code> 先留着，旧算子换完之前还有人用。</p>
+
+<h3><span class="stepno">3</span>测试</h3>
+<div class="codeblock"><div class="cap"><span><b>backend/cpu/common.zig · 测试</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">test &quot;parallelFor 覆盖整个区间且不重叠&quot; {
+    var hits = [_]u8{0} ** 1000;
+    const Ctx = struct { h: []u8 };
+    parallelFor(hits.len, 7, Ctx{ .h = &amp;hits }, struct {
+        fn f(c: Ctx, s: usize, e: usize) void {
+            for (s..e) |i| c.h[i] += 1;
+        }
+    }.f);
+    for (hits) |h| try std.testing.expectEqual(@as(u8, 1), h);
+}</code></pre></div>
+
+<h2>对拍验证</h2>
+<p><code>zig build test</code>（纯 CPU 构建就能跑）。工具本身不改变任何算子的行为，端到端输出不变。接下来去 <a href="cpu-4-kernels-math.html#linear">C4 · Linear</a> 把最慢的那个算子换掉，才能看到速度变化。</p>
+<h2>性能收益</h2>
+<h3>依据</h3>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th class="num">改前</th><th class="num">改后</th><th>来源</th></tr></thead><tbody><tr><td>lab：std.Thread.Pool → fork-join（3090 主机 CPU，tok/s）</td><td class="num">2</td><td class="num">20.8</td><td><span class="src lab">lab CPU 实测</span></td></tr><tr><td>llmgen 早期 CPU 基线：Linear 平均</td><td class="num">87.4 ms / 次</td><td class="num">—</td><td><span class="src start">llmgen 早期 CPU 日志</span></td></tr></tbody></table></div>
+<h3>对 llmgen 的预期</h3>
+<p>这一页只加工具，速度不变。它的作用在后面：</p>
+<ul>
+  <li>Linear 用上 <code>dotBf16</code> + <code>parallelFor</code>（C4），预期从秒级降到毫秒级；</li>
+  <li>其余算子用 <code>bf16Of</code> + <code>parallelFor</code>，prefill 时各快一到两个数量级。</li>
+</ul>
+<p>线程数默认取 <code>getCpuCount()</code>。超线程的机器上物理核数可能更合适；想调的话在 <code>initTeam</code> 里读一个环境变量。</p>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>zig build test 通过</td><td class="num fill" contenteditable="true" data-key="cpu-2-tools.html|zig build test 通过|before"></td><td class="num fill" contenteditable="true" data-key="cpu-2-tools.html|zig build test 通过|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td><code>parallelFor</code> 之后结果偶尔错</td><td><code>body</code> 里写了块之间共享的状态。每块只能写自己那段输出；临时缓冲要放在 <code>body</code> 的栈上（见 C3 注意力的 <code>acc</code>）。</td></tr><tr><td>程序退出时卡住</td><td>工作线程是 detach 的、常驻的，不需要 join。卡住多半是别处在等。</td></tr><tr><td>CPU 占用一直 100%（空闲时）</td><td>自旋等待的代价。<code>SPIN</code> 调小，线程会更早去睡。</td></tr><tr><td><code>incorrect alignment</code> 在 <code>ptrAs</code></td><td>张量的 data 没按元素大小对齐。池的分配对齐是 32 / 64，不该出现；多半是传了一个带奇数偏移的指针。</td></tr><tr><td>嵌套调用 <code>parallelFor</code> 死锁</td><td>它不可重入：只能从主线程（Executor 的派发）调用，<code>body</code> 里不能再调。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li><code>common.zig</code> 里有 <code>bf2f / f2bf / roundBf / ptrAs / bf16Of / dotBf16 / parallelFor</code></li><li><code>zig build test</code> 通过</li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="cpu-1-overview.html"><small>← 上一步</small>CPU：一套执行层两个后端</a><a class="next" href="cpu-3-kernels-layout.html"><small>下一步 →</small>CPU：布局相关的算子</a></div>
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>序列级块表与 KV 预算 · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html" class="active"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">阶段 5 · 连续批处理</div>
+<h1>序列级块表与 KV 预算</h1>
+<p class="lead">拆开 max_seq_len，KV 按显存比例分。</p>
+<div class="callout goal"><span class="t">本步目标</span>KV cache 的容量从“写死 1024 个 token”改成“显存剩多少给多少”。原来一个 <code>max_seq_len</code> 同时管着四件不同的事，这一步把它们拆开。批处理需要的容量和参数就齐了。</div>
+<h2>原理</h2>
+<h3>一个 max_seq_len 管了四件事</h3>
+<div class="tablewrap"><table><thead><tr><th>它现在决定</th><th>实际应该由谁决定</th><th>目标值</th></tr></thead><tbody><tr><td>单条序列最长多少 token</td><td><code>max_model_len</code>：块表的列数、位置的上限</td><td>4096</td></tr><tr><td>一步前向最多多少 token</td><td><code>max_tokens</code>：激活 token 区的大小</td><td>8192</td></tr><tr><td>一步最多多少条序列</td><td><code>max_num_seqs</code>：序列区、元数据、CUDA Graph 桶</td><td>256</td></tr><tr><td>KV cache 能存多少 token</td><td><code>num_kv_blocks × block_size</code>：所有序列共享的池子</td><td>按显存算，约 17.6 万</td></tr></tbody></table></div>
+<p>单序列时这四个数相等，混在一起没问题。批处理时它们差着数量级：256 条序列共享 17.6 万 token 的 KV，但每步只有 256 个 token 进前向。</p>
+
+<h3>KV 是一个共享的块池</h3>
+<p>第 06 步之后，KV 的布局是每层一整块 <code>[块][kv_head][slot][hd]</code>，块的归属由 <code>BlockManager</code> 管：</p>
+<div class="codeblock"><div class="cap"><span><b>block_manager.zig</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">pub const BlockManager = struct {
+    alloc: Alloc,
+    block_size: usize,
+    num_blocks: usize,
+    free: std.ArrayListUnmanaged(i32) = .empty, // 空闲块栈
+
+    pub fn init(alloc: Alloc, num_blocks: usize, block_size: usize) !BlockManager {
+        var self = BlockManager{ .alloc = alloc, .block_size = block_size, .num_blocks = num_blocks };
+        try self.free.ensureTotalCapacity(alloc, num_blocks);
+        var i: usize = num_blocks;
+        while (i &gt; 0) {
+            i -= 1;
+            self.free.appendAssumeCapacity(@intCast(i)); // 栈顶是 0 号块
+        }
+        return self;
+    }
+
+    pub fn deinit(self: *BlockManager) void {
+        self.free.deinit(self.alloc);
+    }
+
+    pub fn numFree(self: *const BlockManager) usize {
+        return self.free.items.len;
+    }
+
+    /// 让 seq 的块表至少覆盖前 n 个 token. 块不够返回 false(不做部分分配).
+    pub fn ensure(self: *BlockManager, seq: *Sequence, n: usize) !bool {
+        const need = Sequence.blocksFor(n, self.block_size);
+        const have = seq.block_table.items.len;
+        if (need &lt;= have) return true;
+        if (need - have &gt; self.free.items.len) return false;
+        try seq.block_table.ensureUnusedCapacity(self.alloc, need - have);
+        for (0..need - have) |_| seq.block_table.appendAssumeCapacity(self.free.pop().?);
+        return true;
+    }
+
+    pub fn canEnsure(self: *const BlockManager, seq: *const Sequence, n: usize) bool {
+        const need = Sequence.blocksFor(n, self.block_size);
+        const have = seq.block_table.items.len;
+        return need &lt;= have or need - have &lt;= self.free.items.len;
+    }
+
+    /// 释放 seq 的全部块(完成或被抢占).
+    pub fn deallocate(self: *BlockManager, seq: *Sequence) void {
+        var i = seq.block_table.items.len;
+        while (i &gt; 0) {
+            i -= 1;
+            self.free.appendAssumeCapacity(seq.block_table.items[i]);
+        }
+        seq.block_table.clearRetainingCapacity();
+        seq.num_computed_tokens = 0;
+    }
+};</code></pre></div>
+<p>一个空闲块的栈。序列需要更多块时 <code>ensure</code> 从栈顶取；序列结束或被抢占时 <code>deallocate</code> 整条归还。块号在所有层通用：拿到块 7，就是每一层 K 和 V 的第 7 块都归你。</p>
+<p>所以“KV 容量”就是总块数。一个 token 在所有层的 K + V 一共占：</p>
+<p style="text-align:center"><code>28 层 × 2（K、V）× 8 个 kv 头 × 128 × 2 B = 114688 B ≈ 112 KiB</code></p>
+<p>起点给了 1024 个 token，112 MiB <span class="src start">llmgen 起点实测</span>。一块 3090 有 24 GB。</p>
+
+<h3>按显存比例分</h3>
+<p>vLLM 和 nano-vllm 的做法：给一个比例（默认 0.9），总显存 × 比例，减去已经用掉的、权重、激活，剩下的全切成 KV 块。</p>
+<div class="codeblock"><div class="cap"><span><b>scheduler.zig · Config</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">pub const Config = struct {
+    vocab_size: usize = 0,
+    max_seq_len: i64 = 1, // 动态维(-1)的解析值,用于层成本估算
+    memory_headroom: f32 = 0.05,
+    /// layer_id&lt;0 的全局节点(embedding/final norm/logits/cache)落在哪台设备; module-style 固定 CPU.
+    global_device: T.Device = .CPU,
+    // ---- 服务引擎建池 / KV 用(module-style 没有) ----
+    model: ?cfgm.Qwen3Config = null, // null = 不建 KV、不留 Executor workspace(纯图调度单测)
+    max_num_seqs: usize = 1, // 一步最多序列数 S
+    max_tokens: usize = 1, // 单趟前向最多 token 数 T(激活区按它分配)
+    max_model_len: usize = 1, // 单条序列最长 token 数(块表列数 / RoPE 表长度)
+    block_size: usize = 16, // 分页块大小(token)
+    gpu_memory_utilization: f32 = 0.9,
+    /// 0 = 按 gpu_memory_utilization 自动算; &gt;0 = 固定块数(做「对齐 KV 容量」对比用)
+    num_kv_blocks: usize = 0,
+};
+
+/// KV 预算里给 CUDA Graph 等杂项留的余量(实测 &lt; 20MB).
+const KV_RESERVE: usize = 32 &lt;&lt; 20;</code></pre></div>
+<div class="codeblock"><div class="cap"><span><b>scheduler.zig · createMemoryPools 的 KV 部分</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">            var kv_cap: usize = 0;
+            if (n_attn &gt; 0 and self.config.model != null) {
+                const blk = self.kvBlockBytes();
+                const per_block_all = blk * 2 * n_attn;
+                var n = self.config.num_kv_blocks;
+                if (n == 0) {
+                    const budget = @as(f64, @floatFromInt(d.total_memory)) * self.config.gpu_memory_utilization -
+                        @as(f64, @floatFromInt(d.used_memory + weight_cap + act_cap + KV_RESERVE));
+                    if (budget &lt;= 0) return error.NoMemoryForKvCache;
+                    n = @intFromFloat(budget / @as(f64, @floatFromInt(per_block_all)));
+                }
+                if (n == 0) return error.NoMemoryForKvCache;
+                self.num_kv_blocks = n;
+                self.kv_bytes = n * per_block_all;
+                kv_cap = 2 * n_attn * std.mem.alignForward(usize, n * blk, A);
+            }
+            _ = try self.mm.getOrCreate(d.device, d.id, weight_cap, act_cap, kv_cap);
+        }
+    }</code></pre></div>
+<div class="codeblock"><div class="cap"><span><b>cuda-course/results-serving.txt（融合版；unfused 的权重和 KV 口径相同）</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="nohighlight">[executor] NVIDIA GeForce RTX 3090 | 权重 1137 MB | 激活 token 区 176 MB + 序列区 75 MB | KV 11051 块 × 16 token = 176816 token (19339 MB) | CUDA Graph 桶 20 个 | 显存已用 21786/24152 MB</code></pre></div>
+<p>24 GB × 0.9 ≈ 21.7 GB；权重 1.1 GB、激活 0.25 GB；剩下 19.3 GB 是 KV：融合版是 11051 块 × 16 = 176816 token，unfused 版因为图节点多、激活区略大，实测是 176736 token。</p>
+
+<h3>块大小</h3>
+<p>块越大，块表越短、寻址越省；但每条序列最后一块平均浪费半块。block 16 时每条序列平均浪费 8 个 token；block 256 时浪费 128 个。nano-vllm 用 256，lab 用 16。lab 实测两者吞吐相同，16 在容量紧张时抢占更少（见第 20 步的表）。</p>
+
+<h2>改动</h2>
+<h3><span class="stepno">1</span>配置项</h3>
+<div class="codeblock diff"><div class="cap"><span><b>src/graph/scheduler.zig</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">    pub const Config = struct {</span><span class="ln ctx">        vocab_size: usize = 0,</span><span class="ln ctx">        max_seq_len: i64 = 1,</span><span class="ln ctx">        memory_headroom: f32 = 0.05,</span><span class="ln ctx">        ...</span><span class="ln add">        // ---- 原来一个 max_seq_len 管所有事, 现在拆成四个量 ----</span><span class="ln add">        max_model_len: usize = 1024, //  单条序列最长 token 数:块表列数、位置上限</span><span class="ln add">        max_num_seqs: usize = 1, //      一步最多几条序列 S</span><span class="ln add">        max_tokens: usize = 1024, //     单趟前向最多 token 数 T:激活 token 区按它分配</span><span class="ln add">        block_size: usize = 16, //       分页块大小</span><span class="ln add">        gpu_memory_utilization: f32 = 0.9,</span><span class="ln add">        /// 0 = 按 gpu_memory_utilization 自动算;&gt; 0 = 固定块数(做&quot;对齐 KV 容量&quot;的对比用)</span><span class="ln add">        num_kv_blocks: usize = 0,</span><span class="ln ctx">    };</span><span class="ln ctx">...</span><span class="ln ctx">    memory_manager: MemoryManager,</span><span class="ln add">    num_kv_blocks: usize = 0, // 每层 K(或 V)切了多少块</span><span class="ln add">    kv_bytes: usize = 0,</span></code></pre></div>
+
+<h3><span class="stepno">2</span>建池：KV 拿剩下的全部</h3>
+<div class="codeblock diff"><div class="cap"><span><b>src/graph/scheduler.zig</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln add">/// KV 预算里给 CUDA Graph 等杂项留的余量</span><span class="ln add">const KV_RESERVE: usize = 32 &lt;&lt; 20;</span><span class="ln ctx">...</span><span class="ln ctx">// ---- createMemoryPools(): 对每台设备 ----</span><span class="ln ctx">            var weight_cap: usize = 0;</span><span class="ln del">            var kv_cap: usize = 0;</span><span class="ln add">            var n_attn: usize = 0; //         本设备上的注意力层数</span><span class="ln add">            var kv_block_bytes: usize = 0; // 一层 K(或 V)一块的字节数</span><span class="ln ctx">            ...</span><span class="ln ctx">                if (is_attn and t.src[1] != null) {</span><span class="ln ctx">                    const head_dim: usize = @intCast(t.dims[3]);</span><span class="ln ctx">                    const n_kv: usize = @intCast(t.src[1].?.dims[2]);</span><span class="ln del">                    const block_bytes = pbs * n_kv * head_dim * t.data_type.size();</span><span class="ln del">                    const per_pool = std.mem.alignForward(usize, max_blocks * block_bytes, pools.POOL_ALIGN);</span><span class="ln del">                    kv_cap += 2 * (per_pool + pools.POOL_ALIGN); // K、V 各一份</span><span class="ln add">                    kv_block_bytes = self.config.block_size * n_kv * head_dim * t.data_type.size();</span><span class="ln add">                    n_attn += 1;</span><span class="ln ctx">                }</span><span class="ln ctx">            ...</span><span class="ln del">            const act_cap = pl.tokArenaBytes(@intCast(max_seq)) + pl.seqArenaBytes(exe.MAX_SEQS) + copy_bytes + ...;</span><span class="ln add">            const act_cap = pl.tokArenaBytes(self.config.max_tokens) + pl.seqArenaBytes(self.config.max_num_seqs) + copy_bytes +</span><span class="ln add">                exe.Executor.workspaceBytes(self.config);</span><span class="ln add"> </span><span class="ln add">            // KV:权重和激活分完之后, 剩下的显存预算全给它</span><span class="ln add">            var kv_cap: usize = 0;</span><span class="ln add">            if (n_attn &gt; 0) {</span><span class="ln add">                const per_block_all = kv_block_bytes * 2 * n_attn; // 一个块号在所有层的 K + V 里占的总字节</span><span class="ln add">                var n = self.config.num_kv_blocks;</span><span class="ln add">                if (n == 0) {</span><span class="ln add">                    const budget = @as(f64, @floatFromInt(backend_info.total_memory)) * self.config.gpu_memory_utilization -</span><span class="ln add">                        @as(f64, @floatFromInt(backend_info.used_memory + weight_cap + act_cap + KV_RESERVE));</span><span class="ln add">                    if (budget &lt;= 0) return error.NoMemoryForKvCache;</span><span class="ln add">                    n = @intFromFloat(budget / @as(f64, @floatFromInt(per_block_all)));</span><span class="ln add">                }</span><span class="ln add">                if (n == 0) return error.NoMemoryForKvCache;</span><span class="ln add">                self.num_kv_blocks = n;</span><span class="ln add">                self.kv_bytes = n * per_block_all;</span><span class="ln add">                kv_cap = 2 * n_attn * (std.mem.alignForward(usize, n * kv_block_bytes, pools.POOL_ALIGN) + pools.POOL_ALIGN);</span><span class="ln add">            }</span><span class="ln ctx"> </span><span class="ln ctx">// ---- initializeKVCache() ----</span><span class="ln del">                    try page_atten_manager.reserveLayer(t.layer_id, @intCast(max_blocks));</span><span class="ln add">                    try page_atten_manager.reserveLayer(t.layer_id, self.num_kv_blocks);</span></code></pre></div>
+
+<h3><span class="stepno">3</span>入口</h3>
+<div class="codeblock diff"><div class="cap"><span><b>src/llmgen.zig</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln del">    const max_seq_len: usize = 1024;</span><span class="ln add">    const max_model_len: usize = 4096;</span><span class="ln add">    const max_num_seqs: usize = 256;</span><span class="ln add">    const pass_tokens: usize = 8192; // 单趟前向的 token 上限;超过就切成多趟(第 19 步)</span><span class="ln ctx">...</span><span class="ln ctx">    var graph_scheduler = GraphScheduler.init(allocator, compute_graph, .{</span><span class="ln del">        .max_seq_len = max_seq_len,</span><span class="ln add">        .max_seq_len = @intCast(max_model_len),</span><span class="ln add">        .max_model_len = max_model_len,</span><span class="ln add">        .max_num_seqs = max_num_seqs,</span><span class="ln add">        .max_tokens = @max(pass_tokens, max_num_seqs),</span><span class="ln add">        .gpu_memory_utilization = 0.9,</span><span class="ln ctx">        ...</span></code></pre></div>
+
+<h3><span class="stepno">4</span>Executor 里跟着改的地方</h3>
+<div class="tablewrap"><table><thead><tr><th>原来</th><th>改成</th></tr></thead><tbody><tr><td><code>pub const MAX_SEQS = 1</code></td><td><code>self.max_seqs</code>，取 <code>config.max_num_seqs</code></td></tr><tr><td><code>self.max_seq</code> 用在块表列数、<code>max_model_len</code></td><td><code>config.max_model_len</code></td></tr><tr><td><code>self.max_seq</code> 用在元数据 Layout 的 T、token 区大小</td><td><code>config.max_tokens</code></td></tr><tr><td><code>BLOCK_SIZE</code> 常量</td><td><code>config.block_size</code></td></tr><tr><td><code>BlockManager.init(allocator, max_blocks, …)</code></td><td><code>BlockManager.init(allocator, graph_scheduler.num_kv_blocks, config.block_size)</code></td></tr><tr><td><code>workspaceBytes(max_seq, cfg)</code></td><td><code>workspaceBytes(config)</code>：split-K scratch 的 <code>cap</code> 要对 s = 1…max_num_seqs 取最大值</td></tr><tr><td><code>captureGraphs</code> 的桶列表</td><td>不用改，已经是按 <code>MAX_SEQS</code> 生成的；现在会录 20 个桶</td></tr></tbody></table></div>
+<p>RoPE 的 cos / sin 表长度是模型的 <code>context_length</code>（Qwen3 是 40960），大于 <code>max_model_len</code>，不用动。</p>
+
+<h2>对拍验证</h2>
+<p>单请求的结果不变：greedy 输出和上一步逐 token 相同。启动日志里确认 KV 池的大小：</p>
+<ul>
+  <li><code>kv_cache</code> 池应该是 19 GB 左右；</li>
+  <li>用 <code>nvidia-smi</code> 看进程占用，约 21.7 GB；</li>
+  <li>启动时间会变长一点：要录 20 个 CUDA Graph 桶。</li>
+</ul>
+<div class="callout warn"><span class="t">3090 上还有别的进程时</span>预算按 <code>total_memory × 0.9 - used_memory</code> 算。有别的进程占着显存（比如 lab 提到的 llama-server），KV 会相应变小，甚至报 <code>NoMemoryForKvCache</code>。压测前先清干净。</div>
+<h2>CPU 同步</h2>
+<div class="callout cpu"><span class="t">这一步 CPU 后端要做的事</span><b>必须同步改。</b>“总显存 × 比例”的预算公式不能用在 CPU 上（CPU 的总内存在 <code>backend.zig</code> 里是写死的 16 GB，会一口气申请十几 GB）。CPU 给固定块数：512 块 = 8192 token，约 0.9 GB；单趟 token 上限 2048。 <a href="cpu-5-exec-cli.html#kv">去看 →</a></div>
+<h2>性能收益</h2>
+<h3>依据</h3>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th class="num">改前</th><th class="num">改后</th><th>来源</th></tr></thead><tbody><tr><td>KV 容量（token）</td><td class="num">1024（112 MiB）</td><td class="num">176736（19.3 GB）</td><td><span class="src lab">lab 实测</span></td></tr><tr><td>融合版 S3：KV 17.6 万 → 8.6 万 token（tok/s）</td><td class="num">5770.1</td><td class="num">4789.8，抢占 157 次</td><td><span class="src lab">消融实测</span></td></tr></tbody></table></div>
+<h3>对 llmgen 的预期</h3>
+<p>这一步不改单请求的速度。它决定的是<b>能同时放多少条序列</b>。</p>
+<p>S3 的 256 条请求输入加输出共 27.7 万 token。KV 有 17.6 万时，靠序列陆续结束、块陆续归还，全程 0 次抢占；KV 减半到 8.6 万时，抢占 157 次，吞吐降 17%，平均 TTFT 从 1.3 秒涨到 6.9 秒 <span class="src lab">消融实测</span>。</p>
+<p>起点的 1024 token 连 S2 的一条请求（最长 512 + 512）都只能勉强放下。</p>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>KV 容量 (token)</td><td class="num fill" contenteditable="true" data-key="18-block-manager.html|KV 容量 (token)|before"></td><td class="num fill" contenteditable="true" data-key="18-block-manager.html|KV 容量 (token)|after"></td><td class="num gain"></td></tr><tr><td>进程显存占用 (MB)</td><td class="num fill" contenteditable="true" data-key="18-block-manager.html|进程显存占用 (MB)|before"></td><td class="num fill" contenteditable="true" data-key="18-block-manager.html|进程显存占用 (MB)|after"></td><td class="num gain"></td></tr><tr><td>加载耗时 (s)</td><td class="num fill" contenteditable="true" data-key="18-block-manager.html|加载耗时 (s)|before"></td><td class="num fill" contenteditable="true" data-key="18-block-manager.html|加载耗时 (s)|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td><code>error.NoMemoryForKvCache</code></td><td>显存被别的进程占了，或者 <code>gpu_memory_utilization</code> 太低。</td></tr><tr><td><code>cudaMalloc … failed: out of memory</code></td><td>预算算多了。<code>used_memory</code> 要在建池<b>之前</b>读，且要包含 CUDA 上下文本身的占用（几百 MB）。把 <code>KV_RESERVE</code> 调大或比例调到 0.85。</td></tr><tr><td>启动慢了好几秒</td><td>20 个桶各录一次是 0.3 秒左右。如果慢得多，看是不是 Debug 构建。</td></tr><tr><td><code>error.OutOfBlocks</code> 在单请求时出现</td><td><code>BlockManager</code> 还在用旧的 <code>max_blocks</code>，没换成 <code>num_kv_blocks</code>。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li>KV 池约 19 GB，容量约 17 万 token</li><li>单请求 greedy 输出不变</li><li>四个量（max_model_len / max_tokens / max_num_seqs / num_kv_blocks）在代码里各管各的</li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="17-cuda-graph.html"><small>← 上一步</small>CUDA Graph</a><a class="next" href="19-batched-forward.html"><small>下一步 →</small>批量前向 execute(entries)</a></div>
+</main>
+</div>
+</body>
+</html>

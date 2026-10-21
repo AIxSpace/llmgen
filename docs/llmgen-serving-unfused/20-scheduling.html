@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>调度策略与抢占 · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html" class="active"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">阶段 5 · 连续批处理</div>
+<h1>调度策略与抢占</h1>
+<p class="lead">prefill_first 和 chunked：吞吐和延迟的取舍。</p>
+<div class="callout goal"><span class="t">本步目标</span>读懂两种调度策略（prefill_first 和 chunked）各自在优化什么、牺牲什么，以及 KV 不够时的抢占。代码第 19 步已经能跑，这一步加一个开关，量出两种策略的差别。</div>
+<h2>原理</h2>
+<h3>调度器每一步要回答的问题</h3>
+<p>有一批在等的新请求（waiting），有一批正在生成的序列（running）。这一步让谁进前向、各进多少 token？约束有三个：</p>
+<ul>
+  <li><code>max_num_seqs</code>：一步最多多少条序列；</li>
+  <li><code>max_num_batched_tokens</code>：一步最多多少 token；</li>
+  <li>KV 的空闲块够不够。</li>
+</ul>
+
+<h3>prefill_first（nano-vllm 的策略）</h3>
+<div class="codeblock"><div class="cap"><span><b>batch.zig · schedulePrefillFirst</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">    fn schedulePrefillFirst(self: *BatchScheduler) !void {
+        // ---- prefill ----
+        var n_tok: usize = 0;
+        while (self.waiting.items.len &gt; 0 and self.scheduled.items.len &lt; self.cfg.max_num_seqs) {
+            const seq = self.waiting.items[0];
+            const n = seq.len();
+            if (n_tok + n &gt; self.cfg.max_num_batched_tokens) break;
+            if (!(try self.bm.ensure(seq, n))) break;
+            _ = self.waiting.orderedRemove(0);
+            seq.status = .running;
+            try self.running.append(self.alloc, seq);
+            try self.scheduled.append(self.alloc, .{ .seq = seq, .q_start = 0, .q_len = n });
+            n_tok += n;
+        }
+        if (self.scheduled.items.len &gt; 0) return;
+
+        // ---- decode ----
+        var i: usize = 0;
+        while (i &lt; self.running.items.len and self.scheduled.items.len &lt; self.cfg.max_num_seqs) {
+            const seq = self.running.items[i];
+            var ok = true;
+            while (!self.bm.canEnsure(seq, seq.len())) {
+                if (self.running.items.len - 1 &gt; i) {
+                    try self.preempt(self.running.pop().?);
+                } else {
+                    _ = self.running.orderedRemove(i);
+                    try self.preempt(seq);
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) break;
+            _ = try self.bm.ensure(seq, seq.len());
+            try self.scheduled.append(self.alloc, .{ .seq = seq, .q_start = seq.len() - 1, .q_len = 1 });
+            i += 1;
+        }
+    }</code></pre></div>
+<p>有新请求就先 prefill，整条 prompt 一步做完；这一步<b>只做 prefill</b>。没有新请求了才 decode。</p>
+<ul>
+  <li><b>好处</b>：简单；prefill 步和 decode 步分开，decode 步全走 CUDA Graph。</li>
+  <li><b>坏处</b>：一次大 prefill（最多 16384 token）期间，所有正在 decode 的序列干等一整步。在线服务里表现为 ITL 尖刺。</li>
+</ul>
+
+<h3>chunked</h3>
+<div class="codeblock"><div class="cap"><span><b>batch.zig · scheduleChunked</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">    fn scheduleChunked(self: *BatchScheduler) !void {
+        var budget = self.cfg.max_num_batched_tokens;
+        var prefill_budget = self.cfg.chunk_tokens;
+        // ---- running: decode 或未完成 prefill 的续段 ----
+        var i: usize = 0;
+        while (i &lt; self.running.items.len and self.scheduled.items.len &lt; self.cfg.max_num_seqs and budget &gt; 0) {
+            const seq = self.running.items[i];
+            const remaining = seq.len() - seq.num_computed_tokens;
+            const is_prefill = remaining &gt; 1;
+            var q = @min(remaining, budget);
+            if (is_prefill) q = @min(q, prefill_budget);
+            if (q == 0) {
+                i += 1;
+                continue;
+            }
+            const upto = seq.num_computed_tokens + q;
+            var ok = true;
+            while (!self.bm.canEnsure(seq, upto)) {
+                if (self.running.items.len - 1 &gt; i) {
+                    try self.preempt(self.running.pop().?);
+                } else {
+                    _ = self.running.orderedRemove(i);
+                    try self.preempt(seq);
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) break;
+            _ = try self.bm.ensure(seq, upto);
+            try self.scheduled.append(self.alloc, .{ .seq = seq, .q_start = seq.num_computed_tokens, .q_len = q });
+            budget -= q;
+            if (is_prefill) prefill_budget -= q;
+            i += 1;
+        }
+        // ---- waiting: 新请求的 prompt 分块 ----
+        while (self.waiting.items.len &gt; 0 and self.scheduled.items.len &lt; self.cfg.max_num_seqs and budget &gt; 0 and prefill_budget &gt; 0) {
+            const seq = self.waiting.items[0];
+            const q = @min(seq.len(), @min(budget, prefill_budget));
+            if (!(try self.bm.ensure(seq, q))) break;
+            _ = self.waiting.orderedRemove(0);
+            seq.status = .running;
+            seq.num_computed_tokens = 0;
+            try self.running.append(self.alloc, seq);
+            try self.scheduled.append(self.alloc, .{ .seq = seq, .q_start = 0, .q_len = q });
+            budget -= q;
+            prefill_budget -= q;
+        }
+    }</code></pre></div>
+<p>每一步先照顾 running：正在 decode 的各出 1 个 token，prefill 没做完的续一段。剩下的 token 预算再切一块新请求的 prompt 进来，每步新 prefill 的量不超过 <code>chunk_tokens</code>。</p>
+<ul>
+  <li><b>好处</b>：decode 每步都能前进，不会被大 prefill 挡住；新请求的第一块能更早开始。</li>
+  <li><b>坏处</b>：prefill 和 decode 混在一步里，这一步不是“纯 decode”，走不了 CUDA Graph，注意力全走 prefill 的 kernel；一条长 prompt 要好几步才 prefill 完。</li>
+</ul>
+<p>它依赖两件前面已经做好的事：<code>Sequence.num_computed_tokens</code> 记着 prefill 做到哪了；prefill 注意力从 KV cache 读已经算过的部分（第 14 步）。</p>
+
+<h3>抢占</h3>
+<div class="codeblock"><div class="cap"><span><b>batch.zig · preempt</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">    fn preempt(self: *BatchScheduler, seq: *Sequence) !void {
+        seq.status = .waiting;
+        self.bm.deallocate(seq);
+        try self.waiting.insert(self.alloc, 0, seq);
+        self.num_preemptions += 1;
+    }</code></pre></div>
+<p>一条正在 decode 的序列每 16 个 token 要一个新块。空闲块用完时，从 running 队尾（最晚来的）开始牺牲：释放它的全部块，放回 waiting 队首，<code>num_computed_tokens</code> 清零。之后轮到它时<b>从头重新 prefill</b>（包括已经生成的 token）。</p>
+<p>抢占很贵：被抢的序列之前的计算全部作废。所以 KV 容量是批处理吞吐的硬约束。</p>
+
+<h3>回填</h3>
+<div class="codeblock"><div class="cap"><span><b>batch.zig · postprocess</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">    pub fn postprocess(self: *BatchScheduler, entries: []const Entry, tokens: []const i32) !usize {
+        var k: usize = 0;
+        var n_finished: usize = 0;
+        for (entries) |e| {
+            const seq = e.seq;
+            const emits = e.emits();
+            seq.num_computed_tokens = e.q_start + e.q_len;
+            if (!emits) continue;
+            const tok = tokens[k];
+            k += 1;
+            try seq.token_ids.append(self.alloc, tok);
+            const hit_eos = !seq.params.ignore_eos and tok == self.cfg.eos;
+            if (hit_eos or seq.numCompletionTokens() &gt;= seq.params.max_tokens) {
+                seq.status = .finished;
+                self.bm.deallocate(seq);
+                for (self.running.items, 0..) |r, idx| {
+                    if (r == seq) {
+                        _ = self.running.orderedRemove(idx);
+                        break;
+                    }
+                }
+                n_finished += 1;
+            }
+        }
+        return n_finished;
+    }</code></pre></div>
+<p>一条 Entry 只有走到序列末尾（<code>emits()</code>）才产出 token。chunked 策略下 prefill 的中间块不产出。</p>
+
+<h2>实测</h2>
+<div class="codeblock"><div class="cap"><span><b>cuda-course/results-serving.txt（融合版；base = prefill_first；block16 / block256 / chunked-s3kv 三行是 KV 减半到 8.6 万 token）</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="nohighlight">  实验                     吞吐     TTFT均    TTFT99    ITL均   ITL99    抢占     步数     图步    显存MB   RSS    加载s
+  base-s2            4430.8     157.1     157.1    4.53    5.26     0    502    564   21788   490   0.70
+  base-s3            5770.1    1272.5    2326.2   26.57   29.45     0   1032   1086   21788   495   0.72
+  block16-s3         4789.8    6859.2   19748.3   18.52   51.90   157   2128   2054   11890   496   0.69
+  block256-s3        4775.0    7576.3   20643.9   16.34   49.71   139   2339   2252   11890   496   0.70
+  chunked-s2         4407.0     100.6     170.8    4.77    5.80     0    502    560   21788   490   0.71
+  chunked-s3         5514.6    1811.1    4165.6   27.44   80.89     0   1092   1085   21788   495   0.69
+  chunked-s3kv       4651.2    7285.8   20655.7   18.78   61.16   128   2020   1924   11890   495   0.70</code></pre></div>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th>结论</th></tr></thead><tbody><tr><td>S2，prefill_first → chunked</td><td>吞吐基本不变（4430.8 → 4407）。平均 TTFT 从 157 ms 降到 101 ms：chunked 下先到的请求不用等所有人一起 prefill 完</td></tr><tr><td>S3，prefill_first → chunked</td><td>吞吐降 4%，ITL p99 从 29 ms 涨到 81 ms，平均 TTFT 从 1.27 s 涨到 1.81 s。离线大批、所有请求同时到达时，chunked 没有优势：混批步走不了 CUDA Graph，prefill 被摊到更多步里</td></tr><tr><td>S3，KV 减半</td><td>抢占 157 次，吞吐降到 4789.8，平均 TTFT 涨到 6.9 秒</td></tr><tr><td>KV 减半时块 16 对块 256</td><td>吞吐相同；块 256 的抢占反而少（139 对 157），但步数更多。差别不大</td></tr></tbody></table></div>
+<div class="callout tip"><span class="t">这些数字说明什么</span>压测用的是“所有请求在 t = 0 同时到达”的离线负载，这对 prefill_first 最有利。chunked 的价值在<b>在线</b>负载：请求陆续到达，新请求的 prefill 不该让老请求的 decode 卡顿。本教程的 bench 测不出这一点，要测得造一个按时间到达的 workload。</div>
+
+<h2>改动</h2>
+<div class="codeblock diff"><div class="cap"><span><b>src/llmgen.zig</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln add">    const policy: batching.Policy = if (std.posix.getenv(&quot;LLMGEN_POLICY&quot;)) |p|</span><span class="ln add">        (if (std.mem.eql(u8, p, &quot;chunked&quot;)) .chunked else .prefill_first)</span><span class="ln add">    else</span><span class="ln add">        .prefill_first;</span><span class="ln ctx">    const engine = try Engine.init(allocator, &amp;runtime_executor, .{</span><span class="ln del">        .policy = .prefill_first,</span><span class="ln add">        .policy = policy,</span></code></pre></div>
+<div class="codeblock"><div class="cap"><span><b>终端</b> <span class="tag out">命令</span></span><button type="button">复制</button></div><pre><code class="language-bash">LLMGEN_WORKLOAD=…/s2.json make llmgen-cuda
+LLMGEN_POLICY=chunked LLMGEN_WORKLOAD=…/s2.json make llmgen-cuda</code></pre></div>
+
+<h2>对拍验证</h2>
+<p>两种策略下，同一批 greedy 请求的<b>输出 token 应该相同</b>（数值上只差在 prefill 是一步算完还是分块算，注意力对已缓存部分读的是同样的 K/V）。和第 06 步同样的保留：分块改变了 FA2 里 tile 的切法，累加顺序可能不同，近似并列处允许分叉。</p>
+<h2>CPU 同步</h2>
+<div class="callout cpu"><span class="t">这一步 CPU 后端要做的事</span><b>不用动。</b>调度和抢占与设备无关。CPU 的注意力只有一条路径，chunked 的混批步不需要特殊处理。</div>
+<h2>性能收益</h2>
+<h3>依据</h3>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th class="num">改前</th><th class="num">改后</th><th>来源</th></tr></thead><tbody><tr><td>融合版 S2 平均 TTFT：prefill_first → chunked（ms）</td><td class="num">157.1</td><td class="num">100.6</td><td><span class="src lab">消融实测</span></td></tr><tr><td>融合版 S2 吞吐（tok/s）</td><td class="num">4430.8</td><td class="num">4407</td><td><span class="src lab">消融实测</span></td></tr><tr><td>融合版 S3 吞吐（tok/s）</td><td class="num">5770.1</td><td class="num">5514.6</td><td><span class="src lab">消融实测</span></td></tr><tr><td>融合版 S3 ITL p99（ms）</td><td class="num">29.45</td><td class="num">80.89</td><td><span class="src lab">消融实测</span></td></tr></tbody></table></div>
+<h3>对 llmgen 的预期</h3>
+<p>这一步没有“提升”，是一个取舍。按你的场景选：</p>
+<ul>
+  <li>离线批量、追求总吞吐：<b>prefill_first</b>（默认，也是和 nano-vllm、目标 lab 对比时的口径）。</li>
+  <li>在线服务、在意已有请求的 ITL 不被新请求打断：<b>chunked</b>，并把 <code>chunk_tokens</code> 调到你能接受的单步时长。</li>
+</ul>
+<p>对 llmgen 预期和上表同方向：S2 的平均 TTFT 降三分之一，S3 的吞吐降 4% 左右 <span class="src est">推算</span>。</p>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>S2 TTFT mean (ms)：prefill_first</td><td class="num fill" contenteditable="true" data-key="20-scheduling.html|S2 TTFT mean (ms)：prefill_first|before"></td><td class="num fill" contenteditable="true" data-key="20-scheduling.html|S2 TTFT mean (ms)：prefill_first|after"></td><td class="num gain"></td></tr><tr><td>S2 TTFT mean (ms)：chunked</td><td class="num fill" contenteditable="true" data-key="20-scheduling.html|S2 TTFT mean (ms)：chunked|before"></td><td class="num fill" contenteditable="true" data-key="20-scheduling.html|S2 TTFT mean (ms)：chunked|after"></td><td class="num gain"></td></tr><tr><td>S3 输出吞吐 (tok/s)：prefill_first</td><td class="num fill" contenteditable="true" data-key="20-scheduling.html|S3 输出吞吐 (tok/s)：prefill_first|before"></td><td class="num fill" contenteditable="true" data-key="20-scheduling.html|S3 输出吞吐 (tok/s)：prefill_first|after"></td><td class="num gain"></td></tr><tr><td>S3 输出吞吐 (tok/s)：chunked</td><td class="num fill" contenteditable="true" data-key="20-scheduling.html|S3 输出吞吐 (tok/s)：chunked|before"></td><td class="num fill" contenteditable="true" data-key="20-scheduling.html|S3 输出吞吐 (tok/s)：chunked|after"></td><td class="num gain"></td></tr><tr><td>S3 ITL p99 (ms)：chunked</td><td class="num fill" contenteditable="true" data-key="20-scheduling.html|S3 ITL p99 (ms)：chunked|before"></td><td class="num fill" contenteditable="true" data-key="20-scheduling.html|S3 ITL p99 (ms)：chunked|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td>chunked 下某条序列的输出比 prefill_first 多 / 少 token</td><td><code>postprocess</code> 里 <code>num_computed_tokens</code> 要对每条 Entry 都更新（包括不产出 token 的中间块）。</td></tr><tr><td>chunked 下卡死（<code>SchedulerStuck</code>）</td><td><code>chunk_tokens</code> 设成了 0，或 running 里有序列 <code>remaining = 0</code>。后者说明 <code>num_computed_tokens</code> 多加了。</td></tr><tr><td>抢占之后输出错</td><td>被抢占的序列 <code>num_computed_tokens</code> 必须清零（<code>BlockManager.deallocate</code> 里做了），重新 prefill 时 <code>q_start = 0</code>、长度是 prompt + 已生成。</td></tr><tr><td>chunked 下 <code>n_graph_steps</code> 很少</td><td>正常：只有纯 decode 步才回放图。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li>能说清两种策略各自让谁等</li><li>量了 S2、S3 在两种策略下的 TTFT 和吞吐</li><li>阶段 5 结束：把四个场景的数字填进总览页的汇总表</li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="19-batched-forward.html"><small>← 上一步</small>批量前向 execute(entries)</a><a class="next" href="21-cli-load.html"><small>下一步 →</small>CLI 与快速加载</a></div>
+</main>
+</div>
+</body>
+</html>

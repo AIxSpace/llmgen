@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CPU：计算类算子 · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html" class="active"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">CPU 支线</div>
+<h1>CPU：计算类算子</h1>
+<p class="lead">Linear、逐元素、RMSNorm，以及 CPU 算子的单测。</p>
+<div class="callout goal"><span class="t">本步目标</span>把 CPU 上四类“纯计算”的算子换掉：Linear、add / mul / silu、RMSNorm。Linear 决定 CPU 的速度，建议最先做；RMSNorm 决定 CPU 和 CUDA 能不能逐 token 相同，必须和主线第 11 步一起做。</div>
+<h2 id="linear">Linear（建议最先做；对应主线第 12 步）</h2>
+<h3>原理</h3>
+<p>CPU 上 Linear 占 99% 的时间（见 <a href="cpu-2-tools.html">C2</a> 的日志）。它和 GPU 上的 GEMV 是同一个问题：decode 时每步要把 1.2 GB 权重读一遍，瓶颈是内存带宽和有多少个核在同时读。</p>
+<div class="codeblock"><div class="cap"><span><b>backend/cpu/linear.zig</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">const T = @import(&quot;../../tensor.zig&quot;);
+const c = @import(&quot;common.zig&quot;);
+const Tensor = T.Tensor;
+
+const Ctx = struct { y: *anyopaque, y_f32: bool, x: [*]const c.bf16, w: [*]const c.bf16, m: usize, n: usize, k: usize };
+
+const M_TILE = 32;
+
+fn cols(ctx: Ctx, n0: usize, n1: usize) void {
+    var m0: usize = 0;
+    while (m0 &lt; ctx.m) : (m0 += M_TILE) {
+        const m1 = @min(m0 + M_TILE, ctx.m);
+        for (n0..n1) |j| {
+            const wr = ctx.w + j * ctx.k;
+            for (m0..m1) |i| {
+                const v = c.dotBf16(ctx.x + i * ctx.k, wr, ctx.k);
+                if (ctx.y_f32) c.ptrAs(f32, ctx.y)[i * ctx.n + j] = v else c.ptrAs(c.bf16, ctx.y)[i * ctx.n + j] = c.f2bf(v);
+            }
+        }
+    }
+}
+
+/// src[0]=x[M, in], src[1]=W[in, out](BF16) → y[M, out](BF16 或 f32).
+/// M = 本趟 T(token 区节点)或 S(lm_head 这类序列区节点).
+pub const LinearImpl = struct {
+    pub fn execute(out: *Tensor, dev_id: i32) !void {
+        _ = dev_id;
+        const w = out.src[1].?;
+        const ctx = Ctx{
+            .y = out.data.?,
+            .y_f32 = out.dtype == .GGML_TYPE_F32,
+            .x = c.bf16Of(out.src[0].?),
+            .w = c.bf16Of(w),
+            .m = @intCast(c.rowsOf(out)),
+            .n = @intCast(c.dimAt(w, 1)),
+            .k = @intCast(c.dimAt(w, 0)),
+        };
+        if (ctx.m == 0) return;
+        c.parallelFor(ctx.n, @max(1, 65536 / (ctx.k * ctx.m)), ctx, cols); // 每块至少 ~64K 次乘加
+    }
+};</code></pre></div>
+<p>三个设计点：</p>
+<ul>
+  <li><b>按输出列并行。</b>N 个输出各是一个独立的点积。<code>parallelFor(n, …)</code> 把输出列均分给线程，每个线程读自己那一段权重行，互不干扰。</li>
+  <li><b>内层 SIMD。</b><code>dotBf16</code> 一次处理 VLEN 个 bf16（AVX2 是 8 个）。</li>
+  <li><b>M 分块。</b>prefill 时 M 可以是几百上千。循环顺序是“块内先 n 再 m”：一行权重（2 KB）读进来后，给块内 32 行输入各用一次，然后才换下一行权重。权重只从内存读一遍；32 行输入共 64 KB，待在 L2 里。如果反过来先 m 再 n，每行输入都要把整个权重矩阵重新读一遍。</li>
+</ul>
+<p>grain 的算法 <code>65536 / (k · m)</code> 保证每块至少约 6.5 万次乘加，小矩阵不会被切得太碎。</p>
+<h3>改动</h3>
+<p>llmgen 的权重维度是 <code>[N, K]</code>（lab 是 <code>[K, N]</code>），行数从 <code>x.dims[1]</code> 读：</p>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cpu/linear.zig</b> <span class="tag new">新建文件</span></span><button type="button">复制</button></div><pre><code class="language-zig">//! cpu/linear.zig -- LinearImpl&lt;CPU&gt;: y[M, N] = x[M, K] · W[N, K]^T, bf16 输入, f32 累加
+//! 输出列 N 均分给线程;线程内 @Vector 点积;按 M_TILE 行一块输入, 一行权重读进来给块内各行复用。
+const Tensor = @import(&quot;../../Tensor.zig&quot;);
+const c = @import(&quot;common.zig&quot;);
+
+const Ctx = struct { y: *anyopaque, y_f32: bool, x: [*]const c.bf16, w: [*]const c.bf16, m: usize, n: usize, k: usize };
+
+const M_TILE = 32;
+
+fn cols(ctx: Ctx, n0: usize, n1: usize) void {
+    var m0: usize = 0;
+    while (m0 &lt; ctx.m) : (m0 += M_TILE) {
+        const m1 = @min(m0 + M_TILE, ctx.m);
+        for (n0..n1) |j| {
+            const wr = ctx.w + j * ctx.k;
+            for (m0..m1) |i| {
+                const v = c.dotBf16(ctx.x + i * ctx.k, wr, ctx.k);
+                if (ctx.y_f32) c.ptrAs(f32, ctx.y)[i * ctx.n + j] = v else c.ptrAs(c.bf16, ctx.y)[i * ctx.n + j] = c.f2bf(v);
+            }
+        }
+    }
+}
+
+/// src[0] = x [1, M, K] bf16, src[1] = W [N, K] bf16 → out [1, M, N](bf16 或 f32)
+pub const LinearImpl = struct {
+    pub fn execute(_: i32, out_tensor: *Tensor) !void {
+        const x = out_tensor.src[0].?;
+        const w = out_tensor.src[1].?;
+        if (x.data_type != .GGML_TYPE_BF16 or w.data_type != .GGML_TYPE_BF16) return error.LinearNeedsBf16;
+        const ctx = Ctx{
+            .y = out_tensor.data.?,
+            .y_f32 = out_tensor.data_type == .GGML_TYPE_F32,
+            .x = c.bf16Of(x),
+            .w = c.bf16Of(w),
+            .m = c.dimAt(x, 1),
+            .n = c.dimAt(w, 0),
+            .k = c.dimAt(w, 1),
+        };
+        if (ctx.m == 0) return;
+        c.parallelFor(ctx.n, @max(1, 65536 / (ctx.k * ctx.m)), ctx, cols); // 每块至少约 64K 次乘加
+    }
+};
+// 同文件里的 MatmulImpl 没人用了, 可以留着也可以删</code></pre></div>
+<h3>数值</h3>
+<p>f32 累加，最后舍入一次，和 <code>.cu</code> 一样。求和顺序和 CUDA 的 GEMV / cuBLAS 不同，结果有 f32 最后一位的差别，舍入到 bf16 后绝大多数相同。</p>
+
+<h2 id="elementwise">add / mul / silu（对应主线第 10 步）</h2>
+<p>原来的实现走通用的 <code>binary(out, fn)</code> + <code>elemF32</code>。换成 bf16 直读直写，大张量时并行：</p>
+<div class="codeblock"><div class="cap"><span><b>backend/cpu/arithmetic.zig、activation.zig</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">const T = @import(&quot;../../tensor.zig&quot;);
+const c = @import(&quot;common.zig&quot;);
+const Tensor = T.Tensor;
+
+const Op = enum { add, mul };
+fn Binary(comptime op: Op) type {
+    return struct {
+        const Ctx = struct { out: [*]c.bf16, a: [*]const c.bf16, b: [*]const c.bf16 };
+        fn body(ctx: Ctx, beg: usize, end: usize) void {
+            for (beg..end) |i| {
+                const x = c.bf2f(ctx.a[i]);
+                const y = c.bf2f(ctx.b[i]);
+                ctx.out[i] = c.f2bf(switch (op) {
+                    .add =&gt; x + y,
+                    .mul =&gt; x * y,
+                });
+            }
+        }
+        /// src[0]=a, src[1]=b(同形).
+        pub fn execute(out: *Tensor, dev_id: i32) !void {
+            _ = dev_id;
+            const ctx = Ctx{ .out = c.bf16Of(out), .a = c.bf16Of(out.src[0].?), .b = c.bf16Of(out.src[1].?) };
+            c.parallelFor(@intCast(c.numelOf(out)), 32768, ctx, body);
+        }
+    };
+}
+
+/// out = a + b.
+pub const AddImpl = Binary(.add);
+/// out = a · b.
+pub const MulImpl = Binary(.mul);
+
+const T = @import(&quot;../../tensor.zig&quot;);
+const c = @import(&quot;common.zig&quot;);
+const Tensor = T.Tensor;
+
+const Ctx = struct { out: [*]c.bf16, x: [*]const c.bf16 };
+fn body(ctx: Ctx, beg: usize, end: usize) void {
+    for (beg..end) |i| {
+        const x = c.bf2f(ctx.x[i]);
+        ctx.out[i] = c.f2bf(x / (1 + @exp(-x)));
+    }
+}
+
+pub const SiluImpl = struct {
+    pub fn execute(out: *Tensor, dev_id: i32) !void {
+        _ = dev_id;
+        c.parallelFor(@intCast(c.numelOf(out)), 16384, Ctx{ .out = c.bf16Of(out), .x = c.bf16Of(out.src[0].?) }, body);
+    }
+};</code></pre></div>
+<div class="codeblock diff"><div class="cap"><span><b>src/backend/cpu/arithmetic.zig、activation.zig：用 lab 的文件覆盖，改这几处</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln del">const T = @import(&quot;../../tensor.zig&quot;);</span><span class="ln add">const Tensor = @import(&quot;../../Tensor.zig&quot;);</span><span class="ln ctx">const c = @import(&quot;common.zig&quot;);</span><span class="ln del">const Tensor = T.Tensor;</span><span class="ln ctx">...</span><span class="ln del">        pub fn execute(out: *Tensor, dev_id: i32) !void {</span><span class="ln del">            _ = dev_id;</span><span class="ln add">        pub fn execute(_: i32, out: *Tensor) !void {</span><span class="ln ctx">            const ctx = Ctx{ .out = c.bf16Of(out), .a = c.bf16Of(out.src[0].?), .b = c.bf16Of(out.src[1].?) };</span><span class="ln del">            c.parallelFor(@intCast(c.numelOf(out)), 32768, ctx, body);</span><span class="ln add">            c.parallelFor(out.numElements(), 32768, ctx, body); // llmgen 的 dims 已经由 resolveDims 填实</span><span class="ln ctx">        }</span><span class="ln ctx">...</span><span class="ln ctx">// activation.zig 同样的三处:import、execute 的参数顺序、numelOf → numElements()</span></code></pre></div>
+<p>grain 给得很大（add / mul 32768，silu 16384）：decode 时这些张量只有一两千个元素，一定是串行的；prefill 几百个 token 时才会分给多个线程。</p>
+<p>数值和 <code>.cu</code> 逐点相同：add / mul 是精确的 f32 运算加一次舍入；silu 是 <code>x / (1 + exp(−x))</code>，CPU 的 <code>@exp</code> 和 GPU 的 <code>__expf</code> 可能差 1 ulp（f32），舍入到 bf16 后几乎总是相同。</p>
+
+<h2 id="norm">RMSNorm（对应主线第 11 步，必须同步）</h2>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cpu/norm.zig</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-zig">pub const RmsNormImpl = struct {
+    pub fn execute(_: i32, out_tensor: *Tensor) !void {
+        const x = out_tensor.src[0].?;
+        const gain = out_tensor.src[1].?;
+
+        const r = out_tensor.rank();
+
+        const last = common.dimAt(out_tensor, r - 1);
+
+        const rows = out_tensor.numElements() / last;
+
+        const eps = out_tensor.op_params[0];
+        const w_offset = out_tensor.op_params[1];
+
+        for (0..rows) |s| {
+            var ss: f32 = 0; // 平方和
+            for (0..last) |hidx| {
+                const v = common.elemF32(x, s * last + hidx);
+                ss += v * v; // 求平方
+            }
+
+            const scale = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(last)) + eps);
+
+            for (0..last) |hidx| {
+                const v = common.elemF32(x, s * last + hidx) * scale * (common.elemF32(gain, hidx) + w_offset);
+                common.storeF32(out_tensor, s * last + hidx, v);
+            }
+        }
+    }
+};</code></pre></div>
+<p>原来的写法是 <code>x · scale · gain</code> 一次算完再舍入。主线第 11 步把 CUDA 的舍入点改成了 PyTorch 的 <code>(x · rstd).to(bf16) · w</code>。<b>CPU 不跟着改，两边的 norm 输出就会在部分元素上差 1 ulp</b>，28 层累积后 greedy 输出会分叉。</p>
+<div class="codeblock"><div class="cap"><span><b>backend/cpu/normalization.zig</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">const T = @import(&quot;../../tensor.zig&quot;);
+const c = @import(&quot;common.zig&quot;);
+const Tensor = T.Tensor;
+
+const Ctx = struct { out: [*]c.bf16, x: [*]const c.bf16, w: [*]const f32, d: usize, eps: f32 };
+
+fn rows(ctx: Ctx, r0: usize, r1: usize) void {
+    const d = ctx.d;
+    for (r0..r1) |r| {
+        const x = ctx.x + r * d;
+        var ss: f32 = 0;
+        for (0..d) |i| ss += c.bf2f(x[i]) * c.bf2f(x[i]);
+        const rstd = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(d)) + ctx.eps);
+        const o = ctx.out + r * d;
+        for (0..d) |i| o[i] = c.f2bf(c.roundBf(c.bf2f(x[i]) * rstd) * ctx.w[i]);
+    }
+}
+
+/// src[0]=x(BF16), src[1]=norm 权重(加载期转 f32); op_params[0]=eps.
+pub const RmsNormImpl = struct {
+    pub fn execute(out: *Tensor, dev_id: i32) !void {
+        _ = dev_id;
+        const w = out.src[1].?;
+        const d: usize = @intCast(c.dimAt(w, 0));
+        const n: usize = @intCast(c.numelOf(out));
+        c.parallelFor(n / d, @max(1, 16384 / d), Ctx{ .out = c.bf16Of(out), .x = c.bf16Of(out.src[0].?), .w = c.ptrAs(f32, w.data), .d = d, .eps = out.op_params[0] }, rows);
+    }
+};</code></pre></div>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cpu/norm.zig</b> <span class="tag edit">修改</span></span><button type="button">复制</button></div><pre><code class="language-zig">// ---- src/backend/cpu/norm.zig: 换掉 RmsNormImpl ----
+const NormCtx = struct { out: [*]c.bf16, x: [*]const c.bf16, w: [*]const f32, d: usize, eps: f32 };
+
+fn normRows(ctx: NormCtx, r0: usize, r1: usize) void {
+    const d = ctx.d;
+    for (r0..r1) |r| {
+        const x = ctx.x + r * d;
+        var ss: f32 = 0;
+        for (0..d) |i| ss += c.bf2f(x[i]) * c.bf2f(x[i]);
+        const rstd = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(d)) + ctx.eps);
+        const o = ctx.out + r * d;
+        // 舍入点和 .cu 一样:(x·rstd) 先舍入到 bf16, 再乘权重, 再舍入
+        for (0..d) |i| o[i] = c.f2bf(c.roundBf(c.bf2f(x[i]) * rstd) * ctx.w[i]);
+    }
+}
+
+/// 行宽 = 权重长度:attn_norm / ffn_norm / final_norm 按 hidden, q_norm / k_norm 按 head_dim
+pub const RmsNormImpl = struct {
+    pub fn execute(_: i32, out_tensor: *Tensor) !void {
+        const x = out_tensor.src[0].?;
+        const w = out_tensor.src[1].?;
+        if (w.data_type != .GGML_TYPE_F32 or x.data_type != .GGML_TYPE_BF16) return error.RmsNormNeedsBf16AndF32Gain;
+        const d = w.numElements();
+        c.parallelFor(x.numElements() / d, @max(1, 16384 / d), NormCtx{
+            .out = c.bf16Of(out_tensor),
+            .x = c.bf16Of(x),
+            .w = c.ptrAs(f32, w.data),
+            .d = d,
+            .eps = out_tensor.op_params[0],
+        }, normRows);
+    }
+};</code></pre></div>
+<p>行宽取权重长度，和 CUDA 的 Impl 同一个约定，所以 q_norm / k_norm 在 token-major 的 <code>[1, T, n, hd]</code> 上不用特殊处理：每 128 个数一行。</p>
+<p>原实现里的 <code>w_offset</code>（<code>op_params[1]</code>）在 Qwen3 的图里恒为 0，这里不再读。</p>
+
+<h2 id="tests">单测（对应主线第 15 步）</h2>
+<p>主线第 15 步的 <code>kernel_test.zig</code> 是“CUDA kernel 对一个写在测试里的 f32 参考”，只在 <code>-Dcuda</code> 时编译。CPU 算子需要自己的一组，纯 CPU 构建就能跑（mac 上也行）。lab 把它们放在 <code>ops.zig</code> 末尾，经派发入口 <code>kernel.xxx</code> 调用，顺带测了派发：</p>
+<div class="codeblock"><div class="cap"><span><b>ops.zig · 测试辅助</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">// ============================================================
+// 测试:用小张量对拍公式(经 kernel.* 走完整派发, CPU 特化)
+// ============================================================
+const testing = std.testing;
+const bf = common.f2bf;
+const fb = common.bf2f;
+
+fn mk(dtype: T.DataType, data: anytype, dims: [4]i64) Tensor {
+    return Tensor{ .data = @ptrCast(data.ptr), .dtype = dtype, .dims = dims, .device = .CPU };
+}
+
+fn toBf(comptime n: usize, v: [n]f32) [n]u16 {
+    var o: [n]u16 = undefined;
+    for (v, 0..) |x, i| o[i] = bf(x);
+    return o;
+}</code></pre></div>
+<div class="codeblock"><div class="cap"><span><b>ops.zig · CPU 算子的单测</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">test &quot;embedding 取行 + 越界报错&quot; {
+    var wd = toBf(6, .{ 1, 2, 3, 4, 5, 6 }); // [hidden=2, vocab=3]
+    var w = mk(.GGML_TYPE_BF16, &amp;wd, .{ 2, 3, 0, 0 });
+    var ids = [_]i32{ 2, 0 };
+    var idt = mk(.GGML_TYPE_I32, &amp;ids, .{ 2, 0, 0, 0 });
+    var od = [_]u16{0} ** 4;
+    var out = mk(.GGML_TYPE_BF16, &amp;od, .{ 2, 2, 0, 0 });
+    out.src[0] = &amp;idt;
+    out.src[1] = &amp;w;
+    setStep(.{ .n_tok = 2, .hidden = 2 });
+    try kernel.embedding(&amp;out, 0);
+    try testing.expectEqualSlices(u16, &amp;toBf(4, .{ 5, 6, 1, 2 }), &amp;od);
+    ids[0] = 9;
+    try testing.expectError(EmbError.TokenOutOfRange, kernel.embedding(&amp;out, 0));
+}
+
+test &quot;rms_norm 对拍公式: hidden 行与每头两种行宽&quot; {
+    var xd = toBf(4, .{ 1, 2, 3, 4 }); // [T=2, 2]
+    var x = mk(.GGML_TYPE_BF16, &amp;xd, .{ -1, 2, 0, 0 });
+    var gd = [_]f32{ 1, 1 };
+    var g = mk(.GGML_TYPE_F32, &amp;gd, .{ 2, 0, 0, 0 });
+    var od = [_]u16{0} ** 4;
+    var out = mk(.GGML_TYPE_BF16, &amp;od, .{ -1, 2, 0, 0 });
+    out.src[0] = &amp;x;
+    out.src[1] = &amp;g;
+    setStep(.{ .n_tok = 2 });
+    try kernel.rmsNorm(&amp;out, 0);
+    try testing.expectApproxEqAbs(@as(f32, 0.63246), fb(od[0]), 4e-3);
+    try testing.expectApproxEqAbs(@as(f32, 1.26491), fb(od[1]), 8e-3);
+    // 每头: x 看成 [T, 2 头, 1], 行宽 = 权重长度 1 → 每个元素单独归一化为 ±1
+    var g1d = [_]f32{2};
+    var g1 = mk(.GGML_TYPE_F32, &amp;g1d, .{ 1, 0, 0, 0 });
+    out.dims = .{ -1, 2, 1, 0 };
+    out.src[1] = &amp;g1;
+    try kernel.rmsNorm(&amp;out, 0);
+    for (od) |o| try testing.expectApproxEqAbs(@as(f32, 2), fb(o), 1e-2);
+}
+
+test &quot;linear: 权重布局 [in, out], bf16 与 f32 两种输出&quot; {
+    var xd = toBf(4, .{ 1, 2, 3, 4 }); // [M=2, in=2]
+    var x = mk(.GGML_TYPE_BF16, &amp;xd, .{ -1, 2, 0, 0 });
+    var wd = toBf(6, .{ 1, 0, 0, 1, 1, 1 }); // 行 o = W + o*in
+    var w = mk(.GGML_TYPE_BF16, &amp;wd, .{ 2, 3, 0, 0 });
+    var od = [_]u16{0} ** 6;
+    var out = mk(.GGML_TYPE_BF16, &amp;od, .{ -1, 3, 0, 0 });
+    out.src[0] = &amp;x;
+    out.src[1] = &amp;w;
+    setStep(.{ .n_tok = 2 });
+    try kernel.linear(&amp;out, 0);
+    try testing.expectEqualSlices(u16, &amp;toBf(6, .{ 1, 2, 3, 3, 4, 7 }), &amp;od);
+    var of32 = [_]f32{0} ** 6;
+    var out32 = mk(.GGML_TYPE_F32, &amp;of32, .{ -1, 3, 0, 0 });
+    out32.src = out.src;
+    try kernel.linear(&amp;out32, 0);
+    try testing.expectEqualSlices(f32, &amp;.{ 1, 2, 3, 3, 4, 7 }, &amp;of32);
+}
+
+test &quot;add / mul / silu 逐元素&quot; {
+    var ad = toBf(4, .{ 1, 2, 3, 4 });
+    var a = mk(.GGML_TYPE_BF16, &amp;ad, .{ -1, 4, 0, 0 });
+    var bd = toBf(4, .{ 10, 20, 30, 40 });
+    var b = mk(.GGML_TYPE_BF16, &amp;bd, .{ -1, 4, 0, 0 });
+    var od = [_]u16{0} ** 4;
+    var out = mk(.GGML_TYPE_BF16, &amp;od, .{ -1, 4, 0, 0 });
+    out.src[0] = &amp;a;
+    out.src[1] = &amp;b;
+    setStep(.{ .n_tok = 1 });
+    try kernel.add(&amp;out, 0);
+    try testing.expectEqualSlices(u16, &amp;toBf(4, .{ 11, 22, 33, 44 }), &amp;od);
+    try kernel.mul(&amp;out, 0);
+    try testing.expectEqualSlices(u16, &amp;toBf(4, .{ 10, 40, 90, 160 }), &amp;od);
+    out.src[1] = null;
+    try kernel.silu(&amp;out, 0);
+    try testing.expectApproxEqAbs(@as(f32, 1.0 / (1.0 + @exp(-1.0))), fb(od[0]), 4e-3);
+}
+
+test &quot;rope: 查 cos/sin 表, 位置取 pos[]&quot; {
+    // [T=1, 1 头, hd=2]: (a, b) 旋转 θ → (a cosθ − b sinθ, b cosθ + a sinθ)
+    var xd = toBf(2, .{ 1, 0 });
+    var x = mk(.GGML_TYPE_BF16, &amp;xd, .{ -1, 1, 2, 0 });
+    var od = [_]u16{0} ** 2;
+    var out = mk(.GGML_TYPE_BF16, &amp;od, .{ -1, 1, 2, 0 });
+    out.src[0] = &amp;x;
+    var tab = [_]f32{ 1, 0, 0, 1 }; // 位置 0: θ=0; 位置 1: θ=90°
+    var pos = [_]i32{1};
+    setStep(.{ .n_tok = 1, .cos_sin = &amp;tab, .pos = &amp;pos });
+    try kernel.applyRope(&amp;out, 0);
+    try testing.expectEqualSlices(u16, &amp;toBf(2, .{ 0, 1 }), &amp;od);
+}
+
+test &quot;gather_last 按 last[] 取行 + sample greedy 取 argmax(并列取小下标)&quot; {
+    var xd = toBf(6, .{ 1, 2, 3, 4, 5, 6 }); // [T=3, H=2]
+    var x = mk(.GGML_TYPE_BF16, &amp;xd, .{ -1, 2, 0, 0 });
+    var od = [_]u16{0} ** 4;
+    var out = mk(.GGML_TYPE_BF16, &amp;od, .{ -2, 2, 0, 0 });
+    out.src[0] = &amp;x;
+    var last = [_]i32{ 2, 0 };
+    var temps = [_]f32{ 0, 0 };
+    var seed = [_]u64{42};
+    setStep(.{ .n_tok = 3, .n_seq = 2, .hidden = 2, .last = &amp;last, .temps = &amp;temps, .seed = &amp;seed });
+    try kernel.gatherLast(&amp;out, 0);
+    try testing.expectEqualSlices(u16, &amp;toBf(4, .{ 5, 6, 1, 2 }), &amp;od);
+
+    var ld = toBf(6, .{ 0.5, 3, 3, -1, -2, -0.5 }); // [S=2, V=3]
+    var logits = mk(.GGML_TYPE_BF16, &amp;ld, .{ -2, 3, 0, 0 });
+    var ids = [_]i32{ -1, -1 };
+    var sout = mk(.GGML_TYPE_I32, &amp;ids, .{ -2, 0, 0, 0 });
+    sout.src[0] = &amp;logits;
+    try kernel.sample(&amp;sout, 0);
+    try testing.expectEqualSlices(i32, &amp;.{ 1, 2 }, &amp;ids);
+    temps = .{ 1, 1 }; // 带温度: 结果仍是合法下标, 且对同一 seed 可复现
+    try kernel.sample(&amp;sout, 0);
+    const first = ids;
+    try kernel.sample(&amp;sout, 0);
+    try testing.expectEqualSlices(i32, &amp;first, &amp;ids);
+    for (ids) |i| try testing.expect(i &gt;= 0 and i &lt; 3);
+}</code></pre></div>
+<p>移植到 llmgen 时要改的和前面几节一样：张量多一维 batch（dims 从 <code>{ -1, 2, 0, 0 }</code> 变成 <code>{ 1, 2, 2, 0 }</code> 这种已填实的形状）、权重维度 <code>[N, K]</code>、rope 是两张表、<code>mk()</code> 里的字段名（<code>dtype</code> → <code>data_type</code>）。attention 的两个测试已经随 C3 搬过来了。</p>
+
+<h3>CPU 当 CUDA 的参考</h3>
+<p>CPU 算子全部换完之后，端到端对拍多了一个维度：</p>
+<div class="codeblock"><div class="cap"><span><b>终端</b> <span class="tag out">命令</span></span><button type="button">复制</button></div><pre><code class="language-bash"># 同一个 prompt、greedy, 两个后端各跑一遍, 比 token id
+./zig-out/bin/llminfer chat &quot;中国的首都是哪里？&quot; 64 --device cpu  2&gt;&amp;1 | grep &quot;token ids&quot; &gt; /tmp/cpu.txt
+./zig-out/bin/llminfer chat &quot;中国的首都是哪里？&quot; 64 --device cuda 2&gt;&amp;1 | grep &quot;token ids&quot; &gt; /tmp/cuda.txt
+diff /tmp/cpu.txt /tmp/cuda.txt &amp;&amp; echo 逐 token 相同</code></pre></div>
+<p>从主线第 12 步起，这个 diff 应该为空。之后每改一次 CUDA kernel，这是最快的回归检查：CPU 的实现都是朴素循环，出错的概率小得多。</p>
+
+<h2>对拍验证</h2>
+<ul>
+  <li><code>zig build test</code> 通过。</li>
+  <li>纯 CPU 构建跑 <code>chat</code>：Linear 换完后，速度应该从“一个 token 等十几秒”变成每秒十几个 token。</li>
+  <li>主线第 12 步之后：CPU 和 CUDA 的 greedy 输出逐 token 相同。</li>
+</ul>
+<h2>性能收益</h2>
+<h3>依据</h3>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th class="num">改前</th><th class="num">改后</th><th>来源</th></tr></thead><tbody><tr><td>llmgen 早期 CPU 基线：Linear 平均（单线程标量）</td><td class="num">87.4 ms / 次</td><td class="num">—</td><td><span class="src start">llmgen 早期 CPU 日志</span></td></tr><tr><td>llmgen 早期 CPU 基线：SILU 平均</td><td class="num">1075.3 µs / 次</td><td class="num">—</td><td><span class="src start">llmgen 早期 CPU 日志</span></td></tr><tr><td>lab：3090 主机 CPU（32 线程）单请求 decode</td><td class="num">—</td><td class="num">21 tok/s</td><td><span class="src lab">lab CPU 实测</span></td></tr><tr><td>lab：mac M3 Pro CPU 单请求 decode</td><td class="num">—</td><td class="num">20–29 tok/s</td><td><span class="src lab">lab CPU 实测</span></td></tr></tbody></table></div>
+<h3>对 llmgen 的预期</h3>
+<p><b>Linear</b> 是 CPU 上唯一要紧的算子。早期日志里它平均 87 ms 一次（含 prefill 的大矩阵和 lm_head）。换完之后一个 decode 步的全部 197 次 Linear 加起来应该在 50 ms 左右，对应 lab 的 21 tok/s <span class="src lab">lab CPU 实测</span>。这大约是两个数量级的差别，来自线程数 × SIMD 宽度 × 去掉逐元素分支。</p>
+<p>上限由内存带宽决定：每步读 1.2 GB 权重，双通道 DDR4 约 30–40 GB/s，下限 30–40 ms，也就是 25–30 tok/s 封顶 <span class="src est">推算</span>。M 系列芯片的统一内存带宽更高，所以笔记本能跑到 20–29 tok/s。</p>
+<p><b>其余算子</b>在 decode 时合计不到 1 ms；它们的并行化主要帮 prefill。</p>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>CPU 单请求 decode (tok/s)</td><td class="num fill" contenteditable="true" data-key="cpu-4-kernels-math.html|CPU 单请求 decode (tok/s)|before"></td><td class="num fill" contenteditable="true" data-key="cpu-4-kernels-math.html|CPU 单请求 decode (tok/s)|after"></td><td class="num gain"></td></tr><tr><td>LINEAR 平均耗时 · decode (µs)</td><td class="num fill" contenteditable="true" data-key="cpu-4-kernels-math.html|LINEAR 平均耗时 · decode (µs)|before"></td><td class="num fill" contenteditable="true" data-key="cpu-4-kernels-math.html|LINEAR 平均耗时 · decode (µs)|after"></td><td class="num gain"></td></tr><tr><td>CPU TTFT · 21 token prompt (ms)</td><td class="num fill" contenteditable="true" data-key="cpu-4-kernels-math.html|CPU TTFT · 21 token prompt (ms)|before"></td><td class="num fill" contenteditable="true" data-key="cpu-4-kernels-math.html|CPU TTFT · 21 token prompt (ms)|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td>Linear 换完后输出全错</td><td>N 和 K 取反了。llmgen 的权重是 <code>[N, K]</code>：<code>n = dims[0]</code>，<code>k = dims[1]</code>。</td></tr><tr><td>多线程比单线程还慢</td><td>Debug 构建；或者机器上别的进程占着核，自旋的工作线程在抢。用 ReleaseFast。</td></tr><tr><td>CPU 和 CUDA 在第 11 步之后开始分叉</td><td>CPU 的 RMSNorm 没换，舍入点不同。</td></tr><tr><td><code>error.RmsNormNeedsBf16AndF32Gain</code></td><td>和 CUDA 同一个约定：norm 权重是 F32。</td></tr><tr><td>mac 上 <code>dotBf16</code> 的结果和 x86 差最后一位</td><td>VLEN 不同（NEON 是 4，AVX2 是 8），部分和的条数不同。f32 层面的正常差别。</td></tr><tr><td>prefill 很慢，decode 正常</td><td>注意力是 O(T²) 的朴素实现（C3）。长 prompt 在 CPU 上本来就慢。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li>CPU 单请求 decode 达到每秒十几个 token</li><li><code>zig build test</code> 通过</li><li>主线第 12 步之后：CPU 和 CUDA 的 greedy token id 逐个相同</li><li><code>backend/cpu/</code> 的热路径上没有 <code>elemF32</code> / <code>storeF32</code></li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="cpu-3-kernels-layout.html"><small>← 上一步</small>CPU：布局相关的算子</a><a class="next" href="cpu-5-exec-cli.html"><small>下一步 →</small>CPU：执行层与命令行</a></div>
+</main>
+</div>
+</body>
+</html>

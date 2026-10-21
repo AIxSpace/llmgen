@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Linear：GEMV + cuBLAS · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html" class="active"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">阶段 3 · kernel</div>
+<h1>Linear：GEMV + cuBLAS</h1>
+<p class="lead">decode 读权重的带宽，决定 ITL 的下限。</p>
+<div class="callout goal"><span class="t">本步目标</span>Linear 分两条路：decode 的小批（M ≤ 2）走自写的 GEMV，其余走 cuBLAS 的 bf16 tensor core GEMM。decode 的时间有七成花在这里。</div>
+<h2>原理</h2>
+<h3>decode 的 Linear 是在“读权重”</h3>
+<p>decode 时每个 Linear 的输入只有一行：<code>y[N] = W[N, K] · x[K]</code>，矩阵乘向量（GEMV）。计算量很小（每个权重元素一次乘加），但<b>每个权重都得读一遍</b>。</p>
+<p>Qwen3-0.6B 每步要读的权重：28 层 × 7 个 Linear，加上 lm_head 的 297 MB，共 1.19 GB。按 3090 的显存带宽，下限是 1.27 ms。目标 lab 的 ITL 是 2.449 ms，其中约 1.5 ms 就是在读权重。</p>
+<p>所以 decode 的 Linear 只有一个指标：<b>读权重的带宽</b>。nsys 里融合版 S1 的 kernel 时间，GEMV 一项占 69.7% <span class="src lab">nsys 实测</span>。</p>
+
+<h3>起点：全交给 cuBLAS</h3>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cuda/linear.cu</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">// 对照 LinearImpl&lt;Device::CUDA&gt;::execute(Tensor* out, int32_t dev_id) 的 cuBLAS 分支
+//   x: [M, K]  w: [N, K](GGUF 行主, dims = [K, N])  out: [M, N]
+extern &quot;C&quot; void cuda_linear(void *out, const void *x, const void *w, int dtype, int wdtype,
+                            int64_t M, int64_t K, int64_t N, int dev_id) {
+    cudaSetDevice(dev_id);
+
+    const void* A = w;
+    if (wdtype != dtype) {
+        if (dtype != GT_F32) {
+            fprintf(stderr, &quot;Linear: mixed dtype only supports f32 activations\n&quot;);
+            return;
+        }
+        long wn = (long)N * K;
+        float* wf32 = dequant_scratch(wn);
+        constexpr int threads = 256;
+        dequant_weight_kernel&lt;&lt;&lt;(unsigned)((wn + threads - 1) / threads), threads&gt;&gt;&gt;(wf32, w, wdtype, wn);
+        A = wf32;
+    }
+
+    cudaDataType_t cdtype = to_cuda_dtype(dtype);
+    const float alpha = 1.0f, beta = 0.0f;
+    const void* Bptr = x;
+    void*       C = out;
+    const int ldb = K, ldc = N;
+    const long long strideA = 0;
+    const long long strideB = M * K;
+    const long long strideC = M * N;
+
+    cublasHandle_t handle = CublasHandlePool::get();
+    cublasGemmStridedBatchedEx(
+        handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, K,
+        &amp;alpha,
+        A, cdtype, K, strideA,
+        Bptr, cdtype, ldb, strideB,
+        &amp;beta,
+        C, cdtype, ldc, strideC,
+        1,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, &quot;Linear GEMM launch failed: %s\n&quot;, cudaGetErrorString(err));
+    }
+}</code></pre></div>
+<p>激活和权重都是 bf16，直接交给 <code>cublasGemmStridedBatchedEx</code>。这对 prefill（M 很大）是对的选择，对 M = 1 则未必：cuBLAS 按通用 GEMM 的思路挑 kernel，有分块、有启动开销。</p>
+
+<h3>自写 GEMV 的线程映射</h3>
+<p>一个 warp 负责输出的一行（一个 n）：32 个 lane 交错读权重的第 n 行，每个 lane 一次读一个 <code>bf16x8</code>，累加自己的部分和，最后 <code>warp_sum</code>。</p>
+<div class="diagram">
+<div class="gridviz" style="grid-template-columns: repeat(8, 1fr)">
+  <div class="on">lane 0<br>k=0,32,64,96</div><div class="on">lane 1<br>k=1,33,65,97</div><div class="on">lane 2</div><div class="on">…</div>
+  <div class="on">lane 29</div><div class="on">lane 30</div><div class="on">lane 31<br>k=31,63,95,127</div><div class="off">← W 的第 n 行，K = 1024 = 128 个 bf16x8</div>
+</div>
+<div class="cap2">一个 warp 顺序扫过权重的一行（2 KB 连续显存）。8 个 warp 一个 block，处理 8 行。</div>
+</div>
+<p>M = 2 时，同一次读出来的权重和两行 x 各乘一遍：权重只读一次。这就是模板参数 <code>M</code> 的作用。</p>
+<div class="codeblock"><div class="cap"><span><b>backend/cuda/linear.cu</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">// lab: module-serving-unfused -- linear.cu: y[M,N] = x[M,K] · W[N,K]^T
+//
+// 对照 module-style linear.cu: 那里每次调用都把 BF16 权重反量化成 f32 临时显存再 cublasSgemm(无 tensor core).
+// 这里权重常驻显存且保持 BF16, 分两条路:
+//   M ≤ SV_GEMV_MAX_M(decode 极小批): 自写 GEMV —— 一个 warp 负责一行输出, 16B 向量化顺序读权重行, M 个输入行复用同一次权重读取.
+//     decode 是纯带宽受限(每步把 1.2GB 权重读一遍), M=1~2 时它比 cuBLAS 快 ~10%(cuda-course 第 05 课).
+//   其余: cuBLAS GemmEx(A/B=BF16, C=BF16 或 f32, compute=32F) → tensor core.
+//     M 变大后 GEMV 每个 lane 要为 M 行各解包一次 x、各累加一份, 计算和寄存器压力上来:
+//     M=8 时 lm_head 只剩 487 GB/s, cuBLAS 仍有 864 GB/s; 而 CUDA Graph 的 decode 桶 1,2,4,8 会把 5~7 条序列补到 8,
+//     所以阈值卡在 cuBLAS 反超之前. cuBLAS 用 cuda_init 里的固定 workspace, 照样能录进 CUDA Graph.
+//
+// 行主 → 列主换算(cuBLAS 路): y 行主 [M,N] == 列主 [N,M]
+//   C_cm[N,M] = op(W)^T[N,K] · op(x)[K,M];  W 行主 [N,K] = 列主 [K,N] → OP_T, lda=K; x 行主 [M,K] = 列主 [K,M] → OP_N, ldb=K
+#include &quot;cuda_common.cuh&quot;
+
+#define GEMV_WARPS 8
+#ifndef SV_GEMV_MAX_M
+#define SV_GEMV_MAX_M 2 // 3090 实测见 README.md 的「GEMV 阈值」一节
+#endif
+
+template &lt;int M, bool OUT_F32&gt;
+__global__ void __launch_bounds__(GEMV_WARPS * 32) gemv_kernel(void *y, const bf16x8 *x, const bf16x8 *w, int N, int K8) {
+    const int lane = threadIdx.x &amp; 31;
+    const int n = blockIdx.x * GEMV_WARPS + (threadIdx.x &gt;&gt; 5);
+    if (n &gt;= N) return; // 整个 warp 一起退出(n 在 warp 内一致), 不影响下面的 warp shuffle
+    const bf16x8 *wr = w + (long)n * K8;
+    float acc[M];
+#pragma unroll
+    for (int m = 0; m &lt; M; ++m) acc[m] = 0.f;
+#pragma unroll 4
+    for (int k = lane; k &lt; K8; k += 32) {
+        float wf[8];
+        unpack8(wr[k], wf);
+#pragma unroll
+        for (int m = 0; m &lt; M; ++m) {
+            float xf[8];
+            unpack8(x[(long)m * K8 + k], xf);
+#pragma unroll
+            for (int e = 0; e &lt; 8; ++e) acc[m] += wf[e] * xf[e];
+        }
+    }
+#pragma unroll
+    for (int m = 0; m &lt; M; ++m) {
+        float v = warp_sum(acc[m]);
+        if (lane == 0) {
+            if (OUT_F32) ((float *)y)[(long)m * N + n] = v;
+            else ((bf16 *)y)[(long)m * N + n] = f2bf(v);
+        }
+    }
+}
+
+template &lt;int M&gt;
+static void launch_gemv(void *y, int y_f32, const cuda_bf16_t *x, const cuda_bf16_t *w, int N, int K) {
+    dim3 grid((N + GEMV_WARPS - 1) / GEMV_WARPS);
+    if (y_f32)
+        gemv_kernel&lt;M, true&gt;&lt;&lt;&lt;grid, GEMV_WARPS * 32, 0, g_cuda_stream&gt;&gt;&gt;(y, (const bf16x8 *)x, (const bf16x8 *)w, N, K / 8);
+    else
+        gemv_kernel&lt;M, false&gt;&lt;&lt;&lt;grid, GEMV_WARPS * 32, 0, g_cuda_stream&gt;&gt;&gt;(y, (const bf16x8 *)x, (const bf16x8 *)w, N, K / 8);
+}
+
+// 环境变量 SV_GEMV_MAX_M 覆盖编译期默认值(0 = 全走 cuBLAS, 最大 8), 首次调用读一次
+static int gemv_max_m() {
+    static const int m = [] {
+        int v = cuda_env_int(&quot;SV_GEMV_MAX_M&quot;, SV_GEMV_MAX_M);
+        v = v &lt; 0 ? 0 : (v &gt; 8 ? 8 : v);
+        if (v != SV_GEMV_MAX_M) fprintf(stderr, &quot;[serve] 回退开关 SV_GEMV_MAX_M=%d\n&quot;, v);
+        return v;
+    }();
+    return m;
+}
+
+extern &quot;C&quot; void cuda_linear(void *y, int y_f32, const cuda_bf16_t *x, const cuda_bf16_t *w, int M, int N, int K) {
+    if (M &lt;= 0) return;
+    if (M &lt;= gemv_max_m() &amp;&amp; K % 8 == 0) {
+        switch (M) {
+            case 1: launch_gemv&lt;1&gt;(y, y_f32, x, w, N, K); return;
+            case 2: launch_gemv&lt;2&gt;(y, y_f32, x, w, N, K); return;
+            case 3: launch_gemv&lt;3&gt;(y, y_f32, x, w, N, K); return;
+            case 4: launch_gemv&lt;4&gt;(y, y_f32, x, w, N, K); return;
+            case 5: launch_gemv&lt;5&gt;(y, y_f32, x, w, N, K); return;
+            case 6: launch_gemv&lt;6&gt;(y, y_f32, x, w, N, K); return;
+            case 7: launch_gemv&lt;7&gt;(y, y_f32, x, w, N, K); return;
+            case 8: launch_gemv&lt;8&gt;(y, y_f32, x, w, N, K); return;
+        }
+    }
+    const float alpha = 1.f, beta = 0.f;
+    cublasStatus_t st = cublasGemmEx(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                                     N, M, K,
+                                     &amp;alpha,
+                                     w, CUDA_R_16BF, K,
+                                     x, CUDA_R_16BF, K,
+                                     &amp;beta,
+                                     y, y_f32 ? CUDA_R_32F : CUDA_R_16BF, N,
+                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    if (st != CUBLAS_STATUS_SUCCESS) fprintf(stderr, &quot;[serve] cublasGemmEx failed: %d (M=%d N=%d K=%d)\n&quot;, (int)st, M, N, K);
+}</code></pre></div>
+
+<h3>M 多大该换 cuBLAS</h3>
+<div class="codeblock"><div class="cap"><span><b>cuda-course/results.txt · 第 05 课</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="nohighlight">[1] decode: y[M,N] = x[M,K]·W^T, W = [N=6144, K=1024] bf16 (Qwen3 gate_up, 12 MB)
+    带宽按 权重字节 / 时间 计算(x 和 y 很小可忽略)
+  [PASS] warp GEMV vs cuBLAS (M=8)      max|err| = 0.00391 (tol 0.02)
+      M   naive 一线程一行               warp GEMV           cuBLAS GemmEx
+      1      81.2 us    155 GB/s      16.5 us    761 GB/s      18.6 us    675 GB/s
+      2     158.0 us     80 GB/s      16.6 us    756 GB/s      19.0 us    661 GB/s
+      4     312.3 us     40 GB/s      21.1 us    597 GB/s      19.1 us    659 GB/s
+      8     619.9 us     20 GB/s      30.9 us    407 GB/s      19.1 us    659 GB/s
+
+    W = [151936, 1024] (lm_head, 297 MB, 远大于 L2)
+  [PASS] warp GEMV vs cuBLAS (M=8)      max|err| = 0.00781 (tol 0.02)
+      M   naive 一线程一行               warp GEMV           cuBLAS GemmEx
+      1        (太慢, 跳过)     344.4 us    904 GB/s     346.4 us    898 GB/s
+      2        (太慢, 跳过)     357.8 us    870 GB/s     353.3 us    881 GB/s
+      4        (太慢, 跳过)     383.2 us    812 GB/s     356.4 us    873 GB/s
+      8        (太慢, 跳过)     638.4 us    487 GB/s     359.7 us    865 GB/s
+    结论: M=1~2 时手写 GEMV 比 cuBLAS 快; M 变大后 GEMV 内层循环的计算和寄存器压力上来, cuBLAS 反超.
+    12 MB 的小矩阵只跑到 ~80% 带宽(数据量小, 启动和尾部占比大), 297 MB 的 lm_head 能到 ~96%.</code></pre></div>
+<p>M = 1、2 时自写 GEMV 比 cuBLAS 快约 12%（12 MB 的矩阵）；M = 4 起 cuBLAS 反超，M = 8 时 GEMV 只剩 407 GB/s。原因是 GEMV 的内层循环要为每个 M 各解包一次 x、各维护一个累加器，寄存器和计算压力随 M 线性增长；cuBLAS 的 kernel 不受影响。</p>
+<p>阈值定在 2 还有一个原因：第 17 步的 CUDA Graph 按批大小分桶（1, 2, 4, 8, 16, …），5–7 条序列会被补到 8。阈值要卡在 cuBLAS 反超之前。</p>
+
+<h3>prefill：tensor core</h3>
+<div class="codeblock"><div class="cap"><span><b>cuda-course/results.txt · 第 05 课</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="nohighlight">[2] prefill: M = N = K = 4096
+  [PASS] tiled f32 vs cublasSgemm       max|err| = 0.000206 (tol 0.01)
+  [PASS] GemmEx bf16 vs cublasSgemm     max|err| = 0.229 (tol 1)
+  smem tiled f32 (你写过的)      45521.564 us     3.02 TFLOPS (  8.5% of peak)
+  cublasSgemm f32                     6423.115 us    21.40 TFLOPS ( 60.1% of peak)
+  cublasGemmEx bf16 (tensor core)     2175.181 us    63.19 TFLOPS ( 89.0% of peak)
+    (f32 两行按 CUDA core 峰值 35.6 TFLOPS 算百分比, bf16 按 tensor core 峰值 71 TFLOPS)
+    module-style 每次 linear 都把 bf16 权重反量化成 f32 再 cublasSgemm, 丢掉了 tensor core</code></pre></div>
+<p>bf16 的 <code>cublasGemmEx</code> 走 tensor core，63.19 TFLOPS，是 f32 <code>cublasSgemm</code> 的 3 倍。llmgen 起点的 cuBLAS 调用已经是 bf16 + <code>CUBLAS_COMPUTE_32F</code>，这部分本来就对。</p>
+
+<h2>改动</h2>
+<h3><span class="stepno">1</span>全局 cuBLAS 句柄和固定 workspace</h3>
+<div class="codeblock diff"><div class="cap"><span><b>src/backend/cuda/cuda_context.cu · cuda_init</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">    checkCuda(cudaStreamCreateWithFlags(&amp;g_cuda_stream, cudaStreamNonBlocking), &quot;cudaStreamCreate&quot;);</span><span class="ln add">    if (cublasCreate(&amp;g_cublas) != CUBLAS_STATUS_SUCCESS) {</span><span class="ln add">        fprintf(stderr, &quot;[cuda_shim] cublasCreate failed\n&quot;);</span><span class="ln add">        return 2;</span><span class="ln add">    }</span><span class="ln add">    cublasSetStream(g_cublas, g_cuda_stream);</span><span class="ln add">    // 固定 workspace:第 17 步录制 CUDA Graph 时, cuBLAS 不能在录制期间自己申请显存</span><span class="ln add">    static void *cublas_ws = nullptr;</span><span class="ln add">    const size_t ws_bytes = 32 &lt;&lt; 20;</span><span class="ln add">    checkCuda(cudaMalloc(&amp;cublas_ws, ws_bytes), &quot;cublas workspace&quot;);</span><span class="ln add">    cublasSetWorkspace(g_cublas, cublas_ws, ws_bytes);</span><span class="ln add">    cublasSetMathMode(g_cublas, CUBLAS_DEFAULT_MATH);</span><span class="ln ctx">    g_inited = true;</span></code></pre></div>
+
+<h3><span class="stepno">2</span>换掉 linear.cu</h3>
+<p>用 lab 的 <code>linear.cu</code> 覆盖。llmgen 里另外几个 Linear 的实验文件（<code>linear_naive.cu</code> / <code>linear_hosted.cu</code> / <code>linear_cublas.cu</code> / <code>linear_common.cuh</code>）不在 <code>CUDA_SRC</code> 里，不影响构建，可以留着也可以删。</p>
+
+<h3><span class="stepno">3</span>Impl 和声明</h3>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cuda/linear.zig（整个文件换掉）</b> <span class="tag new">新建文件</span></span><button type="button">复制</button></div><pre><code class="language-zig">//! cuda/linear.zig -- LinearImpl&lt;CUDA&gt;
+//! M ≤ SV_GEMV_MAX_M(默认 2)走自写 GEMV, 其余走 cuBLAS BF16 GemmEx(tensor core)。
+const Tensor = @import(&quot;../../Tensor.zig&quot;);
+const cu = @import(&quot;cuda.zig&quot;);
+
+/// src[0] = x [1, M, K] bf16, src[1] = W [N, K] bf16 → out [1, M, N] bf16
+pub const LinearImpl = struct {
+    pub fn execute(device_id: i32, out_tensor: *Tensor) !void {
+        _ = device_id;
+        const x = out_tensor.src[0].?;
+        const w = out_tensor.src[1].?;
+        if (x.data_type != .GGML_TYPE_BF16 or w.data_type != .GGML_TYPE_BF16) return error.LinearNeedsBf16;
+        const y_f32: c_int = @intFromBool(out_tensor.data_type == .GGML_TYPE_F32);
+        cu.cuda_linear(out_tensor.data, y_f32, x.data, w.data, @intCast(x.dims[1]), @intCast(w.dims[0]), @intCast(w.dims[1]));
+    }
+};</code></pre></div>
+<div class="codeblock diff"><div class="cap"><span><b>声明（注意参数顺序从 M, K, N 变成了 M, N, K）</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">// ---- cuda_shim.h ----</span><span class="ln del">void cuda_linear(void *out, const void *x, const void *w, int dtype, int wdtype, int64_t M, int64_t K, int64_t N, int dev_id);</span><span class="ln add">void cuda_linear(void *y_dev, int y_f32, const cuda_bf16_t *x_dev, const cuda_bf16_t *w_dev, int M, int N, int K);</span><span class="ln ctx">// ---- cuda.zig ----</span><span class="ln del">pub extern fn cuda_linear(out: ?*anyopaque, x: ?*const anyopaque, w: ?*const anyopaque, dtype: c_int, wdtype: c_int, M: i64, K: i64, N: i64, dev_id: c_int) void;</span><span class="ln add">pub extern fn cuda_linear(y: ?*anyopaque, y_f32: c_int, x: ?*const anyopaque, w: ?*const anyopaque, M: c_int, N: c_int, K: c_int) void;</span></code></pre></div>
+
+<h2>对拍验证</h2>
+<p>GEMV 和 cuBLAS 的累加顺序不同，f32 的结果有最后一位的差别，舍入到 bf16 后绝大多数元素相同。验收：前 20 个 token 不变，全文通顺。</p>
+<p>到这一步，llmgen 所有的 kernel 都和 lab 相同了。用同一个 prompt、同样的 chat 模板，greedy 的输出 token id 应该和 lab 的 <code>chat</code> 命令<b>逐个相同</b>：</p>
+<div class="tablewrap"><table><thead><tr><th></th><th>llmgen</th><th>lab</th></tr></thead><tbody><tr><td>命令</td><td><code>make llmgen-cuda</code>（prompt 改成“中国的首都是哪里？”，max_new = 64，temperature = 0）</td><td><code>./zig-out/bin/lab-module-serving-unfused chat "中国的首都是哪里？" 64</code></td></tr><tr><td>注意</td><td><code>qwenChatTemplate(…, false)</code></td><td><code>qwenChatTemplate(…, true)</code>。第二个参数（是否开思考）要一致，否则 prompt 不同</td></tr></tbody></table></div>
+<p>再用回退开关量 GEMV 的贡献：</p>
+<div class="codeblock"><div class="cap"><span><b>终端</b> <span class="tag out">命令</span></span><button type="button">复制</button></div><pre><code class="language-bash">LLMGEN_WORKLOAD=…/s1.json make llmgen-cuda                    # 默认: M ≤ 2 走 GEMV
+SV_GEMV_MAX_M=0 LLMGEN_WORKLOAD=…/s1.json make llmgen-cuda    # 全部走 cuBLAS</code></pre></div>
+<h2>CPU 同步</h2>
+<div class="callout cpu"><span class="t">这一步 CPU 后端要做的事</span><b>应该早就做了</b>（CPU 支线建议最先做 Linear）。这一步之后 CUDA 的 kernel 全部和 lab 对齐，<code>--device cpu</code> 和 <code>--device cuda</code> 的 greedy token id 应该逐个相同。 <a href="cpu-4-kernels-math.html#linear">去看 →</a></div>
+<h2>性能收益</h2>
+<h3>依据</h3>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th class="num">改前</th><th class="num">改后</th><th>来源</th></tr></thead><tbody><tr><td>融合版 S1：全 cuBLAS → GEMV(M ≤ 2)（tok/s）</td><td class="num">439.2</td><td class="num">485</td><td><span class="src lab">消融实测</span></td></tr><tr><td>融合版 S4（批 4–8）：GEMV 阈值 8 → 2（tok/s）</td><td class="num">1660.5</td><td class="num">2129.8</td><td><span class="src lab">消融实测</span></td></tr><tr><td>gate_up [6144, 1024]，M = 1：cuBLAS → warp GEMV</td><td class="num">18.6 µs（675 GB/s）</td><td class="num">16.5 µs（761 GB/s）</td><td><span class="src lab">lab 实测</span></td></tr><tr><td>lm_head [151936, 1024]，M = 1</td><td class="num">346.4 µs</td><td class="num">344.4 µs</td><td><span class="src lab">lab 实测</span></td></tr><tr><td>融合版 S1 的 gemv_kernel 平均耗时</td><td class="num">—</td><td class="num">13.3 µs</td><td><span class="src lab">nsys 实测</span></td></tr></tbody></table></div>
+<h3>对 llmgen 的预期</h3>
+<p>lab 的消融：S1 上 GEMV 比全走 cuBLAS 快 1.10 倍（ITL 2.24 → 2.03 ms）。反过来，阈值设太大（8）会让 S4 慢 22%。</p>
+<p>对 llmgen：起点已经在用 bf16 的 cuBLAS，所以这一步的收益就是上面这 10% 左右 <span class="src est">推算</span>。如果你量到的提升远大于 10%，说明起点的 <code>cublasGemmStridedBatchedEx</code> 在 M = 1 时掉进了慢路径（lab 记录过 lm_head 输出 f32 时 cuBLAS 掉进 2.8 ms 的 <code>gemv2T</code> 路径），把改前的 LINEAR 平均耗时和上表对照一下就知道。</p>
+<p>到这里 decode 的 kernel 都到位了。S1 的 ITL 应该在 3 ms 上下，剩下和目标的差距是 launch 开销（第 17 步）。</p>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>S1 ITL mean (ms)：SV_GEMV_MAX_M=0</td><td class="num fill" contenteditable="true" data-key="12-linear-gemv.html|S1 ITL mean (ms)：SV_GEMV_MAX_M=0|before"></td><td class="num fill" contenteditable="true" data-key="12-linear-gemv.html|S1 ITL mean (ms)：SV_GEMV_MAX_M=0|after"></td><td class="num gain"></td></tr><tr><td>S1 ITL mean (ms)：默认</td><td class="num fill" contenteditable="true" data-key="12-linear-gemv.html|S1 ITL mean (ms)：默认|before"></td><td class="num fill" contenteditable="true" data-key="12-linear-gemv.html|S1 ITL mean (ms)：默认|after"></td><td class="num gain"></td></tr><tr><td>S1 输出吞吐 (tok/s)</td><td class="num fill" contenteditable="true" data-key="12-linear-gemv.html|S1 输出吞吐 (tok/s)|before"></td><td class="num fill" contenteditable="true" data-key="12-linear-gemv.html|S1 输出吞吐 (tok/s)|after"></td><td class="num gain"></td></tr><tr><td>LINEAR 平均耗时 · decode (µs)</td><td class="num fill" contenteditable="true" data-key="12-linear-gemv.html|LINEAR 平均耗时 · decode (µs)|before"></td><td class="num fill" contenteditable="true" data-key="12-linear-gemv.html|LINEAR 平均耗时 · decode (µs)|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td>输出全错</td><td>参数顺序。新接口是 <code>(M, N, K)</code>，旧的是 <code>(M, K, N)</code>。N 是输出维 = <code>w.dims[0]</code>，K 是输入维 = <code>w.dims[1]</code>。</td></tr><tr><td><code>cublasGemmEx failed: 1</code>（NOT_INITIALIZED）</td><td><code>g_cublas</code> 没建。<code>cuda_init</code> 里的 <code>cublasCreate</code> 要在第一次 Linear 之前。</td></tr><tr><td>prefill 时 <code>cublasGemmEx failed: 3</code>（ALLOC_FAILED）</td><td>固定 workspace 不够。32 MB 对 8192 × 3072 的 GEMM 是够的（lab 实测）；自己调大了 <code>max_seq</code> 就相应加大。</td></tr><tr><td><code>[serve] 回退开关 SV_GEMV_MAX_M=0</code> 没打印</td><td>环境变量在第一次调用 <code>cuda_linear</code> 时读一次。确认它传进了进程（<code>make</code> 会继承环境）。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li>greedy 输出和 lab 的 <code>chat</code> 逐 token 相同（同 prompt、同模板）</li><li>量了 <code>SV_GEMV_MAX_M=0</code> 和默认两种的 ITL</li><li>S1 的 ITL 在 3 ms 上下</li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="11-norm-rope.html"><small>← 上一步</small>RMSNorm 与 RoPE</a><a class="next" href="13-flash-decoding.html"><small>下一步 →</small>decode 注意力：split-K</a></div>
+</main>
+</div>
+</body>
+</html>

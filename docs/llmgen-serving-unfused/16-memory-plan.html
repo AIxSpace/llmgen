@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>活跃区间激活规划 · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html" class="active"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">阶段 4 · 执行层</div>
+<h1>活跃区间激活规划</h1>
+<p class="lead">一次规划，任意 T 复用；地址 = 基址 + 偏移 × T。</p>
+<div class="callout goal"><span class="t">本步目标</span>激活内存不再每步、每个节点现分配。启动时按“谁在什么时候还活着”规划一次每个节点的偏移，之后任何规模的一步都套同一份规划。结果是两件事：激活池的峰值降下来；同样规模的一步里，每个节点的地址恒定（第 17 步的前提）。</div>
+<h2>原理</h2>
+<h3>起点：bump 分配，按层回卷</h3>
+<div class="codeblock"><div class="cap"><span><b>src/executor.zig · forward()</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-zig">        // Phase 2:回卷到水位;换层时再回卷一次(层间复用激活内存)。
+        // prev_layer 以 -1 作&quot;未开始&quot;哨兵:layer -1 → 0 不回卷, embedding 的输出得以保留给第 0 层。
+        self.resetStepActivations();
+        var prev_layer: i32 = -1;
+        for (self.step_nodes.items) |t| {
+            if (prev_layer != -1 and t.layer_id != prev_layer) self.resetStepActivations();
+            prev_layer = t.layer_id;
+            try self.executorTensor(t);
+        }
+    }</code></pre></div>
+<div class="codeblock"><div class="cap"><span><b>src/executor.zig</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-zig">    fn allocateOutput(self: *Self, node: *Tensor, device_id: usize) !void {
+        const device_pools = self.memory_manager.get(node.device_type, device_id) orelse return error.NoDevicePools;
+        const activation_pool = &amp;(device_pools.activation orelse return error.NoActivationPool);
+        const nbytes = node.bytes();
+        if (nbytes == 0) return error.ZeroByteTensor; // 维度没解析(还含 -1)
+        const memory_block = try activation_pool.allocate(node.bytes(), 32);
+        node.data = memory_block.ptr;
+        node.offset = memory_block.offset;
+    }</code></pre></div>
+<p>每个节点执行前从激活池顺序切一块；换层时把游标拨回去，下一层覆盖上一层。池的容量要按“最大的那一层的所有激活之和”来定。</p>
+<p>它有两个问题：</p>
+<ul>
+  <li><b>一层之内不复用。</b>一层里 18 个 kernel 的输出加起来约 60 KB / token，但其中大部分用完马上就没人读了：<code>attn_norm</code> 的输出在 q / k / v 三个 Linear 算完后就死了，<code>gate</code> 在 silu 之后就死了。</li>
+  <li><b>地址取决于执行历史。</b>bump 分配的地址是“前面分了多少”的函数。虽然现在每步的结果碰巧相同，但这不是一个可以依赖的性质。</li>
+</ul>
+
+<h3>活跃区间</h3>
+<p>一个激活从它被算出来的那一步开始活，到它最后一个消费者执行完为止。之后它占的内存就可以给别人。</p>
+<div class="diagram">
+<div class="lanes">
+  <div class="lab">attn_norm</div><div class="lane"><span class="d">■■■■</span></div>
+  <div class="lab">q</div><div class="lane"><span class="x">·</span><span class="d">■■■</span></div>
+  <div class="lab">k</div><div class="lane"><span class="x">··</span><span class="d">■■■</span></div>
+  <div class="lab">v</div><div class="lane"><span class="x">···</span><span class="d">■■■■■■</span></div>
+  <div class="lab">q_norm</div><div class="lane"><span class="x">····</span><span class="h">■■</span><span class="x"> ← 可以放进 attn_norm 腾出的位置</span></div>
+  <div class="lab">残差 x</div><div class="lane"><span class="d">■■■■■■■■■■■■■■■■</span><span class="x"> 活到 attn_res</span></div>
+</div>
+<div class="cap2">横轴是执行序。同一时刻活着的激活不能重叠，其余位置可以复用。</div>
+</div>
+<p>规划算法是 first-fit：按执行序扫一遍，先释放已经死掉的区间，再给当前节点在现有区间的空隙里找第一个放得下的位置。</p>
+
+<h3>关键：按“每行字节”规划，对任意 T 都成立</h3>
+<p>图里的激活除了尾部几个，都是“每个 token 一行”：大小 = <code>行字节 × T</code>。如果直接按字节规划，T 一变就得重算。</p>
+<p>lab 的做法是把单位换成“每行字节”：规划出每个节点的行内偏移 <code>off</code>，运行时地址 = <code>base + off × T</code>。</p>
+<div class="callout tip"><span class="t">为什么不会重叠</span>
+两个同时活着的节点 A、B 在规划里满足 <code>off_A + row_A ≤ off_B</code>。两边同乘 T：<code>off_A·T + row_A·T ≤ off_B·T</code>，即 A 的整块在 B 之前结束。对任何 T 都成立。</div>
+<p>gather_last 之后的节点（logits、采样结果）每<b>序列</b>一行，单独一个区，地址 = <code>seq_base + off × S</code>。这就是第 08 步引入 <code>DYN_S</code> 的另一个用处：规划器靠它区分节点属于哪个区。</p>
+<p>视图节点（拆头的 reshape）不占空间，和根节点同址；视图的消费者算作根的使用点，会延长根的活跃区间。</p>
+<div class="codeblock"><div class="cap"><span><b>plan.zig（测试之前的全部）</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-zig">pub const Scale = enum { tok, seq };
+
+pub const Slot = struct {
+    node: *Tensor,
+    scale: Scale,
+    row_bytes: usize, // 对齐后的「每行」字节(单位偏移)
+    off: usize, // 在对应区里的「每行」偏移
+    view_of: ?usize = null, // 视图节点: 根节点在 slots 里的下标(不占空间, 地址 = 根的地址)
+};
+
+/// 对齐到 256 字节: off × T 仍是 256 的倍数(cuBLAS / 16B 向量化读写都满意).
+const ROW_ALIGN: usize = 256;
+
+pub const MemoryPlan = struct {
+    alloc: Alloc,
+    slots: []Slot, // 与 exec_order 一一对应
+    tok_row_bytes: usize, // token 区峰值(每 token 字节)
+    seq_row_bytes: usize, // 序列区峰值(每序列字节)
+
+    pub fn deinit(self: *MemoryPlan) void {
+        self.alloc.free(self.slots);
+    }
+
+    /// 把计划落到具体的 (T, S): 给每个计算节点的 data 赋地址.
+    pub fn bind(self: *const MemoryPlan, tok_base: usize, seq_base: usize, n_tok: usize, n_seq: usize) void {
+        for (self.slots) |s| {
+            if (s.view_of) |r| {
+                s.node.data = self.slots[r].node.data; // 执行序: 根一定在视图之前
+                continue;
+            }
+            const addr = switch (s.scale) {
+                .tok =&gt; tok_base + s.off * n_tok,
+                .seq =&gt; seq_base + s.off * n_seq,
+            };
+            s.node.data = @ptrFromInt(addr);
+        }
+    }
+
+    pub fn tokArenaBytes(self: *const MemoryPlan, max_tok: usize) usize {
+        return self.tok_row_bytes * max_tok;
+    }
+    pub fn seqArenaBytes(self: *const MemoryPlan, max_seq: usize) usize {
+        return self.seq_row_bytes * max_seq;
+    }
+};
+
+/// 行字节 &amp; 所属区: 动态维 DYN → token 区, DYN_S → 序列区; 其余维相乘 × dtype.
+fn rowOf(node: *const Tensor) !struct { scale: Scale, bytes: usize } {
+    var scale: ?Scale = null;
+    var n: usize = 1;
+    for (node.dims) |d| {
+        if (d == 0) break;
+        if (d == of.DYN) {
+            scale = .tok;
+        } else if (d == of.DYN_S) {
+            scale = .seq;
+        } else n *= @intCast(d);
+    }
+    const sc = scale orelse return error.StaticActivationUnsupported;
+    return .{ .scale = sc, .bytes = std.mem.alignForward(usize, n * node.dtype.size(), ROW_ALIGN) };
+}
+
+const Live = struct { off: usize, size: usize, until: usize };
+
+/// first-fit: 在当前存活区间(按偏移排序)之间找第一个放得下的空隙.
+fn place(live: *std.ArrayListUnmanaged(Live), alloc: Alloc, size: usize, until: usize) !usize {
+    std.sort.insertion(Live, live.items, {}, struct {
+        fn lt(_: void, a: Live, b: Live) bool {
+            return a.off &lt; b.off;
+        }
+    }.lt);
+    var cur: usize = 0;
+    for (live.items) |l| {
+        if (l.off &gt;= cur + size) break;
+        cur = @max(cur, l.off + l.size);
+    }
+    try live.append(alloc, .{ .off = cur, .size = size, .until = until });
+    return cur;
+}
+
+pub fn build(alloc: Alloc, graph: *const G.ComputeGraph) !MemoryPlan {
+    const order = graph.getExecutionOrder();
+
+    // 每个节点在执行序里的位置 + 最后一次被消费的位置
+    var pos: std.AutoHashMapUnmanaged(*Tensor, usize) = .empty;
+    defer pos.deinit(alloc);
+    for (order, 0..) |n, i| try pos.put(alloc, n, i);
+    // 视图 → 根节点下标(视图的视图也归到同一个根); 非视图的根是自己
+    const root = try alloc.alloc(usize, order.len);
+    defer alloc.free(root);
+    for (order, 0..) |n, i| {
+        root[i] = i;
+        if (n.type == .TENSOR_TYPE_VIEW) {
+            const si = pos.get(n.src[0] orelse return error.ViewWithoutSource) orelse return error.ViewOfNonActivation;
+            root[i] = root[si];
+        }
+    }
+    var last_use = try alloc.alloc(usize, order.len);
+    defer alloc.free(last_use);
+    for (order, 0..) |_, i| last_use[i] = i;
+    for (order, 0..) |n, i| {
+        for (n.src) |ms| {
+            const s = ms orelse continue;
+            if (pos.get(s)) |si| last_use[root[si]] = @max(last_use[root[si]], i);
+        }
+    }
+    // 图输出活到最后(采样结果要拷回 host)
+    for (graph.getExternalOutputs()) |o| {
+        if (pos.get(o)) |oi| last_use[root[oi]] = order.len;
+    }
+
+    const slots = try alloc.alloc(Slot, order.len);
+    errdefer alloc.free(slots);
+    var live_tok: std.ArrayListUnmanaged(Live) = .empty;
+    defer live_tok.deinit(alloc);
+    var live_seq: std.ArrayListUnmanaged(Live) = .empty;
+    defer live_seq.deinit(alloc);
+    var peak_tok: usize = 0;
+    var peak_seq: usize = 0;
+
+    for (order, 0..) |n, i| {
+        // 释放: 最后使用点 &lt; i 的区间(使用点 == i 的是本节点的输入, 不能与输出重叠)
+        inline for (.{ &amp;live_tok, &amp;live_seq }) |lv| {
+            var k: usize = 0;
+            while (k &lt; lv.items.len) {
+                if (lv.items[k].until &lt; i) _ = lv.swapRemove(k) else k += 1;
+            }
+        }
+        if (root[i] != i) {
+            const rs = slots[root[i]];
+            slots[i] = .{ .node = n, .scale = rs.scale, .row_bytes = 0, .off = rs.off, .view_of = root[i] };
+            continue;
+        }
+        const r = try rowOf(n);
+        const lv = if (r.scale == .tok) &amp;live_tok else &amp;live_seq;
+        const off = try place(lv, alloc, r.bytes, last_use[i]);
+        if (r.scale == .tok) peak_tok = @max(peak_tok, off + r.bytes) else peak_seq = @max(peak_seq, off + r.bytes);
+        slots[i] = .{ .node = n, .scale = r.scale, .row_bytes = r.bytes, .off = off };
+    }
+    return .{ .alloc = alloc, .slots = slots, .tok_row_bytes = peak_tok, .seq_row_bytes = peak_seq };
+}</code></pre></div>
+
+<h2>改动</h2>
+<h3><span class="stepno">1</span>新建 memory/plan.zig</h3>
+<div class="codeblock diff"><div class="cap"><span><b>src/memory/plan.zig：照搬 lab 的 plan.zig，改这几处，文件末尾的测试先不搬</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln del">const T = @import(&quot;tensor.zig&quot;);</span><span class="ln del">const G = @import(&quot;graph.zig&quot;);</span><span class="ln del">const of = @import(&quot;op_factory.zig&quot;);</span><span class="ln del"> </span><span class="ln del">const Tensor = T.Tensor;</span><span class="ln add">const Tensor = @import(&quot;../Tensor.zig&quot;);</span><span class="ln add">const base = @import(&quot;../module/base.zig&quot;); // DYN / DYN_S</span><span class="ln ctx">const Alloc = std.mem.Allocator;</span><span class="ln ctx">...</span><span class="ln ctx">// rowOf():</span><span class="ln del">        if (d == of.DYN) {</span><span class="ln add">        if (d == base.DYN) {</span><span class="ln ctx">            scale = .tok;</span><span class="ln del">        } else if (d == of.DYN_S) {</span><span class="ln add">        } else if (d == base.DYN_S) {</span><span class="ln ctx">...</span><span class="ln del">    return .{ .scale = sc, .bytes = std.mem.alignForward(usize, n * node.dtype.size(), ROW_ALIGN) };</span><span class="ln add">    return .{ .scale = sc, .bytes = std.mem.alignForward(usize, n * node.data_type.size(), ROW_ALIGN) };</span><span class="ln ctx">...</span><span class="ln ctx">// build(): llmgen 的执行序里混着权重 / 输入 / 只算一次的 CACHE 节点, 所以由调用方传&quot;每步都算的节点&quot;</span><span class="ln del">pub fn build(alloc: Alloc, graph: *const G.ComputeGraph) !MemoryPlan {</span><span class="ln del">    const order = graph.getExecutionOrder();</span><span class="ln add">pub fn build(alloc: Alloc, order: []const *Tensor, outputs: []const *Tensor) !MemoryPlan {</span><span class="ln ctx">...</span><span class="ln del">        if (n.type == .TENSOR_TYPE_VIEW) {</span><span class="ln add">        if (n.tensor_type == .TENSOR_TYPE_VIEW) {</span><span class="ln ctx">...</span><span class="ln del">    for (graph.getExternalOutputs()) |o| {</span><span class="ln add">    for (outputs) |o| {</span></code></pre></div>
+
+<h3><span class="stepno">2</span>调度器：先规划，再按规划定池容量</h3>
+<div class="codeblock diff"><div class="cap"><span><b>src/graph/scheduler.zig</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln add">const mp = @import(&quot;../memory/plan.zig&quot;);</span><span class="ln add">const exe = @import(&quot;../executor.zig&quot;);</span><span class="ln add">const qwen3 = @import(&quot;../models/qwen3.zig&quot;);</span><span class="ln ctx">...</span><span class="ln ctx">    pub const Config = struct {</span><span class="ln ctx">        ...</span><span class="ln add">        model: ?qwen3.Config = null, // llmgen.zig 里传 qwen3.Config.fromGGUF(gguf_info);算 workspace 大小要用头数和 head_dim</span><span class="ln ctx">    };</span><span class="ln ctx">...</span><span class="ln ctx">pub const GraphScheduler = struct {</span><span class="ln ctx">    ...</span><span class="ln ctx">    memory_manager: MemoryManager,</span><span class="ln add">    plan: ?mp.MemoryPlan = null,</span><span class="ln add">    step_nodes: std.ArrayList(*Tensor) = .empty, // 每步都算的节点(执行序), Executor 也用这一份</span><span class="ln ctx"> </span><span class="ln ctx">// ---- deinit() ----</span><span class="ln add">        if (self.plan) |*p| p.deinit();</span><span class="ln add">        self.step_nodes.deinit(self.allocator);</span><span class="ln ctx"> </span><span class="ln ctx">// ---- createMemoryPools(): 开头先做规划 ----</span><span class="ln add">        for (self.compute_graph.getExecutionOrder()) |t| {</span><span class="ln add">            if (t.isComputed() and t.tensor_type != .TENSOR_TYPE_CACHE) try self.step_nodes.append(self.allocator, t);</span><span class="ln add">        }</span><span class="ln add">        self.plan = try mp.build(self.allocator, self.step_nodes.items, self.compute_graph.getExecutionOutputs());</span><span class="ln ctx">...</span><span class="ln del">            var act_cap = max_act + copy_bytes;</span><span class="ln del">            if (act_cap &lt; 64 &lt;&lt; 20) act_cap = 64 &lt;&lt; 20;</span><span class="ln add">            // 激活池 = token 区峰值 + 序列区峰值 + 只算一次的拷贝代理(RoPE 表) + Executor 的常驻 workspace</span><span class="ln add">            const pl = &amp;self.plan.?;</span><span class="ln add">            const act_cap = pl.tokArenaBytes(@intCast(max_seq)) + pl.seqArenaBytes(exe.MAX_SEQS) + copy_bytes +</span><span class="ln add">                exe.Executor.workspaceBytes(@intCast(max_seq), self.config.model.?);</span></code></pre></div>
+<p>64 MB 的兜底不需要了：容量现在是算出来的，不是估的。</p>
+
+<h3><span class="stepno">3</span>Executor：两个区 + bind</h3>
+<div class="codeblock"><div class="cap"><span><b>src/executor.zig（MAX_SEQS 改成 pub const；qwen3.Config 经 GraphScheduler.Config.model 传给调度器）</b> <span class="tag new">新增</span></span><button type="button">复制</button></div><pre><code class="language-zig">// ---- 字段 ----
+    plan: *const mp.MemoryPlan, // = &amp;graph_scheduler.plan.?
+    tok_arena: usize = 0, //       token 区基址:每 token 一行的激活都住这里
+    seq_arena: usize = 0, //       序列区基址:gather_last 之后每序列一行的激活
+
+    /// 常驻 workspace 的字节数(元数据 + split-K scratch + 采样 scratch)。调度器建池时要把它算进去。
+    pub fn workspaceBytes(max_seq: usize, cfg: qwen3.Config) usize {
+        const A = pools.POOL_ALIGN;
+        const max_blocks = (max_seq + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        const nq: usize = @intCast(cfg.head_count);
+        const hd: usize = @intCast(cfg.key_length);
+        var cap: usize = 0;
+        var s: usize = 1;
+        while (s &lt;= MAX_SEQS) : (s += 1) cap = @max(cap, s * cuda_attn.maxParts(s, max_seq));
+        var total: usize = 0;
+        total += std.mem.alignForward(usize, Layout.init(max_seq, MAX_SEQS, max_seq / PF_TILE + MAX_SEQS, max_blocks).total, A);
+        total += std.mem.alignForward(usize, cap * nq * hd * 4, A); // part_o
+        total += std.mem.alignForward(usize, cap * nq * 2 * 4, A); //  part_ml
+        total += std.mem.alignForward(usize, MAX_SEQS * 32 * 8, A); // 采样 scratch(= cuda_sample_scratch_bytes)
+        return total + 4 * A;
+    }
+
+// ---- allocMeta() 里, markPersistent() 之前:切出两个激活区 ----
+        self.tok_arena = @intFromPtr((try pool.allocate(self.plan.tokArenaBytes(self.max_seq), pools.POOL_ALIGN)).ptr);
+        self.seq_arena = @intFromPtr((try pool.allocate(self.plan.seqArenaBytes(MAX_SEQS), pools.POOL_ALIGN)).ptr);</code></pre></div>
+<div class="codeblock diff"><div class="cap"><span><b>src/executor.zig（markPersistentCursor / resetStepActivations / persistent_cursor / executeView 可以删掉）</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">        self.resolveDims(@intCast(n_seq), @intCast(n_tok));</span><span class="ln ctx">        self.bindStep(lay, n_tok, n_seq, n_tiles, decode);</span><span class="ln add">        // 所有每步节点的输出地址一次绑好:地址 = 区基址 + 每行偏移 × 行数</span><span class="ln add">        self.plan.bind(self.tok_arena, self.seq_arena, n_tok, n_seq);</span><span class="ln ctx"> </span><span class="ln ctx">        // Phase 1:持久节点只算一次</span><span class="ln ctx">        if (!self.persistent_computed) {</span><span class="ln ctx">            self.memory_manager.resetAllActivations();</span><span class="ln ctx">            for (self.persistent_nodes.items) |t| try self.executorTensor(t);</span><span class="ln del">            try self.markPersistentCursor();</span><span class="ln ctx">            self.persistent_computed = true;</span><span class="ln ctx">        }</span><span class="ln ctx"> </span><span class="ln del">        // Phase 2:回卷到水位;换层时再回卷一次(层间复用激活内存)。</span><span class="ln del">        self.resetStepActivations();</span><span class="ln del">        var prev_layer: i32 = -1;</span><span class="ln del">        for (self.step_nodes.items) |t| {</span><span class="ln del">            if (prev_layer != -1 and t.layer_id != prev_layer) self.resetStepActivations();</span><span class="ln del">            prev_layer = t.layer_id;</span><span class="ln del">            try self.executorTensor(t);</span><span class="ln del">        }</span><span class="ln add">        // Phase 2:每步节点按执行序派发, 不再分配也不再回卷</span><span class="ln add">        try self.runNodes();</span><span class="ln ctx">        return self.fetchOut(n_seq);</span><span class="ln ctx">    }</span><span class="ln add"> </span><span class="ln add">    fn runNodes(self: *Self) !void {</span><span class="ln add">        for (self.graph_scheduler.step_nodes.items) |t| try self.executorTensor(t);</span><span class="ln add">    }</span><span class="ln ctx"> </span><span class="ln ctx">// ---- executorTensor() ----</span><span class="ln del">        if (isViewOp(tensor.op_type)) {</span><span class="ln del">            return executeView(tensor); // 内部转换处理</span><span class="ln del">        }</span><span class="ln add">        if (isViewOp(tensor.op_type)) return; // 视图和它的根同址, plan.bind 已经设好</span><span class="ln ctx">        const device_id = self.graph_scheduler.deviceIdForLayer(tensor.layer_id) orelse 0;</span><span class="ln del"> </span><span class="ln del">        try self.allocateOutput(tensor, device_id);</span><span class="ln add">        // 只算一次的 CACHE 节点(RoPE 表及其拷贝代理)不在规划里, 仍然从池里 bump 一块</span><span class="ln add">        if (tensor.tensor_type == .TENSOR_TYPE_CACHE) try self.allocateOutput(tensor, device_id);</span></code></pre></div>
+
+<h2>对拍验证</h2>
+<p>只改了激活放在哪，没改任何计算。输出必须和上一步<b>逐 token 相同</b>，kernel_test 不受影响。</p>
+<p>规划错了的典型症状是“某一层之后数值突然乱掉”：两个同时活着的激活重叠了。lab 的 <code>plan.zig</code> 末尾有一个逐对检查不重叠的测试，建议移植（它依赖一个合成的小模型 <code>fake_gguf.zig</code>，可以换成直接对真实图跑）。</p>
+<p>lab 启动时会打印两个区的大小：</p>
+<div class="codeblock"><div class="cap"><span><b>cuda-course/results-serving.txt</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="nohighlight">[executor] ... | 激活 token 区 176 MB + 序列区 75 MB | ...        # lab: 单趟 8192 token, 256 条序列
+[executor] ... | 激活 token 区 44 MB + 序列区 75 MB | ...         # lab: 单趟 2048 token</code></pre></div>
+<p>折算下来 token 区约 21.5 KB / token，序列区约 293 KB / 序列（主要是一行 logits，151936 × 2 B）。</p>
+<h2>CPU 同步</h2>
+<div class="callout cpu"><span class="t">这一步 CPU 后端要做的事</span><b>不用动。</b>规划的是“每行偏移”，和设备无关；两个区的基址在 CPU 上就是 CPU 池里的地址。可以先在 mac 上把这一步跑通。 <a href="cpu-5-exec-cli.html">去看 →</a></div>
+<h2>性能收益</h2>
+<h3>依据</h3>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th class="num">改前</th><th class="num">改后</th><th>来源</th></tr></thead><tbody><tr><td>token 区（lab，8192 token）</td><td class="num">—</td><td class="num">176 MB = 21.5 KB / token</td><td><span class="src lab">消融实测</span></td></tr><tr><td>序列区（lab，256 序列）</td><td class="num">—</td><td class="num">75 MB = 293 KB / 序列</td><td><span class="src lab">消融实测</span></td></tr><tr><td>llmgen 起点激活池（max_seq = 1024）</td><td class="num">341 MiB</td><td class="num">—</td><td><span class="src start">llmgen 起点实测</span></td></tr></tbody></table></div>
+<h3>对 llmgen 的预期</h3>
+<p><b>内存</b>：按层回卷时，一层的激活之和约 60 KB / token；规划后峰值约 21.5 KB / token，降到三分之一左右 <span class="src est">推算</span>。<code>max_seq = 1024</code> 时 token 区约 22 MB，序列区 0.3 MB。这在单序列时无关紧要，到第 19 步单趟 8192 token 时，是 176 MB 对 490 MB 的差别。</p>
+<p><b>速度</b>：每步省掉五百次 <code>allocateOutput</code> 和 28 次回卷，都是纳秒级的 host 操作，ITL 上看不出来。</p>
+<p>这一步真正的产出是<b>地址恒定</b>：同样的 (T, S)，每个节点的输出地址每步都相同。下一步的 CUDA Graph 把 kernel 的参数（包括指针）录下来回放，要求的正是这一点。</p>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>激活池容量 (MiB)</td><td class="num fill" contenteditable="true" data-key="16-memory-plan.html|激活池容量 (MiB)|before"></td><td class="num fill" contenteditable="true" data-key="16-memory-plan.html|激活池容量 (MiB)|after"></td><td class="num gain"></td></tr><tr><td>S1 ITL mean (ms)</td><td class="num fill" contenteditable="true" data-key="16-memory-plan.html|S1 ITL mean (ms)|before"></td><td class="num fill" contenteditable="true" data-key="16-memory-plan.html|S1 ITL mean (ms)|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td><code>error.StaticActivationUnsupported</code></td><td>规划器遇到了没有动态维的节点。传给 <code>build</code> 的列表里混进了 CACHE 节点（RoPE 表）。只传每步都算的节点。</td></tr><tr><td><code>error.ViewOfNonActivation</code></td><td>某个视图的源不在列表里。视图的源必须是每步都算的激活。</td></tr><tr><td>某一层之后数值乱</td><td>两个活着的激活重叠。最常见的原因：有 kernel 读了不是自己 <code>src</code> 的张量（规划器不知道这个依赖）。阶段 1–3 的 kernel 都只读 <code>src</code> 和元数据，不该出现。</td></tr><tr><td><code>OutOfPoolMemory</code></td><td><code>workspaceBytes</code> 少算了某块 scratch，或者 RoPE 表的拷贝代理（<code>copy_bytes</code>）没加进去。</td></tr><tr><td>第二次 <code>generate</code> 时 RoPE 表被覆盖</td><td>两个区和 workspace 要在 <code>markPersistent()</code> <b>之前</b>切；CACHE 节点在它之后 bump，只做一次。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li>输出和上一步逐 token 相同</li><li><code>forward</code> 里没有逐节点分配和回卷了</li><li>同一规模的两步，打印任意节点的 <code>data</code> 地址，两次相同</li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="15-kernel-test.html"><small>← 上一步</small>kernel 对拍</a><a class="next" href="17-cuda-graph.html"><small>下一步 →</small>CUDA Graph</a></div>
+</main>
+</div>
+</body>
+</html>

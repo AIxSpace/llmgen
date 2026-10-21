@@ -1,0 +1,13 @@
+{
+  "backend": "cuda",
+  "prompt_tokens": 21,
+  "gen_tokens": 455,
+  "prefill_ms": 417.871987,
+  "ttft_ms": 423.339934,
+  "tpot_ms": 65.300489,
+  "itl_p50_ms": 64.42215,
+  "itl_p99_ms": 73.477085,
+  "prefill_tps": 50.25462498877677,
+  "decode_tps": 15.313820769701067,
+  "e2e_ms": 30135.062997
+}

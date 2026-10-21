@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>token-major 零拷贝拆头 · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html" class="active"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">阶段 1 · 去掉主机开销</div>
+<h1>token-major 零拷贝拆头</h1>
+<p class="lead">拆头不发 kernel，RoPE 从元数据读位置。</p>
+<div class="callout goal"><span class="t">本步目标</span>q / k / v 拆头不再发 kernel：<code>[1, T, n·hd]</code> 直接当成 <code>[1, T, n, hd]</code> 看。RoPE 改成 token-major 的 kernel，位置从元数据读。<b>这一步做完先别跑</b>，注意力和写 KV 要到第 06 步才配套。</div>
+<h2>原理</h2>
+<h3>head-major 和 token-major</h3>
+<p>Linear 算出来的 q 是 <code>[T, n·hd]</code>：每个 token 一行，一行里 16 个头依次排开。这在内存里已经是 <code>[T, n, hd]</code> 了，reshape 不用动数据。</p>
+<p>起点沿用了 PyTorch 的习惯，再 permute 成 <code>[n, T, hd]</code>（head-major），因为 <code>F.scaled_dot_product_attention</code> 要这个形状：</p>
+<div class="codeblock"><div class="cap"><span><b>src/module/shape.zig · HeadSplit</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-zig">        pub fn forward(self: *Self, x: *Tensor) !*Tensor {
+            // [B, seq, n*hd] → reshape [B, seq, n, hd](视图) → permute {0,2,1,3}(kernel) → [B, n, seq, hd]
+            return reshapePermute(
+                self.allocator,
+                x,
+                &amp;.{ 1, base.DYN, self.n_head, self.head_dim },
+                &amp;.{ 0, 2, 1, 3 },
+                self.name,
+                self.layer_id,
+            );
+        }
+    };
+}</code></pre></div>
+<div class="codeblock"><div class="cap"><span><b>src/module/attention.zig</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-zig">    pub fn forward(self: *Self, q: *Tensor, k: *Tensor, v: *Tensor) !*Tensor {
+        const attn = try attention(
+            self.allocator,
+            q,
+            k,
+            v,
+            null,
+            -1,
+            true,
+            0,
+            self.name_attn,
+            self.layer_id,
+            self.op,
+        );
+
+        // [B, n_head, seq, hd] → permute {0,2,1,3} → reshape(视图)回 [B, seq, q_dim]
+        return shape.permuteReshape(
+            self.allocator,
+            attn,
+            &amp;.{ 0, 2, 1, 3 },
+            &amp;.{ 1, base.DYN, self.q_dim },
+            self.name_attn_traspose,
+            self.layer_id,
+        );
+    }
+};</code></pre></div>
+<div class="diagram">
+<div class="lanes">
+  <div class="lab">token-major</div><div class="lane"><span class="d">t0·h0</span><span class="d">t0·h1</span><span class="d">…</span><span class="d">t0·h15</span><span class="h">t1·h0</span><span class="h">t1·h1</span><span class="h">…</span><span class="h">t1·h15</span></div>
+  <div class="lab">head-major</div><div class="lane"><span class="d">h0·t0</span><span class="h">h0·t1</span><span class="d">…</span><span class="d">h1·t0</span><span class="h">h1·t1</span><span class="d">…</span><span class="d">h15·t0</span><span class="h">h15·t1</span></div>
+</div>
+<div class="cap2">同一批数据的两种排法。Linear 的输出天然是上面那种。</div>
+</div>
+<p>每层为此发 4 个 permute kernel：q、k、v 各一个，注意力输出再转回来一个。28 层共 112 个 kernel，每个都把数据原样搬一遍，还各占一块激活内存。</p>
+
+<h3>注意力 kernel 其实不需要 head-major</h3>
+<p>自己写的注意力 kernel 想怎么寻址都行。token-major 下，第 t 个 token 第 h 个头的 q 在 <code>q + (t·n + h)·hd</code>，一样是连续的 128 个数。而 KV cache 是另一块内存，布局由我们自己定（第 06 步）。所以 permute 纯属多余。</p>
+<p>token-major 还有一个好处：多条序列的 token 可以直接首尾相接排成一个 <code>[T, …]</code>（第 19 步的变长打包），不需要 padding。head-major 做不到这一点。</p>
+
+<h3>RoPE 要跟着改</h3>
+<p>RoPE kernel 靠下标算出“这是第几个 token、第几个头”。起点按 head-major 解下标：</p>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cuda/rope.cu</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">template &lt;typename T&gt;
+__global__ void apply_rope_kernel(
+    T* __restrict__ out,
+    const T* __restrict__ input,
+    const float* __restrict__ cos_cache,
+    const float* __restrict__ sin_cache,
+    int64_t B, int64_t n_heads, int64_t seq_len,
+    int64_t head_dim, int64_t rope_half, int64_t rope_dim,
+    int64_t head_stride, int64_t batch_stride,
+    int64_t cos_stride, int64_t start_pos
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &gt;= B * n_heads * seq_len * head_dim) return;
+
+    int i = idx % head_dim;
+    int tmp = idx / head_dim;
+    int s = tmp % seq_len;
+    tmp /= seq_len;
+    int h = tmp % n_heads;
+    int b = tmp / n_heads;
+
+    const T* row_in = input + b * batch_stride + h * head_stride + s * head_dim;
+    T* row_out = out + b * batch_stride + h * head_stride + s * head_dim;
+    int64_t pos = start_pos + s;
+
+    if (i &lt; rope_half) {
+        float x0 = float(row_in[i]);
+        float x1 = float(row_in[i + rope_half]);
+        float c = cos_cache[pos * cos_stride + i];
+        float si = sin_cache[pos * cos_stride + i];
+        row_out[i] = T(x0 * c - x1 * si);
+        row_out[i + rope_half] = T(x0 * si + x1 * c);
+    } else if (i &gt;= rope_dim) {
+        row_out[i] = row_in[i];
+    }
+}</code></pre></div>
+<p>一个线程一个元素，每个线程做 4 次整数除法 / 取模来定位。位置是 <code>start_pos + s</code>，只适用于单条序列。</p>
+<p>lab 的写法：一个 block 一个 token，一个 warp 一个头，32 个 lane 每人管 2 对元素。下标直接从 <code>blockIdx</code> / <code>threadIdx</code> 来，没有除法；位置查 <code>positions[t]</code>：</p>
+<div class="codeblock"><div class="cap"><span><b>backend/cuda/rope.cu</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">// ------------------------------------------------------------------
+// rope(NEOX): 一个 block 一个 token, 一个 warp 一个头; lane 持有 i∈{lane, lane+32} 及其配对 i+64
+// ------------------------------------------------------------------
+__global__ void rope_kernel(bf16 *out, const bf16 *x, const float *cos_sin, const int *positions, int n_head) {
+    const int HD = 128, HALF = 64;
+    const int t = blockIdx.x, h = threadIdx.x &gt;&gt; 5, lane = threadIdx.x &amp; 31;
+    if (h &gt;= n_head) return;
+    const long base = ((long)t * n_head + h) * HD;
+    const float *cs = cos_sin + (long)positions[t] * HD;
+#pragma unroll
+    for (int j = 0; j &lt; 2; ++j) {
+        const int i = lane + 32 * j;
+        const float a = bf2f(x[base + i]), b = bf2f(x[base + i + HALF]), c = cs[i], s = cs[HALF + i];
+        out[base + i] = f2bf(a * c - b * s);
+        out[base + i + HALF] = f2bf(b * c + a * s);
+    }
+}
+
+extern &quot;C&quot; void cuda_rope(cuda_bf16_t *out, const cuda_bf16_t *x, const float *cos_sin, const int *positions, int T, int n_head,
+                        int hd) {
+    if (T &lt;= 0) return;
+    if (hd != 128 || n_head &gt; 32) {
+        fprintf(stderr, &quot;[serve] rope: 仅支持 head_dim=128 且 n_head&lt;=32\n&quot;);
+        return;
+    }
+    rope_kernel&lt;&lt;&lt;T, n_head * 32, 0, g_cuda_stream&gt;&gt;&gt;((bf16 *)out, (const bf16 *)x, cos_sin, positions, n_head);
+}</code></pre></div>
+
+<h2>改动</h2>
+<h3><span class="stepno">1</span>拆头改成视图</h3>
+<div class="codeblock diff"><div class="cap"><span><b>src/module/shape.zig · HeadSplit.forward</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">        pub fn forward(self: *Self, x: *Tensor) !*Tensor {</span><span class="ln del">            // [B, seq, n*hd] → reshape [B, seq, n, hd](视图) → permute {0,2,1,3}(kernel) → [B, n, seq, hd]</span><span class="ln del">            return reshapePermute(</span><span class="ln del">                self.allocator,</span><span class="ln del">                x,</span><span class="ln del">                &amp;.{ 1, base.DYN, self.n_head, self.head_dim },</span><span class="ln del">                &amp;.{ 0, 2, 1, 3 },</span><span class="ln del">                self.name,</span><span class="ln del">                self.layer_id,</span><span class="ln del">            );</span><span class="ln add">            // [1, T, n*hd] → reshape [1, T, n, hd]:零拷贝视图, 保持 token-major, 不发 kernel</span><span class="ln add">            return reshape(self.allocator, x, &amp;.{ 1, base.DYN, self.n_head, self.head_dim }, self.name, self.layer_id);</span><span class="ln ctx">        }</span></code></pre></div>
+
+<h3><span class="stepno">2</span>注意力输出转回来也改成视图</h3>
+<div class="codeblock diff"><div class="cap"><span><b>src/module/attention.zig</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">        const attn = try attention(</span><span class="ln ctx">            ...</span><span class="ln ctx">        );</span><span class="ln ctx"> </span><span class="ln del">        // [B, n_head, seq, hd] → permute {0,2,1,3} → reshape(视图)回 [B, seq, q_dim]</span><span class="ln del">        return shape.permuteReshape(</span><span class="ln del">            self.allocator,</span><span class="ln del">            attn,</span><span class="ln del">            &amp;.{ 0, 2, 1, 3 },</span><span class="ln del">            &amp;.{ 1, base.DYN, self.q_dim },</span><span class="ln del">            self.name_attn_traspose,</span><span class="ln del">            self.layer_id,</span><span class="ln del">        );</span><span class="ln add">        // [1, T, n_head, hd] 本来就是 token-major, reshape 成 [1, T, q_dim] 只是换个看法</span><span class="ln add">        return shape.reshape(self.allocator, attn, &amp;.{ 1, base.DYN, self.q_dim }, self.name_attn_traspose, self.layer_id);</span><span class="ln ctx">    }</span><span class="ln ctx"> </span><span class="ln ctx">...</span><span class="ln ctx">pub fn attention(...) !*Tensor {</span><span class="ln del">    const n_heads = q_rope.dims[1];</span><span class="ln del">    const n_kv_heads = k_rope.dims[1];</span><span class="ln add">    const n_heads = q_rope.dims[2]; // [1, T, n, hd]</span><span class="ln add">    const n_kv_heads = k_rope.dims[2];</span></code></pre></div>
+<p>Executor 的 <code>isViewOp</code> 已经把 <code>OP_TYPE_RESHAPE</code> 当视图处理（<code>executeView</code> 让它和源共享地址），所以执行层不用改。</p>
+
+<h3><span class="stepno">3</span>RoPE kernel</h3>
+<p>lab 的 kernel 读一张合并的 <code>cos_sin</code> 表；llmgen 的 cos 和 sin 是两张表，这里改成收两个指针，其余照搬：</p>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cuda/rope.cu（整个文件换掉）</b> <span class="tag new">新建文件</span></span><button type="button">复制</button></div><pre><code class="language-cpp">// rope.cu -- NEOX RoPE, token-major: x / out [T, n_head, 128]
+// 位置从本步元数据的 positions[t] 读, 不再是&quot;起点 + 序号&quot;。
+// cos / sin 是 llmgen 的两张 [max_seq, 128] f32 表(由 RopeCacheImpl&lt;CPU&gt; 算一次, 经拷贝代理常驻显存),
+// 每行前后两半存同一个角度, 这里只读前半 i ∈ [0, 64)。
+#include &quot;cuda_common.cuh&quot;
+
+// 一个 block 一个 token, 一个 warp 一个头; lane 持有 i ∈ {lane, lane+32} 及其配对 i+64
+__global__ void rope_kernel(bf16 *out, const bf16 *x, const float *cos_tab, const float *sin_tab, const int *positions, int n_head) {
+    const int HD = 128, HALF = 64;
+    const int t = blockIdx.x, h = threadIdx.x &gt;&gt; 5, lane = threadIdx.x &amp; 31;
+    if (h &gt;= n_head) return;
+    const long base = ((long)t * n_head + h) * HD;
+    const long row = (long)positions[t] * HD;
+#pragma unroll
+    for (int j = 0; j &lt; 2; ++j) {
+        const int i = lane + 32 * j;
+        const float a = bf2f(x[base + i]), b = bf2f(x[base + i + HALF]);
+        const float c = cos_tab[row + i], s = sin_tab[row + i];
+        out[base + i] = f2bf(a * c - b * s);
+        out[base + i + HALF] = f2bf(b * c + a * s);
+    }
+}
+
+extern &quot;C&quot; void cuda_rope(cuda_bf16_t *out, const cuda_bf16_t *x, const float *cos_tab, const float *sin_tab,
+                          const int *positions, int T, int n_head, int hd) {
+    if (T &lt;= 0) return;
+    if (hd != 128 || n_head &gt; 32) {
+        fprintf(stderr, &quot;rope: 仅支持 head_dim=128 且 n_head&lt;=32\n&quot;);
+        return;
+    }
+    rope_kernel&lt;&lt;&lt;T, n_head * 32, 0, g_cuda_stream&gt;&gt;&gt;((bf16 *)out, (const bf16 *)x, cos_tab, sin_tab, positions, n_head);
+}</code></pre></div>
+<div class="codeblock"><div class="cap"><span><b>src/backend/cuda/rope.zig（整个文件换掉）</b> <span class="tag new">新建文件</span></span><button type="button">复制</button></div><pre><code class="language-zig">//! cuda/rope.zig -- ApplyRopeImpl&lt;CUDA&gt;: token-major, 位置从本步元数据读
+const Tensor = @import(&quot;../../Tensor.zig&quot;);
+const c = @import(&quot;../cpu/common.zig&quot;);
+const cu = @import(&quot;cuda.zig&quot;);
+
+/// src[0] = x [1, T, n_head, hd] bf16, src[1] = cos / src[2] = sin [max_seq, hd] f32(显存)
+pub const ApplyRopeImpl = struct {
+    pub fn execute(device_id: i32, out_tensor: *Tensor) !void {
+        _ = device_id;
+        const x = out_tensor.src[0].?;
+        const cos = out_tensor.src[1].?;
+        const sin = out_tensor.src[2].?;
+        if (x.data_type != .GGML_TYPE_BF16) return error.RopeNeedsBf16;
+        cu.cuda_rope(out_tensor.data, x.data, cos.data, sin.data, c.g_step.pos, c.g_step.n_tok, @intCast(x.dims[2]), @intCast(x.dims[3]));
+    }
+};</code></pre></div>
+<div class="codeblock diff"><div class="cap"><span><b>声明</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">// ---- cuda_shim.h ----</span><span class="ln del">void cuda_apply_rope(void *out, const void *x, const float *cos, const float *sin, int dtype,</span><span class="ln del">                     int64_t B, int64_t n_heads, int64_t seq_len,</span><span class="ln del">                     int64_t head_dim, int64_t rope_dim, int64_t start_pos, int dev_id);</span><span class="ln add">void cuda_rope(cuda_bf16_t *out, const cuda_bf16_t *x, const float *cos_tab, const float *sin_tab,</span><span class="ln add">               const int *positions, int T, int n_head, int hd);</span><span class="ln ctx"> </span><span class="ln ctx">// ---- cuda.zig ----</span><span class="ln del">pub extern fn cuda_apply_rope(...) void;</span><span class="ln add">pub extern fn cuda_rope(out: ?*anyopaque, x: ?*const anyopaque, cos_tab: ?*const anyopaque, sin_tab: ?*const anyopaque, positions: ?*const anyopaque, T: c_int, n_head: c_int, hd: c_int) void;</span></code></pre></div>
+
+<h3><span class="stepno">4</span>删掉 setRopeStart</h3>
+<div class="codeblock diff"><div class="cap"><span><b>src/executor.zig（apply_rope_tensors 字段和它的收集循环也一并删掉）</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln del">        self.setRopeStart(0); // 第 05 步删掉:RoPE 改从元数据里读位置</span><span class="ln ctx">        try self.forward(&amp;.{.{ .seq = &amp;seq, .q_start = 0, .q_len = prompt.len }});</span><span class="ln ctx">...</span><span class="ln del">                self.setRopeStart(seq.len() - 1);</span><span class="ln ctx">                try self.forward(&amp;.{.{ .seq = &amp;seq, .q_start = seq.len() - 1, .q_len = 1 }});</span><span class="ln ctx">...</span><span class="ln del">    /// RoPE 起点写进每个 APPLY_ROPE 节点的 op_params[2](对照 C++ apply_rope_tensors_)。</span><span class="ln del">    fn setRopeStart(self: *Self, pos: usize) void {</span><span class="ln del">        for (self.apply_rope_tensors.items) |t| {</span><span class="ln del">            t.op_params[2] = @floatFromInt(pos);</span><span class="ln del">        }</span><span class="ln del">    }</span></code></pre></div>
+
+<h3><span class="stepno">5</span>QK-norm 不用改</h3>
+<p><code>RmsNormImpl&lt;CUDA&gt;</code> 把输入看成 <code>[rows, 权重长度]</code>，<code>rows = 元素数 / 权重长度</code>。q_norm 的权重长度是 head_dim = 128，不管 q 是 <code>[n, T, hd]</code> 还是 <code>[T, n, hd]</code>，都是“每 128 个数归一化一次”，结果只是行的顺序不同。</p>
+
+<div class="callout warn"><span class="t">做完这一步不能跑</span>现在 q / k / v 是 token-major，但 <code>appendKVFromTensor</code> 和 <code>paged_attention_kernel</code> 还按 head-major 读，会算出错的结果（不会崩）。接着做第 06 步，两步合起来验证。<br>
+CPU 后端同理：<code>backend/cpu/rope.zig</code> 和 <code>backend/cpu/attention.zig</code> 也是 head-major 的，这两步要跟着换（见下面的“CPU 同步”），换完之后 CPU 和 CUDA 一起恢复可用。</div>
+
+<h2>对拍验证</h2>
+<p>这一步只能先看图结构。重新导出 <code>docs/qwen3-graph.dot</code>，确认每层：</p>
+<ul>
+  <li>没有名字带 <code>_permute</code> 的节点；</li>
+  <li><code>q_hp / k_hp / v_hp / attn_tr</code> 四个节点是 <code>TENSOR_TYPE_VIEW</code>；</li>
+  <li>注意力的三个输入形状是 <code>[1, -1, 16, 128]</code>、<code>[1, -1, 8, 128]</code>、<code>[1, -1, 8, 128]</code>。</li>
+</ul>
+<h2>CPU 同步</h2>
+<div class="callout cpu"><span class="t">这一步 CPU 后端要做的事</span><b>必须同步改。</b>CPU 的 RoPE 还按 head-major 寻址、位置还读 <code>op_params</code>，不改会算出乱码。换成 token-major、位置读元数据的版本。和 CUDA 一样，要等第 06 步做完才能跑。 <a href="cpu-3-kernels-layout.html#rope">去看 →</a></div>
+<h2>性能收益</h2>
+<h3>依据</h3>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th class="num">改前</th><th class="num">改后</th><th>来源</th></tr></thead><tbody><tr><td>每层发射的 kernel 数</td><td class="num">22（含 4 个 permute）</td><td class="num">18</td><td><span class="src lab">lab 实测</span></td></tr><tr><td>每层图节点数</td><td class="num">—</td><td class="num">22，其中 4 个是视图</td><td><span class="src lab">lab 实测</span></td></tr></tbody></table></div>
+<h3>对 llmgen 的预期</h3>
+<p>每步少 28 × 4 = 112 个 kernel。按第 02 步的账（每个 kernel 一次 launch + 一次 sync，单次约 12.9 + 16.5 µs），省下约 3.3 ms / 步 <span class="src est">推算</span>。permute kernel 本身搬的数据很小（decode 时一共几 KB），kernel 时间可以忽略。</p>
+<p>prefill 时每个 permute 要搬 <code>T × n × hd × 2</code> 字节，512 token 时 q 是 2 MB、k / v 各 1 MB，每层 6 MB，28 层 168 MB 的无用搬运也没了。</p>
+<p>这一步的数字要等第 06 步做完才能量。</p>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>每层 kernel 数（看 profile 的算子计数）</td><td class="num fill" contenteditable="true" data-key="05-token-major-view.html|每层 kernel 数（看 profile 的算子计数）|before"></td><td class="num fill" contenteditable="true" data-key="05-token-major-view.html|每层 kernel 数（看 profile 的算子计数）|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td><code>error.HeadsNotDivisible</code></td><td><code>attention()</code> 里还在读 <code>dims[1]</code>，token-major 下那是 T（-1）。改成 <code>dims[2]</code>。</td></tr><tr><td><code>error.BadHeadDim</code>（applyRope）</td><td>它读 <code>x.dims[3]</code>，token-major 下仍然是 head_dim，不该报错。报了说明拆头的 reshape 形状写错了。</td></tr><tr><td>链接报 <code>undefined symbol: cuda_apply_rope</code></td><td>还有地方在用旧名字。<code>grep -rn cuda_apply_rope src</code>。</td></tr><tr><td><code>module/shape.zig</code> 的单测失败</td><td>测试断言的是 head-major 的形状，按新形状改断言。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li>图里没有 permute 节点</li><li><code>rope.cu</code> 换成了 token-major 版本，<code>setRopeStart</code> 已删除</li><li>知道现在跑出来的结果是错的，下一步修</li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="04-step-state.html"><small>← 上一步</small>StepState：元数据一次上传</a><a class="next" href="06-store-kv.html"><small>下一步 →</small>写 KV 改成一个 kernel</a></div>
+</main>
+</div>
+</body>
+</html>

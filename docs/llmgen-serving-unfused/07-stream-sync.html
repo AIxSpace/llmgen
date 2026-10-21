@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>一条 stream，一步一同步 · llmgen 优化到 serving-unfused</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/extra.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/extra.js"></script>
+<script src="assets/app.js"></script>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <div class="brand">llmgen → serving-unfused</div>
+  <div class="sub">15 tok/s 到 400 tok/s，一步一步来</div>
+  <ol><li><a href="index.html"><span class="n">·</span><span>总览</span></a></li><li class="grp">阶段 0 · 先能量</li><li><a href="01-bench.html"><span class="n">01</span><span>基准对齐</span></a></li><li><a href="02-where-time-goes.html"><span class="n">02</span><span>64 ms 去哪了</span></a></li><li class="grp">阶段 1 · 去掉主机开销</li><li><a href="03-all-on-gpu.html"><span class="n">03</span><span>全图上 GPU</span></a></li><li><a href="04-step-state.html"><span class="n">04</span><span>StepState：元数据一次上传</span></a></li><li><a href="05-token-major-view.html"><span class="n">05</span><span>token-major 零拷贝拆头</span></a></li><li><a href="06-store-kv.html"><span class="n">06</span><span>写 KV 改成一个 kernel</span></a></li><li><a href="07-stream-sync.html" class="active"><span class="n">07</span><span>一条 stream，一步一同步</span></a></li><li class="grp">阶段 2 · 少算、少搬</li><li><a href="08-gather-last.html"><span class="n">08</span><span>gather_last：只算最后一行</span></a></li><li><a href="09-gpu-sampling.html"><span class="n">09</span><span>GPU 采样</span></a></li><li class="grp">阶段 3 · kernel</li><li><a href="10-bf16x8.html"><span class="n">10</span><span>bf16x8 向量化</span></a></li><li><a href="11-norm-rope.html"><span class="n">11</span><span>RMSNorm 与 RoPE</span></a></li><li><a href="12-linear-gemv.html"><span class="n">12</span><span>Linear：GEMV + cuBLAS</span></a></li><li><a href="13-flash-decoding.html"><span class="n">13</span><span>decode 注意力：split-K</span></a></li><li><a href="14-fa2-prefill.html"><span class="n">14</span><span>prefill 注意力：FA2</span></a></li><li><a href="15-kernel-test.html"><span class="n">15</span><span>kernel 对拍</span></a></li><li class="grp">阶段 4 · 执行层</li><li><a href="16-memory-plan.html"><span class="n">16</span><span>活跃区间激活规划</span></a></li><li><a href="17-cuda-graph.html"><span class="n">17</span><span>CUDA Graph</span></a></li><li class="grp">阶段 5 · 连续批处理</li><li><a href="18-block-manager.html"><span class="n">18</span><span>序列级块表与 KV 预算</span></a></li><li><a href="19-batched-forward.html"><span class="n">19</span><span>批量前向 execute(entries)</span></a></li><li><a href="20-scheduling.html"><span class="n">20</span><span>调度策略与抢占</span></a></li><li class="grp">阶段 6 · 收尾</li><li><a href="21-cli-load.html"><span class="n">21</span><span>CLI 与快速加载</span></a></li><li><a href="22-final-bench.html"><span class="n">22</span><span>最终对比</span></a></li><li><a href="23-switches-debug.html"><span class="n">23</span><span>附录：回退开关与排错</span></a></li><li class="grp">CPU 支线 · 每步同步做</li><li><a href="cpu-1-overview.html"><span class="n">C1</span><span>CPU：一套执行层两个后端</span></a></li><li><a href="cpu-2-tools.html"><span class="n">C2</span><span>CPU：并行与 SIMD 工具</span></a></li><li><a href="cpu-3-kernels-layout.html"><span class="n">C3</span><span>CPU：布局相关的算子</span></a></li><li><a href="cpu-4-kernels-math.html"><span class="n">C4</span><span>CPU：计算类算子</span></a></li><li><a href="cpu-5-exec-cli.html"><span class="n">C5</span><span>CPU：执行层与命令行</span></a></li></ol>
+</nav>
+<main>
+<div class="kicker">阶段 1 · 去掉主机开销</div>
+<h1>一条 stream，一步一同步</h1>
+<p class="lead">host 一口气发完整步的 kernel，只等一次。</p>
+<div class="callout goal"><span class="t">本步目标</span>所有 kernel 排进同一条 CUDA stream，host 一口气把整步的 kernel 发完，只在最后取结果时等一次。同步次数从每步 500 多次降到 1 次。</div>
+<h2>原理</h2>
+<h3>launch 是异步的</h3>
+<p><code>kernel&lt;&lt;&lt;…&gt;&gt;&gt;(…)</code> 只是把一个任务放进队列就返回，GPU 在后台按顺序执行。host 可以连着发几百个 kernel 而不等任何一个。只有 host 要<b>读结果</b>时才需要等。</p>
+<p>一步前向里，host 真正需要读的只有最后的 logits（第 09 步之后是一个 token id）。中间那五百个 kernel 的输出都留在显存里给下一个 kernel 用，host 根本不看。</p>
+<p>起点却在每个 kernel 后面都等：</p>
+<div class="codeblock"><div class="cap"><span><b>src/executor.zig · executorTensor</b> <span class="tag edit">起点（你现在的代码）</span></span><button type="button">复制</button></div><pre><code class="language-zig">        // 需要分析时开启，不要影响指标 metrics 评估
+        if (self.profiler.enabled) {
+            var timer = try std.time.Timer.start();
+            try dispatchKernel(tensor, @intCast(device_id));
+            if (opts.have_cuda and tensor.device_type != .CPU) {
+                // 这里目前是同步操作，所以 OpProfiler 能算准
+                cuda.CudaContext.instance().sync(); // cuda 同步操作
+            }
+            const ns = timer.read();
+            const ctx: u64 = @intCast(self.seq_pos + self.cur_tokens); // forward 期间 seq_pos 还没更新
+            self.profiler.record(
+                tensor.op_type,
+                tensor.device_type,
+                ns,
+                profiler.opCost(tensor, ctx),
+            );
+        } else {
+            try dispatchKernel(tensor, @intCast(device_id));
+            if (opts.have_cuda and tensor.device_type != .CPU) {
+                cuda.CudaContext.instance().sync(); // cuda 同步操作
+            }
+        }
+    }</code></pre></div>
+<div class="diagram">
+<div class="lanes">
+  <div class="lab">每算子同步</div><div class="lane"><span class="h">发 A</span><span class="x">等 A</span><span class="h">发 B</span><span class="x">等 B</span><span class="h">发 C</span><span class="x">等 C</span><span class="h">…</span></div>
+  <div class="lab">GPU</div><div class="lane"><span class="x">·</span><span class="d">A</span><span class="x">·</span><span class="d">B</span><span class="x">·</span><span class="d">C</span></div>
+</div>
+<div class="lanes" style="margin-top:14px">
+  <div class="lab">一步一同步</div><div class="lane"><span class="h">发 A</span><span class="h">发 B</span><span class="h">发 C</span><span class="h">…</span><span class="h">发 Z</span><span class="x">等一次</span></div>
+  <div class="lab">GPU</div><div class="lane"><span class="x">·</span><span class="d">A</span><span class="d">B</span><span class="d">C</span><span class="d">…</span><span class="d">Z</span></div>
+</div>
+<div class="cap2">上：host 和 GPU 轮流干活，互相等。下：host 发命令和 GPU 执行重叠，GPU 不空转。</div>
+</div>
+<p>每次同步的代价有两部分：系统调用和线程唤醒的固定开销；以及 GPU 做完一个 kernel 后空转，等 host 醒来发下一个。decode 的 kernel 大多只跑几微秒，空转的时间比干活的时间还长。</p>
+
+<h3>为什么要一条独立的 stream</h3>
+<p>stream 是一条 FIFO 队列，同一条 stream 里的操作严格按提交顺序执行，这就保证了 kernel B 一定在 kernel A 之后跑，不需要 host 来排。</p>
+<p>现在所有 kernel 都在<b>默认 stream</b> 上。默认 stream 有个特殊语义：它上面的每个操作都会和其它（阻塞型）stream 隐式同步。换成一条用 <code>cudaStreamNonBlocking</code> 创建的独立 stream 之后：</p>
+<ul>
+  <li>可以用 <code>cudaStreamSynchronize(stream)</code> 只等这一条，比 <code>cudaDeviceSynchronize</code> 轻；</li>
+  <li>cuBLAS 可以绑到同一条 stream 上，和自写 kernel 排在一起；</li>
+  <li>第 17 步的 CUDA Graph 录制是按 stream 录的（<code>cudaStreamBeginCapture</code>），默认 stream 不能录。</li>
+</ul>
+<div class="codeblock"><div class="cap"><span><b>backend/cuda/cuda_context.cu</b> <span class="tag out">lab 参考（3090 实测过）</span></span><button type="button">复制</button></div><pre><code class="language-cpp">cudaStream_t g_cuda_stream = nullptr;
+cublasHandle_t g_cublas = nullptr;
+static void *g_cublas_ws = nullptr;
+static cudaGraph_t g_capture_graph = nullptr;
+
+extern &quot;C&quot; int cuda_init(size_t ws_bytes) {
+    if (g_cuda_stream) return 0;
+    int count = 0;
+    if (cudaGetDeviceCount(&amp;count) != cudaSuccess || count &lt;= 0) {
+        fprintf(stderr, &quot;[serve] no CUDA device\n&quot;);
+        return 1;
+    }
+    CUDA_CHECK(cudaSetDevice(0));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&amp;g_cuda_stream, cudaStreamNonBlocking));
+    if (cublasCreate(&amp;g_cublas) != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, &quot;[serve] cublasCreate failed\n&quot;);
+        return 2;
+    }
+    cublasSetStream(g_cublas, g_cuda_stream);
+    // 固定 workspace: CUDA Graph 录制期间 cuBLAS 不能自己申请显存
+    if (ws_bytes &gt; 0) {
+        CUDA_CHECK(cudaMalloc(&amp;g_cublas_ws, ws_bytes));
+        cublasSetWorkspace(g_cublas, g_cublas_ws, ws_bytes);
+    }
+    cublasSetMathMode(g_cublas, CUBLAS_DEFAULT_MATH);
+    return 0;
+}</code></pre></div>
+
+<h3>为什么这一步排在第 06 步之后</h3>
+<p>去掉逐算子同步之后，一步之内所有操作必须能排进同一条队列。前几步做的事正是把不能排队的东西清掉：</p>
+<div class="tablewrap"><table><thead><tr><th>原来热路径上有</th><th>问题</th><th>哪一步清掉的</th></tr></thead><tbody><tr><td>同步 <code>cudaMemcpy</code>（写 KV、块表）</td><td>走默认 stream。换成非阻塞 stream 后，它不会等我们的 kernel，会读到还没算完的数据</td><td>06</td></tr><tr><td><code>cudaFree</code>（块表）</td><td>kernel 还在队列里没跑，它要读的显存就被释放了</td><td>06</td></tr><tr><td>CPU 上的 embedding</td><td>host 要参与计算，就得先等 GPU</td><td>03</td></tr><tr><td>RoPE 起点写在 <code>op_params</code></td><td>没问题，但 CUDA Graph 回放时改不了</td><td>05</td></tr></tbody></table></div>
+<p>现在一步里只有：一次元数据上传、五百个 kernel、一次 logits 回拷。全都能排队。</p>
+
+<h2>改动</h2>
+<h3><span class="stepno">1</span>建 stream</h3>
+<p>第 03 步已经定义了 <code>g_cuda_stream = nullptr</code>。现在真的创建它：</p>
+<div class="codeblock diff"><div class="cap"><span><b>src/backend/cuda/cuda_context.cu</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">extern &quot;C&quot; int cuda_init(void) {</span><span class="ln ctx">    if (g_inited) return 0;</span><span class="ln ctx">    ...</span><span class="ln ctx">    checkCuda(cudaSetDevice(0), &quot;cudaSetDevice&quot;);</span><span class="ln add">    // 独立的非阻塞 stream:不和默认 stream 互相隐式同步</span><span class="ln add">    checkCuda(cudaStreamCreateWithFlags(&amp;g_cuda_stream, cudaStreamNonBlocking), &quot;cudaStreamCreate&quot;);</span><span class="ln ctx">    g_inited = true;</span><span class="ln ctx">    return 0;</span><span class="ln ctx">}</span><span class="ln ctx"> </span><span class="ln ctx">extern &quot;C&quot; void cuda_sync(void) {</span><span class="ln del">    checkCuda(cudaDeviceSynchronize(), &quot;sync&quot;);</span><span class="ln add">    checkCuda(cudaStreamSynchronize(g_cuda_stream), &quot;sync&quot;);</span><span class="ln ctx">}</span></code></pre></div>
+
+<h3><span class="stepno">2</span>老 kernel 的发射点加上 stream</h3>
+<p>从 lab 搬来的 kernel（embedding、rope、attention）本来就写了 <code>g_cuda_stream</code>。llmgen 自己的几个老 kernel 还没有：<code>arithmetic.cu</code>（add / mul）、<code>activation.cu</code>（silu）、<code>norm_warp.cu</code>。</p>
+<div class="codeblock diff"><div class="cap"><span><b>每个老 kernel 的发射点：第三个参数是动态 shared memory 字节数（0），第四个是 stream</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln del">        add_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(static_cast&lt;const __nv_bfloat16*&gt;(in1), ...);</span><span class="ln add">        add_kernel&lt;&lt;&lt;blocks, threads, 0, g_cuda_stream&gt;&gt;&gt;(static_cast&lt;const __nv_bfloat16*&gt;(in1), ...);</span></code></pre></div>
+<div class="codeblock"><div class="cap"><span><b>终端</b> <span class="tag out">命令</span></span><button type="button">复制</button></div><pre><code class="language-bash"># 还排在默认 stream 上的发射点。输出应该只剩已经不用的文件(shape.cu / softmax.cu / linear_naive.cu ...)
+grep -n &quot;&lt;&lt;&lt;&quot; src/backend/cuda/*.cu | grep -v g_cuda_stream</code></pre></div>
+<div class="callout warn"><span class="t">漏一个都不行</span>漏掉的 kernel 会跑在默认 stream 上，和我们的 stream <b>没有先后关系</b>：它可能在前一个 kernel 写完之前就开始读。症状是结果偶尔错、每次错得不一样。改完务必跑一遍上面的 grep。</div>
+
+<h3><span class="stepno">3</span>cuBLAS 绑到同一条 stream</h3>
+<div class="codeblock diff"><div class="cap"><span><b>src/backend/cuda/linear.cu</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln ctx">        cublasHandle_t get_impl(int dev) {</span><span class="ln ctx">            if (handles_[dev]) return handles_[dev];</span><span class="ln ctx">            cublasHandle_t h;</span><span class="ln ctx">            cublasCreate(&amp;h);</span><span class="ln add">            cublasSetStream(h, g_cuda_stream); // cuBLAS 的 kernel 也排进同一条 stream</span><span class="ln ctx">            handles_[dev] = h;</span><span class="ln ctx">            return h;</span><span class="ln ctx">        }</span></code></pre></div>
+
+<h3><span class="stepno">4</span>拷贝也排进这条 stream</h3>
+<div class="codeblock diff"><div class="cap"><span><b>src/backend/cuda/memcpy.cu（cuda_shim.h 和 cuda.zig 里补上两个 _async 的声明）</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln add">// 加载期 / 测试用的&quot;同步&quot;拷贝:排进同一条 stream 再等它, 保证和之前发的 kernel 有先后</span><span class="ln ctx">extern &quot;C&quot; void cuda_h2d(void *dst, const void *src, size_t bytes) {</span><span class="ln del">    checkCuda(cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice), &quot;H2D&quot;);</span><span class="ln add">    checkCuda(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, g_cuda_stream), &quot;H2D&quot;);</span><span class="ln add">    checkCuda(cudaStreamSynchronize(g_cuda_stream), &quot;H2D sync&quot;);</span><span class="ln ctx">}</span><span class="ln ctx">extern &quot;C&quot; void cuda_d2h(void *dst, const void *src, size_t bytes) {</span><span class="ln del">    checkCuda(cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost), &quot;D2H&quot;);</span><span class="ln add">    checkCuda(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, g_cuda_stream), &quot;D2H&quot;);</span><span class="ln add">    checkCuda(cudaStreamSynchronize(g_cuda_stream), &quot;D2H sync&quot;);</span><span class="ln ctx">}</span><span class="ln add">// 热路径用的异步拷贝:src / dst 的 host 一侧必须是 pinned 内存, 且在拷贝完成前不能动</span><span class="ln add">extern &quot;C&quot; void cuda_h2d_async(void *dst, const void *src, size_t bytes) {</span><span class="ln add">    checkCuda(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, g_cuda_stream), &quot;H2D async&quot;);</span><span class="ln add">}</span><span class="ln add">extern &quot;C&quot; void cuda_d2h_async(void *dst, const void *src, size_t bytes) {</span><span class="ln add">    checkCuda(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, g_cuda_stream), &quot;D2H async&quot;);</span><span class="ln add">}</span><span class="ln ctx"> </span><span class="ln ctx">// cuda_memcpy(拷贝代理节点用):三个分支里的 cudaMemcpy 都按同样方式改</span><span class="ln ctx">    if (src_dev == DEV_CPU &amp;&amp; dst_dev == DEV_CUDA) {</span><span class="ln del">        cudaMemcpy(dst, src, nbytes, cudaMemcpyHostToDevice);</span><span class="ln add">        cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyHostToDevice, g_cuda_stream);</span><span class="ln add">        cudaStreamSynchronize(g_cuda_stream);</span><span class="ln ctx">        return;</span><span class="ln ctx">    }</span><span class="ln ctx">    if (src_dev == DEV_CUDA &amp;&amp; dst_dev == DEV_CPU) {</span><span class="ln del">        cudaMemcpy(dst, src, nbytes, cudaMemcpyDeviceToHost);</span><span class="ln add">        cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyDeviceToHost, g_cuda_stream);</span><span class="ln add">        cudaStreamSynchronize(g_cuda_stream);</span><span class="ln ctx">        return;</span><span class="ln ctx">    }</span></code></pre></div>
+<div class="callout tip"><span class="t">pageable 和 pinned 的区别</span><code>cudaMemcpyAsync</code> 从普通（pageable）host 内存拷到显存时，驱动要先把数据搬到内部的 pinned 暂存区，这一步可能在后台线程里做，调用返回时 host 缓冲还在被读。所以异步 H2D 的 host 缓冲必须是 pinned 的，并且在这一步结束前不能改。元数据缓冲是 <code>cudaMallocHost</code> 分的，每步 <code>fillMeta</code> 之前上一步已经同步过，满足条件。<br>
+<code>cuda_h2d</code> / <code>cuda_d2h</code> 用在权重加载和单测里，host 缓冲是普通内存，所以保留“拷完再返回”的语义：排进 stream，再等 stream。</div>
+
+<h3><span class="stepno">5</span>Executor 去掉逐算子同步</h3>
+<div class="codeblock diff"><div class="cap"><span><b>src/executor.zig</b> <span class="tag edit">改动对比</span></span><button type="button">复制改后代码</button></div><pre><code class="nohighlight"><span class="ln add">    /// 回退开关:每个算子后同步一次, 复现改动前的行为(LLMGEN_SYNC_EACH=1)</span><span class="ln add">    sync_each: bool = false,</span><span class="ln ctx">...</span><span class="ln ctx">// ---- init() ----</span><span class="ln add">        self.sync_each = std.posix.getenv(&quot;LLMGEN_SYNC_EACH&quot;) != null;</span><span class="ln ctx">...</span><span class="ln ctx">    fn executorTensor(self: *Self, tensor: *Tensor) !void {</span><span class="ln ctx">        ...</span><span class="ln del">        // 需要分析时开启，不要影响指标 metrics 评估</span><span class="ln ctx">        if (self.profiler.enabled) {</span><span class="ln add">            // 算子级计时必须等 kernel 真做完, 所以 profile 模式下仍然逐算子同步;这个模式下的吞吐不能当成绩</span><span class="ln ctx">            var timer = try std.time.Timer.start();</span><span class="ln ctx">            try dispatchKernel(tensor, @intCast(device_id));</span><span class="ln ctx">            if (opts.have_cuda and tensor.device_type != .CPU) {</span><span class="ln del">                // 这里目前是同步操作，所以 OpProfiler 能算准</span><span class="ln ctx">                cuda.CudaContext.instance().sync(); // cuda 同步操作</span><span class="ln ctx">            }</span><span class="ln ctx">            ...</span><span class="ln ctx">        } else {</span><span class="ln ctx">            try dispatchKernel(tensor, @intCast(device_id));</span><span class="ln del">            if (opts.have_cuda and tensor.device_type != .CPU) {</span><span class="ln del">                cuda.CudaContext.instance().sync(); // cuda 同步操作</span><span class="ln del">            }</span><span class="ln add">            if (self.sync_each and opts.have_cuda and tensor.device_type != .CPU) {</span><span class="ln add">                cuda.CudaContext.instance().sync();</span><span class="ln add">            }</span><span class="ln ctx">        }</span><span class="ln ctx">    }</span><span class="ln ctx"> </span><span class="ln ctx">// ---- uploadMeta(): 元数据缓冲是 pinned 的, 可以异步上传 ----</span><span class="ln del">            cuda.cuda_h2d(self.devAt(0), self.meta_host, bytes); // 第 07 步换成异步</span><span class="ln add">            cuda.cuda_h2d_async(self.devAt(0), self.meta_host, bytes);</span></code></pre></div>
+<p>结尾的那一次同步不用显式写：logits 的拷贝代理走 <code>cuda_memcpy</code> 的 D2H 分支，它排在所有 kernel 后面，然后等 stream。第 09 步把它换成 4 字节的异步 D2H 加一次 <code>cuda_sync</code>。</p>
+
+<h2>对拍验证</h2>
+<p>这一步不改任何计算，输出必须和第 06 步做完时<b>逐 token 相同</b>。跑三遍，三遍都相同（排查漏改 stream 导致的偶发错误）。</p>
+<p>再用回退开关做一次 A/B：</p>
+<div class="codeblock"><div class="cap"><span><b>终端</b> <span class="tag out">命令</span></span><button type="button">复制</button></div><pre><code class="language-bash">LLMGEN_WORKLOAD=src/bench/workloads/s1.json make llmgen-cuda                       # 一步一同步
+LLMGEN_SYNC_EACH=1 LLMGEN_WORKLOAD=src/bench/workloads/s1.json make llmgen-cuda    # 每算子同步</code></pre></div>
+<p>nsys 里 <code>cudaDeviceSynchronize</code> 应该消失，<code>cudaStreamSynchronize</code> 每步 1–2 次。</p>
+<h2>CPU 同步</h2>
+<div class="callout cpu"><span class="t">这一步 CPU 后端要做的事</span><b>不用动。</b>CPU 算子本来就是同步执行的，没有 stream。<code>executorTensor</code> 里的同步带着设备判断，CPU 上不会走到。</div>
+<h2>性能收益</h2>
+<h3>依据</h3>
+<div class="tablewrap"><table><thead><tr><th>对比</th><th class="num">改前</th><th class="num">改后</th><th>来源</th></tr></thead><tbody><tr><td>融合版 S1 吞吐：每算子同步 → 一步一同步（tok/s）</td><td class="num">292.4</td><td class="num">435.7</td><td><span class="src lab">消融实测</span></td></tr><tr><td>融合版 S1 ITL mean（ms）</td><td class="num">3.38</td><td class="num">2.26</td><td><span class="src lab">消融实测</span></td></tr><tr><td>融合版 S4 吞吐（8 并发，tok/s）</td><td class="num">1208.6</td><td class="num">1938</td><td><span class="src lab">消融实测</span></td></tr></tbody></table></div>
+<h3>对 llmgen 的预期</h3>
+<p>lab 的消融（<code>--sync-each</code>）：融合版每层 9 个节点、每步 252 次同步，去掉后 S1 快 1.49 倍，ITL 省 1.12 ms，折合每次同步 4.4 µs。S4 快 1.60 倍。</p>
+<p>llmgen 现在每步约 508 个 kernel（每层 18 个，加上 embedding、final_norm、lm_head 和拷贝），同步次数是融合版的两倍。按每次 4.4 µs 算，预期 ITL 省 2.2 ms 左右 <span class="src est">推算</span>。</p>
+<p>省多少倍取决于此时的 ITL：如果第 06 步之后 ITL 已经降到十几毫秒，这一步是 15–20% 的提升；等阶段 3 把 kernel 换完、ITL 降到 3 ms 时再用 <code>LLMGEN_SYNC_EACH=1</code> 回头量，差距会接近 lab 的 1.5 倍。固定开销不变，其余部分越快，它占的比例越大。</p>
+<h3>你的实测</h3>
+<div class="tablewrap"><table class="mine"><thead><tr><th>你的实测（点格子直接填，存在浏览器本地）</th><th class="num">改前</th><th class="num">改后</th><th class="num">提升</th></tr></thead><tbody><tr><td>S1 ITL mean (ms)：LLMGEN_SYNC_EACH=1</td><td class="num fill" contenteditable="true" data-key="07-stream-sync.html|S1 ITL mean (ms)：LLMGEN_SYNC_EACH=1|before"></td><td class="num fill" contenteditable="true" data-key="07-stream-sync.html|S1 ITL mean (ms)：LLMGEN_SYNC_EACH=1|after"></td><td class="num gain"></td></tr><tr><td>S1 ITL mean (ms)：默认</td><td class="num fill" contenteditable="true" data-key="07-stream-sync.html|S1 ITL mean (ms)：默认|before"></td><td class="num fill" contenteditable="true" data-key="07-stream-sync.html|S1 ITL mean (ms)：默认|after"></td><td class="num gain"></td></tr><tr><td>S1 输出吞吐 (tok/s)</td><td class="num fill" contenteditable="true" data-key="07-stream-sync.html|S1 输出吞吐 (tok/s)|before"></td><td class="num fill" contenteditable="true" data-key="07-stream-sync.html|S1 输出吞吐 (tok/s)|after"></td><td class="num gain"></td></tr><tr><td>cudaStreamSynchronize 次数 / 步</td><td class="num fill" contenteditable="true" data-key="07-stream-sync.html|cudaStreamSynchronize 次数 / 步|before"></td><td class="num fill" contenteditable="true" data-key="07-stream-sync.html|cudaStreamSynchronize 次数 / 步|after"></td><td class="num gain"></td></tr></tbody></table></div><h2>常见错误</h2>
+<div class="tablewrap"><table><thead><tr><th>现象</th><th>原因和处理</th></tr></thead><tbody><tr><td>输出偶尔错，每次不一样</td><td>有 kernel 还在默认 stream 上。跑第 2 步的 grep。cuBLAS 没 <code>cublasSetStream</code> 也是同样的症状。</td></tr><tr><td>输出全错，稳定复现</td><td>检查 logits 回拷：<code>cuda_memcpy</code> 的 D2H 分支如果还是同步 <code>cudaMemcpy</code>，它不会等我们的 stream，读到的是上一步的 logits。</td></tr><tr><td>单测（<code>make llmgen-cuda-test</code>）失败</td><td><code>tests.zig</code> 用 <code>cudaD2H</code> 取结果。<code>cuda_d2h</code> 必须按第 4 步改成“排进 stream 再等”，否则读到的是 kernel 跑之前的内容。</td></tr><tr><td><code>LLMGEN_PROFILE=1</code> 下各算子耗时之和远小于 forward</td><td>正常：profile 模式逐算子同步，同步本身的时间算在“框架开销”里。</td></tr><tr><td>速度没变</td><td>确认不是在 <code>LLMGEN_PROFILE=1</code> 或 <code>LLMGEN_SYNC_EACH=1</code> 下量的。</td></tr></tbody></table></div><h2>检查点</h2>
+<ul class="checklist"><li><code>grep "&lt;&lt;&lt;" … | grep -v g_cuda_stream</code> 只剩不再使用的文件</li><li>连跑三次输出相同，且和第 06 步相同</li><li>量了 <code>LLMGEN_SYNC_EACH=1</code> 和默认两种模式的 ITL</li><li>阶段 1 结束：把 S1 的吞吐、TTFT、ITL 填进总览页的汇总表</li></ul>
+<div class="callout warn"><span class="t">关于本页的数字</span>按约定，代码由你来改、来测。标“lab 实测 / 消融实测 / nsys 实测”的数字出自目标 lab 在同一块 RTX 3090 上的记录；标“推算”的是据此算出来的，<b>没有在 llmgen 上实测</b>。和你的实测对不上时，以你的为准，再回头对照文中给出的 lab 参考文件。</div>
+<div class="pager"><a class="prev" href="06-store-kv.html"><small>← 上一步</small>写 KV 改成一个 kernel</a><a class="next" href="08-gather-last.html"><small>下一步 →</small>gather_last：只算最后一行</a></div>
+</main>
+</div>
+</body>
+</html>
