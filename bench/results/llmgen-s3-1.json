@@ -1,0 +1,38 @@
+{
+  "engine": "llmgen",
+  "workload": "s3-bench256",
+  "n_requests": 256,
+  "repeat": 1,
+  "input_tokens": 142827,
+  "output_tokens": 133966,
+  "wall_s": 23.958944851,
+  "throughput_out": 5591.481629643157,
+  "throughput_total": 11552.804254167613,
+  "ttft_ms": {
+    "mean": 1351.955191785155,
+    "p50": 1394.66094,
+    "p90": 2222.94943,
+    "p99": 2471.304921,
+    "max": 2471.304921,
+    "n": 256
+  },
+  "itl_ms": {
+    "mean": 27.22588105444722,
+    "p50": 27.080453,
+    "p90": 29.288937,
+    "p99": 30.489709,
+    "max": 2227.316304,
+    "n": 133710
+  },
+  "peak_rss_mb": 580.44921875,
+  "device_used_mb": 21837.4375,
+  "weights_mb": 1137,
+  "kv_cache_mb": 19215,
+  "kv_tokens": 175680,
+  "load_s": 1.317481063,
+  "preemptions": 0,
+  "steps": 1032,
+  "graph_steps": 1023,
+  "eager_steps": 18,
+  "policy": "prefill_first"
+}

@@ -3,7 +3,7 @@ CUDA_HOME ?= /usr/local/cuda
 CUDA_FLAGS = -Dcuda=true -Dnvcc=$(CUDA_HOME)/bin/nvcc -Dcuda-home=$(CUDA_HOME)
 export LLMGEN_MODEL
 
-.PHONY: build build-cuda run run-cuda test test-cuda bench workloads clean
+.PHONY: build build-cuda run run-cuda test test-cuda bench workloads compare plot clean
 
 build:
 	zig build -Doptimize=ReleaseFast
@@ -27,6 +27,12 @@ bench:
 	bash bench/run.sh
 workloads:
 	python3 bench/gen_workload.py bench/workloads
+
+# 和 nano-vllm 对比:同一份 workload 两个引擎交替跑 3 次, 结果在 bench/results/, 再画图
+compare:
+	bash bench/compare.sh 3
+plot:
+	python3 bench/plot.py bench/results docs/images/bench-compare.png
 
 # 对拍(greedy 输出在每一步优化前后应完全相同):
 #   make run-cuda 2>&1 | grep '^token ids' > ~/llmgen-golden.txt

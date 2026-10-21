@@ -18,7 +18,7 @@ for i in $(seq 1 "$runs"); do
   echo "run ${i}/${runs} ..."
   LLMGEN_METRICS=1 \
   LLMGEN_METRICS_JSON="${out}/run${i}.json" \
-  ./zig-out/bin/llmgen > /dev/null 2> "${out}/run${i}.log" || {
+  ./zig-out/bin/llmgen chat --single > /dev/null 2> "${out}/run${i}.log" || {
     echo "第 ${i} 次运行失败, 日志: ${out}/run${i}.log"; exit 1;
   }
 done
